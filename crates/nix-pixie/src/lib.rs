@@ -19,10 +19,12 @@ pub mod inventory;
 pub mod mdns;
 pub mod metadata;
 pub mod net;
+pub mod plan;
 pub mod probe;
 pub mod push;
 pub mod state;
 pub mod store;
+pub mod system;
 
 use tokio::signal::unix::{SignalKind, signal};
 
