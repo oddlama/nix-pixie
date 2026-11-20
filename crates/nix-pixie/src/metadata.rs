@@ -25,6 +25,7 @@ pub struct Machine {
     pub configuration: String,
     #[serde(rename = "match")]
     pub hints: Hints,
+    pub disks: Disks,
     pub facter: Facter,
 }
 
@@ -35,6 +36,14 @@ pub struct Machine {
 pub struct Hints {
     pub mac: Vec<String>,
     pub dmi_serial: Vec<String>,
+}
+
+/// How the machine's disks are chosen.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Disks {
+    /// Pinned mode: where the chosen disks are recorded, relative to the
+    /// flake. `None`: whatever the disko config names.
+    pub file: Option<String>,
 }
 
 /// Where the machine's nixos-facter report goes, if it wants one.

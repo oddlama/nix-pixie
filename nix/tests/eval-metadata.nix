@@ -1,5 +1,6 @@
 # Both entry points (plain `lib.mkPixie` and the flake-parts module) must
-# produce identical metadata from identical configuration.
+# produce identical metadata from identical configuration. Also covers the
+# other evaluation-only helpers of the lib.
 {
   pkgs,
   pixieLib,
@@ -23,15 +24,10 @@ let
         hostKey.mode = "pull";
         facter.reportPath = "machines/web1/facter.json";
       };
-      rack-a = {
-        configuration = "generic";
-        disks = {
-          mode = "agnostic";
-          roles = [
-            "main"
-            "data0"
-          ];
-        };
+      rack-a.configuration = "generic";
+      db1 = {
+        configuration = "web1";
+        disks.file = "machines/db1/disks.json";
       };
     };
   };
@@ -58,10 +54,7 @@ let
           mac = [ "aa:bb:cc:dd:ee:ff" ];
           dmiSerial = [ ];
         };
-        disks = {
-          mode = "pinned";
-          roles = [ "main" ];
-        };
+        disks.file = null;
         hostKey.mode = "pull";
         facter.reportPath = "machines/web1/facter.json";
       };
@@ -71,13 +64,17 @@ let
           mac = [ ];
           dmiSerial = [ ];
         };
-        disks = {
-          mode = "agnostic";
-          roles = [
-            "main"
-            "data0"
-          ];
+        disks.file = null;
+        hostKey.mode = "none";
+        facter.reportPath = null;
+      };
+      db1 = {
+        configuration = "web1";
+        match = {
+          mac = [ ];
+          dmiSerial = [ ];
         };
+        disks.file = "machines/db1/disks.json";
         hostKey.mode = "none";
         facter.reportPath = null;
       };
@@ -103,6 +100,25 @@ let
       inherit nixosConfigurations;
       config.machines.web1.facter.reportPath = "machines/../../facter.json";
     };
+    absolute-disks-file = pixieLib.mkPixie {
+      inherit nixosConfigurations;
+      config.machines.web1.disks.file = "/etc/disks.json";
+    };
+  };
+
+  # pinnedDisk: the recorded disk, else the role path; also before the file exists.
+  disksFile = builtins.toFile "disks.json" (json {
+    main = "/dev/disk/by-id/nvme-Example_SSD_1234";
+  });
+  pinned = {
+    recorded = pixieLib.pinnedDisk disksFile "main";
+    unrecorded = pixieLib.pinnedDisk disksFile "data";
+    noFile = pixieLib.pinnedDisk ./does-not-exist.json "main";
+  };
+  expectedPinned = {
+    recorded = "/dev/disk/by-id/nvme-Example_SSD_1234";
+    unrecorded = "/dev/disk/by-pixie/data";
+    noFile = "/dev/disk/by-pixie/main";
   };
   unexpectedSuccesses = lib.attrNames (lib.filterAttrs (_: expr: !(fails expr)) failures);
 
@@ -117,4 +133,5 @@ assert lib.assertMsg (
 assert lib.assertMsg (
   unexpectedSuccesses == [ ]
 ) "these invalid configurations evaluated: ${lib.concatStringsSep ", " unexpectedSuccesses}";
+assert lib.assertMsg (pinned == expectedPinned) "pinnedDisk returned ${json pinned}";
 pkgs.writeText "eval-metadata.json" (json viaLib)

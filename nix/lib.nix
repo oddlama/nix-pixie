@@ -44,6 +44,19 @@ in
 {
   inherit metadataVersion optionsModule mkMetadata;
 
+  # Pinned mode: the device for disko disk `name`, as the controller recorded
+  # it in `file` (the machine's `disks.file`). Until it has, the disk's
+  # `/dev/disk/by-pixie/<name>` path, so the configuration evaluates and
+  # builds before the first install.
+  #
+  #   disko.devices.disk.main.device = nix-pixie.lib.pinnedDisk ./disks.json "main";
+  pinnedDisk =
+    file: name:
+    let
+      pinned = if builtins.pathExists file then lib.importJSON file else { };
+    in
+    pinned.${name} or "/dev/disk/by-pixie/${name}";
+
   mkPixie =
     {
       nixosConfigurations,

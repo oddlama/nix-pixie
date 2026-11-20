@@ -45,26 +45,21 @@ let
           };
         };
 
-        disks = {
-          mode = mkOption {
-            type = types.enum [
-              "pinned"
-              "agnostic"
-            ];
-            default = "pinned";
-            description = ''
-              `pinned`: the controller writes the selected `/dev/disk/by-id`
-              paths into the repository.
-              `agnostic`: the disko config references `/dev/disk/by-pixie/<role>`
-              and the agent links the selected disks there, so one config can
-              install many machines.
-            '';
-          };
-          roles = mkOption {
-            type = types.listOf (types.strMatching "[a-z0-9][a-z0-9-]*");
-            default = [ "main" ];
-            description = "Disk roles the disko config expects, in selection order.";
-          };
+        disks.file = mkOption {
+          type = types.nullOr repoRelativePath;
+          default = null;
+          example = "machines/web1/disks.json";
+          description = ''
+            Pinned mode: where the controller records the disks chosen for
+            this machine, relative to the flake root, as
+            `{ "<disko disk name>": "/dev/disk/by-id/…" }`. Read it in the
+            disko config with `nix-pixie.lib.pinnedDisk`.
+
+            `null`: the controller installs onto the devices the disko config
+            names. Devices of the form `/dev/disk/by-pixie/<role>` are chosen
+            per install (agnostic mode, one configuration for many machines);
+            other paths must exist on the target.
+          '';
         };
 
         hostKey.mode = mkOption {

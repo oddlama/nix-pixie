@@ -6,6 +6,12 @@
       url = "github:numtide/devshell";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Only for the checks: nix-pixie works with whatever disko the user's
+    # configurations import. Not a flake input, so it pulls in nothing else.
+    disko = {
+      url = "github:nix-community/disko";
+      flake = false;
+    };
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
       inputs.nixpkgs-lib.follows = "nixpkgs";
@@ -59,6 +65,8 @@
 
           # The package defaults to this flake's build for the host platform.
           nixosModules = {
+            # For the configurations nix-pixie installs.
+            default = ./nix/nixos/system.nix;
             # Just the agent service.
             agent = withDefaultPackage ./nix/nixos/agent.nix;
             # Agent plus installer networking: add to any live system.
@@ -132,6 +140,11 @@
                   inherit pkgs pixieLib;
                   inherit (inputs) flake-parts;
                   flakeModule = inputs.self.flakeModules.default;
+                };
+                eval-disks = import ./nix/tests/eval-disks.nix {
+                  inherit pkgs;
+                  inherit (inputs) disko;
+                  systemModule = ./nix/nixos/system.nix;
                 };
                 vm-pairing = import ./nix/tests/pairing.nix {
                   inherit pkgs;

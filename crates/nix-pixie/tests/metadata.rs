@@ -18,14 +18,14 @@ const METADATA: &str = r#"{
         "web1": {
             "configuration": "web1",
             "match": { "mac": ["52:54:00:12:01:02"], "dmiSerial": [] },
-            "disks": { "mode": "pinned", "roles": ["main"] },
+            "disks": { "file": "machines/web1/disks.json" },
             "hostKey": { "mode": "none" },
             "facter": { "reportPath": "machines/web1/facter.json" }
         },
         "db1": {
             "configuration": "db",
             "match": { "mac": [], "dmiSerial": ["SN-42"] },
-            "disks": { "mode": "agnostic", "roles": ["main"] },
+            "disks": { "file": null },
             "hostKey": { "mode": "pull" },
             "facter": { "reportPath": null }
         }
