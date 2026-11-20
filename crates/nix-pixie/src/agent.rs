@@ -14,8 +14,8 @@ use mdns_sd::ServiceEvent;
 use nix_pixie_proto::announce::{Announcement, Pairing};
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::ctrl::{
-    ControllerMsg, DiskAssignment, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, StreamRequest,
-    TargetMsg,
+    ControllerMsg, DiskAssignment, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, Shutdown,
+    StreamRequest, TargetMsg,
 };
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use nix_pixie_proto::pair::Side;
@@ -27,6 +27,7 @@ use crate::disko;
 use crate::inventory;
 use crate::mdns::{self, Mdns};
 use crate::net::{self, Stream};
+use crate::nixos;
 use crate::probe::Responder;
 use crate::state::StateDir;
 use crate::store;
@@ -34,6 +35,9 @@ use crate::store;
 /// Spent guesses before a code is given up: the owner shows a new one, the
 /// typist asks for it to be entered again. Each guess has ~1 in 2^31 odds.
 pub const MAX_FAILURES: u32 = 3;
+/// How long to wait for the controller to leave after `Finished` before
+/// shutting down anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// How long to listen for other targets' nameplates before picking ours.
 const NAMEPLATE_SURVEY: Duration = Duration::from_secs(2);
 
@@ -241,13 +245,45 @@ async fn session(
     let result = serve_controller(state, &mut stream, &approved).await;
     streams.abort();
     refuser.abort();
-    if result.is_ok() {
-        let reason = conn.closed().await;
-        info!(%controller, "controller disconnected: {reason}");
+    if let Ok(shutdown) = &result {
+        // After `Finished` the controller leaves at once; don't wait for one
+        // that vanished without saying so.
+        let wait = if shutdown.is_some() {
+            SHUTDOWN_GRACE
+        } else {
+            Duration::MAX
+        };
+        if let Ok(reason) = tokio::time::timeout(wait, conn.closed()).await {
+            info!(%controller, "controller disconnected: {reason}");
+        } else {
+            warn!(%controller, "controller did not disconnect");
+        }
     }
     state.remove("paired-controller");
     state.remove("approved");
-    result
+    if let Some(how) = result? {
+        shut_down(how).await?;
+    }
+    Ok(())
+}
+
+/// Reboots into the installed system or powers off.
+async fn shut_down(how: Shutdown) -> Result<()> {
+    let (verb, message) = match how {
+        Shutdown::Reboot => ("reboot", "Rebooting into the installed system."),
+        Shutdown::PowerOff => ("poweroff", "Powering off."),
+    };
+    info!(how = verb, "installed; shutting down");
+    println!("\n    Installed. {message}\n");
+    let status = tokio::process::Command::new("systemctl")
+        .arg(verb)
+        .status()
+        .await
+        .context("running systemctl")?;
+    if !status.success() {
+        bail!("systemctl {verb} failed ({status})");
+    }
+    Ok(())
 }
 
 /// Serves the extra streams the controller opens (store connections). Each
@@ -285,12 +321,13 @@ async fn refuse_incoming(endpoint: Endpoint) {
 }
 
 /// Answers the paired controller's requests until it disconnects or rejects
-/// us. Disconnecting is the normal end of a session.
+/// us. Disconnecting is the normal end of a session; after `Finish`, it is
+/// the signal to shut down as returned.
 async fn serve_controller(
     state: &StateDir,
     stream: &mut Stream,
     approved: &AtomicBool,
-) -> Result<()> {
+) -> Result<Option<Shutdown>> {
     let label = net::hostname();
     write_frame(stream, &TargetMsg::Hello { label }).await?;
     let inventory = inventory::collect(&disko::formatted(state)).await;
@@ -298,9 +335,11 @@ async fn serve_controller(
 
     // Checked (and linked) by `PrepareDisks`, for `RunDisko`.
     let mut prepared: Option<Vec<DiskAssignment>> = None;
+    // Set by a successful `Finish`.
+    let mut shutdown: Option<Shutdown> = None;
     loop {
         let Ok(message) = read_frame::<_, ControllerMsg>(stream, MAX_CONTROLLER_FRAME).await else {
-            return Ok(());
+            return Ok(shutdown);
         };
         let reply = match message {
             ControllerMsg::Approve { machine } => {
@@ -311,7 +350,7 @@ async fn serve_controller(
                 let reason = net::sanitise(&reason, 200);
                 warn!(%reason, "rejected by the controller");
                 println!("\n    Rejected by the controller: {reason}\n");
-                return Ok(());
+                return Ok(None);
             }
             // Everything else needs approval first.
             message if !approved.load(Ordering::Relaxed) => match refusal(&message) {
@@ -342,6 +381,50 @@ async fn serve_controller(
             ControllerMsg::RunDisko { script } => {
                 run_disko(state, stream, &script, prepared.take()).await?
             }
+            ControllerMsg::GenerateHostKey => {
+                let comment = state
+                    .read("approved")
+                    .filter(|m| !m.is_empty())
+                    .map_or_else(String::new, |machine| format!("root@{machine}"));
+                match nixos::generate_host_key(state, &comment).await {
+                    Ok(public) => TargetMsg::HostKey { public },
+                    Err(e) => {
+                        warn!("host key: {e:#}");
+                        TargetMsg::HostKeyFailed {
+                            error: format!("{e:#}"),
+                        }
+                    }
+                }
+            }
+            ControllerMsg::Install {
+                root,
+                system,
+                host_key_path,
+            } => {
+                println!("\n    Installing the boot loader...\n");
+                match nixos::install(state, stream, &root, &system, host_key_path.as_deref())
+                    .await?
+                {
+                    Ok(()) => TargetMsg::InstallDone,
+                    Err(error) => {
+                        warn!(%error, "nixos-install");
+                        println!("\n    Installing failed: {error}\n");
+                        TargetMsg::InstallFailed { error }
+                    }
+                }
+            }
+            ControllerMsg::Finish { root, zpools, then } => {
+                match nixos::finish(&root, &zpools).await {
+                    Ok(()) => {
+                        shutdown = Some(then);
+                        TargetMsg::Finished
+                    }
+                    Err(error) => {
+                        warn!(%error, "finishing");
+                        TargetMsg::FinishFailed { error }
+                    }
+                }
+            }
         };
         write_frame(stream, &reply).await?;
     }
@@ -369,6 +452,9 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::PrepareStore { .. } => Some(TargetMsg::StoreRefused { reason }),
         ControllerMsg::PrepareDisks { .. } => Some(TargetMsg::DisksRefused { reason }),
         ControllerMsg::RunDisko { .. } => Some(TargetMsg::DiskoFailed { error: reason }),
+        ControllerMsg::GenerateHostKey => Some(TargetMsg::HostKeyFailed { error: reason }),
+        ControllerMsg::Install { .. } => Some(TargetMsg::InstallFailed { error: reason }),
+        ControllerMsg::Finish { .. } => Some(TargetMsg::FinishFailed { error: reason }),
     }
 }
 

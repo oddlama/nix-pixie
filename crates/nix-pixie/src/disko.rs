@@ -13,11 +13,11 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-use nix_pixie_proto::ctrl::{DiskAssignment, TargetMsg};
-use nix_pixie_proto::frame::write_frame;
+
+use crate::child;
+use nix_pixie_proto::ctrl::DiskAssignment;
 use nix_pixie_proto::inventory::Disk;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::{info, trace};
+use tracing::info;
 
 use crate::inventory;
 use crate::net::Stream;
@@ -149,57 +149,5 @@ pub async fn run(
     }
 
     info!(%script, "running disko");
-    let mut child = match tokio::process::Command::new(script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return Ok(Err(format!("starting {script}: {e}"))),
-    };
-    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        return Ok(Err("disko's output is not connected".into()));
-    };
-    forward(stream, stdout, stderr).await?;
-    let status = child.wait().await.context("waiting for disko")?;
-    info!(%status, "disko finished");
-    Ok(if status.success() {
-        Ok(())
-    } else {
-        Err(format!("disko failed ({status})"))
-    })
-}
-
-/// Sends both pipes' data as `DiskoOutput` frames until both are closed.
-async fn forward(
-    stream: &mut Stream,
-    mut stdout: impl AsyncRead + Unpin,
-    mut stderr: impl AsyncRead + Unpin,
-) -> Result<()> {
-    let mut out_buf = vec![0; 16 * 1024];
-    let mut err_buf = vec![0; 16 * 1024];
-    let (mut out_open, mut err_open) = (true, true);
-    loop {
-        // `read` is cancel-safe: a branch that loses the race loses no data.
-        // A read error counts as the end of that pipe.
-        let (n, from_stdout) = tokio::select! {
-            r = stdout.read(&mut out_buf), if out_open => (r.unwrap_or(0), true),
-            r = stderr.read(&mut err_buf), if err_open => (r.unwrap_or(0), false),
-            else => return Ok(()),
-        };
-        if n == 0 {
-            if from_stdout {
-                out_open = false;
-            } else {
-                err_open = false;
-            }
-            continue;
-        }
-        trace!(bytes = n, "disko output");
-        let buf = if from_stdout { &out_buf } else { &err_buf };
-        let chunk = buf.get(..n).unwrap_or_default().to_vec();
-        write_frame(stream, &TargetMsg::DiskoOutput { chunk }).await?;
-    }
+    child::run("disko", tokio::process::Command::new(script), stream).await
 }

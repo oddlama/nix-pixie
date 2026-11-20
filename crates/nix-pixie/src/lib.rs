@@ -10,6 +10,7 @@
 )]
 
 pub mod agent;
+pub mod child;
 pub mod cli;
 pub mod controller;
 pub mod discovery;
@@ -20,6 +21,7 @@ pub mod inventory;
 pub mod mdns;
 pub mod metadata;
 pub mod net;
+pub mod nixos;
 pub mod plan;
 pub mod probe;
 pub mod push;

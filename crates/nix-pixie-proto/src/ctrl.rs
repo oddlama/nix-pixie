@@ -9,12 +9,22 @@
 //! FacterReport | FacterFailed ->
 //!                           <-   PrepareDisks { disks }      (after Approve)
 //! DisksReady | DisksRefused ->
+//!                           <-   GenerateHostKey             (after Approve)
+//! HostKey | HostKeyFailed   ->
 //!                           <-   RunDisko { script }         (after DisksReady)
-//! DiskoOutput*              ->
+//! Output*                   ->
 //! DiskoDone | DiskoFailed   ->
 //!                           <-   PrepareStore { root }       (after Approve)
 //! StoreReady | StoreRefused ->
+//!                           <-   Install { root, system, .. } (after Approve)
+//! Output*                   ->
+//! InstallDone | InstallFailed ->
+//!                           <-   Finish { root, zpools, then }
+//! Finished | FinishFailed   ->
 //! ```
+//!
+//! After `Finished`, the target reboots or powers off as soon as the
+//! controller closes the connection.
 //!
 //! The controller may open more bi-streams after `Approve`, one per Nix
 //! daemon connection, each starting with a [`StreamRequest`] frame. The
@@ -62,12 +72,25 @@ pub enum TargetMsg {
     DisksReady,
     /// Why the target won't let disko touch these disks.
     DisksRefused { reason: String },
-    /// Output of the running disko script, as it comes.
-    DiskoOutput { chunk: Vec<u8> },
+    /// Output of the running disko script or `nixos-install`, as it comes.
+    Output { chunk: Vec<u8> },
     /// disko finished; the target filesystems are mounted.
     DiskoDone,
     /// disko could not run or failed.
     DiskoFailed { error: String },
+    /// The generated SSH host key's public half, in OpenSSH format.
+    HostKey { public: String },
+    /// Why there is no host key.
+    HostKeyFailed { error: String },
+    /// `nixos-install` finished: the system boots from the target's disks.
+    InstallDone,
+    /// `nixos-install` could not run or failed.
+    InstallFailed { error: String },
+    /// Unmounted and exported; the target shuts down once the controller is
+    /// gone.
+    Finished,
+    /// Why the disks could not be left ready to boot.
+    FinishFailed { error: String },
 }
 
 /// Messages the controller sends to the target.
@@ -90,6 +113,34 @@ pub enum ControllerMsg {
     /// Run this disko script (destroy, format, mount), already pushed into
     /// the live store. Only after `DisksReady`.
     RunDisko { script: String },
+    /// Generate an ed25519 SSH host key for the installed system (pull
+    /// mode). It stays on the installer's tmpfs until `Install`.
+    GenerateHostKey,
+    /// Install the system, already pushed into the store under `root`: put
+    /// the generated host key at `host_key_path` (relative to `root`, if
+    /// given), then run `nixos-install`, which sets the system profile and
+    /// installs the boot loader.
+    Install {
+        root: String,
+        system: String,
+        host_key_path: Option<String>,
+    },
+    /// Leave the disks ready to boot (unmount `root`, export `zpools`), then
+    /// shut down as `then` says once the controller disconnects.
+    Finish {
+        root: String,
+        zpools: Vec<String>,
+        then: Shutdown,
+    },
+}
+
+/// How the target goes down after the install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Shutdown {
+    /// Boot the installed system.
+    Reboot,
+    /// Power off, e.g. to remove the installer medium first.
+    PowerOff,
 }
 
 /// A disk the disko script is going to format, as the operator chose it.

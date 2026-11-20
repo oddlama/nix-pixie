@@ -40,11 +40,16 @@ in
       after = [ "network.target" ];
       # Inventory: lsblk for disks, nixos-facter for the hardware report.
       # Store push: `nix daemon --stdio` serving the store under /mnt.
+      # Install: ssh-keygen for pulled host keys, nixos-install, and zpool
+      # to export pools before the first boot.
       path = [
         pkgs.util-linux
         pkgs.nixos-facter
         config.nix.package
-      ];
+        pkgs.openssh
+        pkgs.nixos-install
+      ]
+      ++ lib.optional (config.boot.supportedFilesystems.zfs or false) config.boot.zfs.package;
       serviceConfig = {
         ExecStart = "${lib.getExe cfg.package} agent --port ${toString cfg.port} --state-dir /run/nix-pixie";
         RuntimeDirectory = "nix-pixie";

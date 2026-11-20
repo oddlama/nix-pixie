@@ -375,7 +375,7 @@ async fn run_disko(stream: &mut Stream, script: &str) -> Result<()> {
     let mut tail = Tail::default();
     loop {
         match read_frame(stream, MAX_TARGET_FRAME).await? {
-            TargetMsg::DiskoOutput { chunk } => {
+            TargetMsg::Output { chunk } => {
                 trace!(bytes = chunk.len(), "disko output");
                 tail.push(&chunk);
             }
