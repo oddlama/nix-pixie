@@ -170,9 +170,7 @@ async fn review(
     args: &PairArgs,
 ) -> Result<()> {
     let (label, inventory) = introduction(stream).await?;
-    let suggestions = flake
-        .map(|(_, m)| m.suggest(&inventory))
-        .unwrap_or_default();
+    let suggestions = flake.map_or_else(Vec::new, |(_, m)| m.suggest(&inventory));
     let machine = match &args.machine {
         Some(machine) => Some(machine.clone()),
         None => match suggestions.as_slice() {
@@ -340,9 +338,8 @@ fn summary(
         .filter_map(opt)
         .collect();
     if !hardware.is_empty() || inventory.dmi.serial.is_some() {
-        let serial = opt(&inventory.dmi.serial)
-            .map(|s| format!(" (serial {s})"))
-            .unwrap_or_default();
+        let serial =
+            opt(&inventory.dmi.serial).map_or_else(String::new, |s| format!(" (serial {s})"));
         let _ = writeln!(out, "  hardware  {}{serial}", hardware.join(" "));
     }
     for nic in &inventory.nics {
@@ -407,19 +404,22 @@ fn summary(
 }
 
 fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    // Display only: precision loss above 2^53 bytes is irrelevant.
     #[allow(clippy::cast_precision_loss)]
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = "KiB";
+    for next in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
         value /= 1024.0;
-        unit += 1;
+        unit = next;
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    format!("{value:.1} {unit}")
 }
 
 /// Dials discovered targets, at most once per target and code, but again
@@ -561,7 +561,7 @@ async fn pair_with_targets(
                     paired.push(conn);
                 }
                 Err(e) => {
-                    warn!(target = %peer.id, "target paired but did not introduce itself: {e:#}")
+                    warn!(target = %peer.id, "target paired but did not introduce itself: {e:#}");
                 }
             },
             Attempt::TooManyFailures => {
@@ -577,7 +577,7 @@ async fn pair_with_targets(
 }
 
 fn new_code(code_file: Option<&Path>) -> Result<Code> {
-    let code = Code::generate(None);
+    let code = Code::generate(None)?;
     eprintln!(
         "\n    Controller code:  {code}\n\n    On the target: nix-pixie agent --controller-code {code}\n"
     );

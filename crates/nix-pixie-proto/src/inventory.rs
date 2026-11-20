@@ -52,7 +52,12 @@ pub struct Nic {
     pub link_up: bool,
 }
 
+/// A whole disk (not a partition) as lsblk reports it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent flags mirroring lsblk's columns"
+)]
 pub struct Disk {
     /// Kernel name, e.g. `nvme0n1`.
     pub name: String,
@@ -78,6 +83,7 @@ pub struct Disk {
 
 impl Disk {
     /// Whether installing onto this disk would destroy something.
+    #[must_use]
     pub fn has_data(&self) -> bool {
         self.partition_table.is_some() || !self.contents.is_empty()
     }
@@ -96,6 +102,7 @@ pub struct Content {
 /// Whether `id` is acceptable as a `/dev/disk/by-id` name. These end up in
 /// generated disko configs and shell scripts, so only a conservative set of
 /// characters passes.
+#[must_use]
 pub fn is_valid_disk_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 255
@@ -106,6 +113,7 @@ pub fn is_valid_disk_id(id: &str) -> bool {
 }
 
 /// The Nix system double for a Rust `target_arch` on Linux.
+#[must_use]
 pub fn nix_system(arch: &str) -> String {
     let arch = match arch {
         "x86" => "i686",

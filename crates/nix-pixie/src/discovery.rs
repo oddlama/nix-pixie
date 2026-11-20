@@ -132,7 +132,7 @@ impl Discovery {
                     (announcement, vec![addr], "probe")
                 }
             };
-            if let Some(peer) = self.merge(announcement, addrs, via) {
+            if let Some(peer) = self.merge(&announcement, addrs, via) {
                 return Ok(peer);
             }
         }
@@ -141,7 +141,7 @@ impl Discovery {
     /// Records an announcement; returns the peer if anything changed.
     fn merge(
         &mut self,
-        announcement: Announcement,
+        announcement: &Announcement,
         addrs: Vec<SocketAddr>,
         via: &str,
     ) -> Option<Peer> {

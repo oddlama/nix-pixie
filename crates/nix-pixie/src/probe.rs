@@ -19,7 +19,7 @@
 //! One catch: if the target still has *us* in its neighbour cache, it doesn't
 //! need to ask, and we learn nothing until its entry goes stale (5-10 s).
 //! That happens whenever the controller's side flushes its table, e.g.
-//! NetworkManager re-activating a link. So the target (root on the installer)
+//! `NetworkManager` re-activating a link. So the target (root on the installer)
 //! flushes its entry for the prober before replying, which forces the
 //! request.
 //!
@@ -85,7 +85,7 @@ impl Responder {
             let Ok((len, from)) = self.socket.recv_from(&mut buf).await else {
                 continue;
             };
-            let Some(nonce) = decode_probe(&buf[..len]) else {
+            let Some(nonce) = buf.get(..len).and_then(decode_probe) else {
                 continue;
             };
             debug!(%from, "probe received");
@@ -100,7 +100,14 @@ impl Responder {
                 .borrow()
                 .as_ref()
                 .map(|a| encode_reply(&nonce, a));
-            let Some(reply) = reply else { continue };
+            let reply = match reply {
+                Some(Ok(reply)) => reply,
+                Some(Err(e)) => {
+                    warn!("encoding a probe reply: {e}");
+                    continue;
+                }
+                None => continue,
+            };
             let prober = canonical(from).ip();
             if flushed
                 .get(&prober)
@@ -188,7 +195,7 @@ impl Prober {
 async fn recv_reply(socket: &UdpSocket, nonce: &Nonce) -> Option<(Announcement, SocketAddr)> {
     let mut buf = vec![0; PROBE_LEN];
     let (len, from) = socket.recv_from(&mut buf).await.ok()?;
-    match decode_reply(&buf[..len], nonce) {
+    match decode_reply(buf.get(..len)?, nonce) {
         Ok(announcement) => {
             debug!(%from, "probe reply");
             let mut addr = canonical(from);
@@ -347,7 +354,7 @@ fn canonical(addr: SocketAddr) -> SocketAddr {
             Some(v4) => SocketAddr::from((v4, v6.port())),
             None => addr,
         },
-        v4 => v4,
+        v4 @ SocketAddr::V4(_) => v4,
     }
 }
 
@@ -387,7 +394,10 @@ mod tests {
 
     #[test]
     fn garbage_neighbour_output_is_empty() {
-        assert!(parse_neighbours(b"not json", |_| None).is_empty());
+        assert_eq!(
+            parse_neighbours(b"not json", |_| None),
+            Vec::<SocketAddr>::new()
+        );
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub enum AnnounceError {
 
 impl Announcement {
     /// Builds an announcement for this protocol version, truncating the label.
+    #[must_use]
     pub fn new(id: [u8; 32], port: u16, pairing: Pairing, label: &str) -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -73,6 +74,7 @@ impl Announcement {
     }
 
     /// TXT record entries. The port goes into the SRV record instead.
+    #[must_use]
     pub fn txt(&self) -> Vec<(&'static str, String)> {
         let mut txt = vec![
             ("v", self.version.to_string()),
@@ -90,6 +92,10 @@ impl Announcement {
     }
 
     /// Parses TXT record entries (looked up through `get`) plus the SRV port.
+    ///
+    /// # Errors
+    ///
+    /// If a field is missing or malformed, or the version is not ours.
     pub fn from_txt<'a>(
         get: impl Fn(&str) -> Option<&'a str>,
         port: u16,
@@ -139,6 +145,8 @@ impl Announcement {
 /// Random per-discovery value that replies must echo.
 pub type Nonce = [u8; 16];
 
+/// A fresh random probe nonce.
+#[must_use]
 pub fn new_nonce() -> Nonce {
     rand::random()
 }
@@ -149,6 +157,8 @@ pub const PROBE_LEN: usize = 512;
 const PROBE_MAGIC: &[u8; 16] = b"nix-pixie/probe1";
 const REPLY_MAGIC: &[u8; 16] = b"nix-pixie/reply1";
 
+/// A probe carrying `nonce`, padded to [`PROBE_LEN`].
+#[must_use]
 pub fn encode_probe(nonce: &Nonce) -> Vec<u8> {
     let mut probe = Vec::with_capacity(PROBE_LEN);
     probe.extend_from_slice(PROBE_MAGIC);
@@ -158,31 +168,45 @@ pub fn encode_probe(nonce: &Nonce) -> Vec<u8> {
 }
 
 /// The probe's nonce, if `datagram` is a well-formed probe.
+#[must_use]
 pub fn decode_probe(datagram: &[u8]) -> Option<Nonce> {
     if datagram.len() != PROBE_LEN || !datagram.starts_with(PROBE_MAGIC) {
         return None;
     }
-    datagram[16..32].try_into().ok()
+    datagram.get(16..32)?.try_into().ok()
 }
 
-pub fn encode_reply(nonce: &Nonce, announcement: &Announcement) -> Vec<u8> {
+/// The reply to a probe with `nonce`.
+///
+/// # Errors
+///
+/// If the announcement doesn't serialise, which only a bug can cause.
+pub fn encode_reply(nonce: &Nonce, announcement: &Announcement) -> postcard::Result<Vec<u8>> {
     let mut reply = Vec::with_capacity(PROBE_LEN);
     reply.extend_from_slice(REPLY_MAGIC);
     reply.extend_from_slice(nonce);
-    reply.extend(postcard::to_allocvec(announcement).expect("announcements always serialise"));
+    let reply = postcard::to_extend(announcement, reply)?;
     debug_assert!(reply.len() < PROBE_LEN, "reply of {} bytes", reply.len());
-    reply
+    Ok(reply)
 }
 
 /// The announcement in a reply to our probe with `nonce`.
+///
+/// # Errors
+///
+/// If the datagram is not a reply to this probe, or its announcement is
+/// malformed or of another protocol version.
 pub fn decode_reply(datagram: &[u8], nonce: &Nonce) -> Result<Announcement, AnnounceError> {
-    if datagram.len() < 32 || !datagram.starts_with(REPLY_MAGIC) {
+    let Some((header, body)) = datagram.split_at_checked(32) else {
+        return Err(AnnounceError::Invalid("reply"));
+    };
+    if !header.starts_with(REPLY_MAGIC) {
         return Err(AnnounceError::Invalid("reply"));
     }
-    if &datagram[16..32] != nonce {
+    if header.get(16..) != Some(nonce.as_slice()) {
         return Err(AnnounceError::Invalid("nonce"));
     }
-    postcard::from_bytes::<Announcement>(&datagram[32..])
+    postcard::from_bytes::<Announcement>(body)
         .map_err(|_| AnnounceError::Invalid("reply"))?
         .validated()
 }
@@ -246,7 +270,7 @@ mod tests {
     #[test]
     fn reply_round_trip_checks_nonce() {
         let nonce = [5; 16];
-        let reply = encode_reply(&nonce, &shows(42));
+        let reply = encode_reply(&nonce, &shows(42)).unwrap();
         assert_eq!(decode_reply(&reply, &nonce), Ok(shows(42)));
         assert_eq!(
             decode_reply(&reply, &[6; 16]),
@@ -271,6 +295,6 @@ mod tests {
             &label,
         );
         assert_eq!(announcement.label.chars().count(), MAX_LABEL);
-        assert!(encode_reply(&[0; 16], &announcement).len() < PROBE_LEN);
+        assert!(encode_reply(&[0; 16], &announcement).unwrap().len() < PROBE_LEN);
     }
 }

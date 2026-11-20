@@ -183,10 +183,17 @@ async fn main() -> Result<()> {
 
 /// Resolves on Ctrl-C or SIGTERM (systemd stop).
 pub async fn shutdown_signal() {
-    let mut term = signal(SignalKind::terminate()).expect("installing a SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        Err(e) => {
+            tracing::warn!("can't handle SIGTERM, only Ctrl-C: {e}");
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 

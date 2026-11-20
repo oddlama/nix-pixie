@@ -14,7 +14,7 @@ use tracing::warn;
 
 use crate::net::{hostname, sanitise};
 
-/// EFI global variable GUID (SecureBoot, SetupMode).
+/// EFI global variable GUID (`SecureBoot`, `SetupMode`).
 const EFI_GLOBAL: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 /// Longest string we keep from sysfs or lsblk.
 const MAX_FIELD: usize = 128;

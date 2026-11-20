@@ -18,7 +18,7 @@
 use std::fmt;
 use std::sync::OnceLock;
 
-use rand::RngExt;
+use rand::seq::IndexedRandom;
 
 /// Number of secret words in a code.
 pub const WORDS: usize = 3;
@@ -28,6 +28,7 @@ pub const MAX_NAMEPLATE: u8 = 99;
 const WORDLIST_SOURCE: &str = include_str!("wordlist.txt");
 
 /// The pairing wordlist, in file order.
+#[must_use]
 pub fn wordlist() -> &'static [&'static str] {
     static WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
     WORDS.get_or_init(|| {
@@ -38,19 +39,22 @@ pub fn wordlist() -> &'static [&'static str] {
     })
 }
 
-fn word_index(word: &str) -> Option<u16> {
+/// The list's own spelling of `word`, if it is on the list.
+fn lookup(word: &str) -> Option<&'static str> {
     // The list is sorted; the tests check that.
-    wordlist()
-        .binary_search(&word)
+    let list = wordlist();
+    list.binary_search(&word)
         .ok()
-        .map(|i| u16::try_from(i).expect("wordlist has fewer than 65536 words"))
+        .and_then(|i| list.get(i))
+        .copied()
 }
 
 /// A parsed or generated pairing code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Code {
     nameplate: Option<u8>,
-    words: [u16; WORDS],
+    /// Words from [`wordlist`], in order.
+    words: [&'static str; WORDS],
 }
 
 /// Why a typed code was rejected.
@@ -64,30 +68,37 @@ pub enum CodeError {
     UnknownWord(String),
     #[error("`{0}` matches several code words ({1}); please retype it")]
     AmbiguousWord(String, String),
+    #[error("the built-in wordlist is empty")]
+    EmptyWordlist,
 }
 
 impl Code {
     /// Generates a code with fresh random words.
-    pub fn generate(nameplate: Option<u8>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Only if the built-in wordlist were empty (the tests check it isn't).
+    /// Returned rather than papered over: a fallback would be a code without
+    /// any secret.
+    pub fn generate(nameplate: Option<u8>) -> Result<Self, CodeError> {
+        let list = wordlist();
         let mut rng = rand::rng();
-        let len = u16::try_from(wordlist().len()).expect("wordlist has fewer than 65536 words");
-        Self {
-            nameplate,
-            words: std::array::from_fn(|_| rng.random_range(0..len)),
+        let mut words = [""; WORDS];
+        for word in &mut words {
+            *word = list.choose(&mut rng).ok_or(CodeError::EmptyWordlist)?;
         }
+        Ok(Self { nameplate, words })
     }
 
     /// Picks a random nameplate that is not in `taken`, if one is left.
+    #[must_use]
     pub fn free_nameplate(taken: &[u8]) -> Option<u8> {
         let free: Vec<u8> = (1..=MAX_NAMEPLATE).filter(|n| !taken.contains(n)).collect();
-        if free.is_empty() {
-            None
-        } else {
-            Some(free[rand::rng().random_range(0..free.len())])
-        }
+        free.choose(&mut rand::rng()).copied()
     }
 
     /// The public nameplate, if this is a target-shown code.
+    #[must_use]
     pub fn nameplate(&self) -> Option<u8> {
         self.nameplate
     }
@@ -95,6 +106,11 @@ impl Code {
     /// Parses a typed code. Any run of characters other than letters, digits
     /// and `;` separates tokens, so `42 acid acorn acre` and `42-acid-acorn-acre`
     /// are the same code. A leading all-digit token is the nameplate.
+    ///
+    /// # Errors
+    ///
+    /// If the nameplate is out of range, the number of words is wrong, or a
+    /// word is unknown or ambiguous.
     pub fn parse(input: &str) -> Result<Self, CodeError> {
         let mut tokens: Vec<&str> = input
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == ';'))
@@ -117,7 +133,7 @@ impl Code {
         if tokens.len() != WORDS {
             return Err(CodeError::WordCount(tokens.len()));
         }
-        let mut words = [0; WORDS];
+        let mut words = [""; WORDS];
         for (slot, token) in words.iter_mut().zip(tokens) {
             *slot = normalise_word(token)?;
         }
@@ -125,6 +141,7 @@ impl Code {
     }
 
     /// The PAKE password: the canonical spelling of the whole code.
+    #[must_use]
     pub fn password(&self) -> Vec<u8> {
         self.to_string().into_bytes()
     }
@@ -135,9 +152,7 @@ impl fmt::Display for Code {
         if let Some(n) = self.nameplate {
             write!(f, "{n}-")?;
         }
-        let list = wordlist();
-        let words: Vec<&str> = self.words.iter().map(|&i| list[usize::from(i)]).collect();
-        f.write_str(&words.join("-"))
+        f.write_str(&self.words.join("-"))
     }
 }
 
@@ -163,8 +178,11 @@ fn azerty(c: char) -> char {
     }
 }
 
-/// Spellings to try for a typed word: as typed, and with each layout undone.
-fn candidates(typed: &str) -> [String; 3] {
+/// `word` as typed on a US, a QWERTZ and an AZERTY keyboard while the
+/// console uses a US keymap. Every swap is its own inverse, so these are
+/// also the spellings to try for a typed word.
+#[must_use]
+pub fn layout_variants(typed: &str) -> [String; 3] {
     [
         typed.to_string(),
         typed.chars().map(qwertz).collect(),
@@ -172,25 +190,23 @@ fn candidates(typed: &str) -> [String; 3] {
     ]
 }
 
-fn normalise_word(token: &str) -> Result<u16, CodeError> {
+/// The word a typed token means, undoing keymap mix-ups.
+///
+/// # Errors
+///
+/// If no spelling of the token is a code word, or several are.
+pub fn normalise_word(token: &str) -> Result<&'static str, CodeError> {
     let typed = token.to_ascii_lowercase();
-    let mut found: Vec<u16> = candidates(&typed)
+    let mut found: Vec<&'static str> = layout_variants(&typed)
         .iter()
-        .filter_map(|c| word_index(c))
+        .filter_map(|c| lookup(c))
         .collect();
     found.sort_unstable();
     found.dedup();
     match found.as_slice() {
-        [index] => Ok(*index),
+        [word] => Ok(word),
         [] => Err(CodeError::UnknownWord(token.to_string())),
-        many => {
-            let list = wordlist();
-            let names: Vec<&str> = many.iter().map(|&i| list[usize::from(i)]).collect();
-            Err(CodeError::AmbiguousWord(
-                token.to_string(),
-                names.join(", "),
-            ))
-        }
+        many => Err(CodeError::AmbiguousWord(token.to_string(), many.join(", "))),
     }
 }
 
@@ -213,18 +229,9 @@ mod tests {
     /// keymap) must normalise back to exactly that word.
     #[test]
     fn layouts_are_unambiguous() {
-        for (i, word) in wordlist().iter().enumerate() {
-            let typed_as = [
-                word.to_string(),
-                word.chars().map(qwertz).collect::<String>(),
-                word.chars().map(azerty).collect::<String>(),
-            ];
-            for typed in typed_as {
-                assert_eq!(
-                    normalise_word(&typed),
-                    Ok(u16::try_from(i).unwrap()),
-                    "{word} typed as {typed}"
-                );
+        for word in wordlist() {
+            for typed in layout_variants(word) {
+                assert_eq!(normalise_word(&typed), Ok(*word), "{word} typed as {typed}");
             }
         }
     }
@@ -232,7 +239,7 @@ mod tests {
     #[test]
     fn round_trip() {
         for nameplate in [None, Some(1), Some(42), Some(MAX_NAMEPLATE)] {
-            let code = Code::generate(nameplate);
+            let code = Code::generate(nameplate).unwrap();
             assert_eq!(Code::parse(&code.to_string()), Ok(code));
         }
     }

@@ -27,10 +27,10 @@ impl Mdns {
     pub fn advertise(&self, announcement: &Announcement) -> Result<String> {
         // Unique per endpoint and code, so a rotated code shows up as a new
         // instance instead of an update that browsers may have cached.
-        let id = nix_pixie_proto::hex::encode(&announcement.id);
+        let id = nix_pixie_proto::hex::encode(announcement.id.get(..6).unwrap_or(&announcement.id));
         let instance = match announcement.pairing {
-            Pairing::ShowsCode { nameplate } => format!("target-{}-{nameplate}", &id[..12]),
-            Pairing::TypedControllerCode => format!("target-{}-typed", &id[..12]),
+            Pairing::ShowsCode { nameplate } => format!("target-{id}-{nameplate}"),
+            Pairing::TypedControllerCode => format!("target-{id}-typed"),
         };
         let txt = announcement.txt();
         let properties: Vec<(&str, &str)> = txt.iter().map(|(k, v)| (*k, v.as_str())).collect();

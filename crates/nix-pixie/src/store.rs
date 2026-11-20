@@ -71,23 +71,30 @@ fn mounts(mountinfo: &str) -> impl Iterator<Item = (PathBuf, String)> + '_ {
 }
 
 /// Undoes mountinfo's octal escapes (`\040` for a space, and so on).
-fn unescape(field: &str) -> String {
-    let bytes = field.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && let Some(octal) = bytes.get(i + 1..i + 4)
-            && let Ok(byte) = u8::from_str_radix(&String::from_utf8_lossy(octal), 8)
+pub fn unescape(field: &str) -> String {
+    let mut rest = field.as_bytes();
+    let mut out = Vec::with_capacity(rest.len());
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'\\'
+            && let Some((digits, after)) = tail.split_first_chunk::<3>()
+            && let Some(decoded) = octal(*digits)
         {
-            out.push(byte);
-            i += 4;
+            out.push(decoded);
+            rest = after;
         } else {
-            out.push(bytes[i]);
-            i += 1;
+            out.push(byte);
+            rest = tail;
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Three octal digits as a byte (`\000` to `\377`).
+fn octal(digits: [u8; 3]) -> Option<u8> {
+    digits.iter().try_fold(0u8, |value, &digit| {
+        let digit = digit.checked_sub(b'0').filter(|d| *d < 8)?;
+        value.checked_mul(8)?.checked_add(digit)
+    })
 }
 
 /// Runs `nix daemon --stdio` for the store under `root` and connects it to the
@@ -185,5 +192,10 @@ mod tests {
         assert_eq!(unescape("/a\\040b\\011c"), "/a b\tc");
         assert_eq!(unescape("/plain"), "/plain");
         assert_eq!(unescape("/trailing\\04"), "/trailing\\04");
+        // Only real octal escapes: not signs, not 8 or 9, nothing above \377.
+        assert_eq!(unescape("/x\\+12"), "/x\\+12");
+        assert_eq!(unescape("/x\\089"), "/x\\089");
+        assert_eq!(unescape("/x\\400"), "/x\\400");
+        assert_eq!(unescape("/x\\377"), "/x\u{fffd}");
     }
 }

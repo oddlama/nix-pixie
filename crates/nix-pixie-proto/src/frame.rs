@@ -18,6 +18,10 @@ pub enum FrameError {
 }
 
 /// Writes one frame and flushes.
+///
+/// # Errors
+///
+/// If the value doesn't serialise, is larger than 4 GiB, or writing fails.
 pub async fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin,
@@ -35,6 +39,11 @@ where
 }
 
 /// Reads one frame of at most `limit` bytes.
+///
+/// # Errors
+///
+/// If reading fails, the frame is larger than `limit`, or it doesn't
+/// deserialise as `T`.
 pub async fn read_frame<R, T>(reader: &mut R, limit: usize) -> Result<T, FrameError>
 where
     R: AsyncRead + Unpin,

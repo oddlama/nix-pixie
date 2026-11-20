@@ -94,7 +94,7 @@ pub async fn dial_and_pair(
 
 /// The addresses to dial: everything except IPv6 link-local, unless that's all
 /// there is. Link-local is the fallback for direct cables. It depends on
-/// scope ids (which stock iroh drops, iroh#4584), and NetworkManager briefly
+/// scope ids (which stock iroh drops, iroh issue 4584), and `NetworkManager` briefly
 /// removes it whenever it gives up on DHCP on that link.
 pub fn dial_addrs(addrs: &BTreeSet<SocketAddr>) -> Vec<SocketAddr> {
     let is_link_local =

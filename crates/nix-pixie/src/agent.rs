@@ -124,7 +124,7 @@ async fn show_code(announcer: &mut Announcer<'_>, state: &StateDir) -> Result<()
         let taken = nameplates_in_use(announcer.mdns, endpoint).await?;
         let nameplate =
             Code::free_nameplate(&taken).context("all nameplates on this network are in use")?;
-        let code = Code::generate(Some(nameplate));
+        let code = Code::generate(Some(nameplate))?;
         announcer.announce(Pairing::ShowsCode { nameplate })?;
         state.write("code", &code.to_string())?;
         println!(
@@ -134,15 +134,14 @@ async fn show_code(announcer: &mut Announcer<'_>, state: &StateDir) -> Result<()
         let paired = accept_pairing(endpoint, &code, Side::OwnsCode).await;
         announcer.withdraw();
         state.remove("code");
-        match paired? {
-            Some((conn, stream)) => {
-                if let Err(e) = session(endpoint, state, &conn, stream).await {
-                    warn!("session ended with an error: {e:#}");
-                }
+        if let Some((conn, stream)) = paired? {
+            if let Err(e) = session(endpoint, state, &conn, stream).await {
+                warn!("session ended with an error: {e:#}");
             }
-            None => warn!(
+        } else {
+            warn!(
                 "{MAX_FAILURES} pairing attempts with a wrong code; someone may be guessing. Showing a new code."
-            ),
+            );
         }
     }
 }
@@ -307,7 +306,7 @@ async fn serve_controller(
                 info!(?machine, "approved by the controller");
                 match machine {
                     Some(machine) => {
-                        println!("\n    Approved as {machine}. Waiting for the controller.\n")
+                        println!("\n    Approved as {machine}. Waiting for the controller.\n");
                     }
                     None => println!("\n    Approved. Waiting for the controller.\n"),
                 }
@@ -337,11 +336,7 @@ async fn serve_controller(
                 write_frame(stream, &reply).await?;
             }
             ControllerMsg::PrepareStore { root } => {
-                let reply = if !approved {
-                    TargetMsg::StoreRefused {
-                        reason: "not approved yet".to_string(),
-                    }
-                } else {
+                let reply = if approved {
                     match store::check_root(&root) {
                         Ok(fstype) => {
                             info!(%root, %fstype, "ready to receive store paths");
@@ -352,6 +347,10 @@ async fn serve_controller(
                             warn!(%root, %reason, "refusing to receive store paths");
                             TargetMsg::StoreRefused { reason }
                         }
+                    }
+                } else {
+                    TargetMsg::StoreRefused {
+                        reason: "not approved yet".to_string(),
                     }
                 };
                 write_frame(stream, &reply).await?;

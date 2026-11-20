@@ -155,6 +155,11 @@ pub struct PairParams<'a> {
 
 /// Runs the pairing exchange, giving up after `timeout`. On `Ok`, both sides
 /// verified each other's key confirmation.
+///
+/// # Errors
+///
+/// A [`PairFailure`] when the exchange fails for any reason; it says whether
+/// the attempt counts as a spent guess at the code.
 pub async fn pair<S>(
     stream: &mut S,
     params: PairParams<'_>,
@@ -228,17 +233,14 @@ where
     let transcript = Transcript::new(&params, &ours, &theirs);
     let confirm = PairFrame::Confirm {
         mac: transcript
-            .mac(&key, params.role)
+            .mac(&key, params.role)?
             .finalize()
             .into_bytes()
             .into(),
     };
-    let check_peer = |mac: &[u8; 32]| {
-        transcript
-            .mac(&key, params.role.peer())
-            .verify_slice(mac)
-            .is_ok()
-    };
+    let peer_mac = transcript.mac(&key, params.role.peer())?;
+    // Constant-time comparison.
+    let check_peer = |mac: &[u8; 32]| peer_mac.clone().verify_slice(mac).is_ok();
 
     match params.side {
         Side::TypedCode => {
@@ -312,24 +314,28 @@ impl<'a> Transcript<'a> {
 
     /// The confirmation MAC that `sender` sends. Including the sender's role
     /// stops an attacker from reflecting a side's own MAC back to it.
-    fn mac(&self, key: &[u8], sender: Role) -> HmacSha256 {
-        let mut kdf =
-            <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC takes any key size");
+    fn mac(&self, key: &[u8], sender: Role) -> Result<HmacSha256, PairError> {
+        // HMAC takes keys of any length; the error can't happen.
+        let new = |key: &[u8]| {
+            <HmacSha256 as KeyInit>::new_from_slice(key)
+                .map_err(|_| PairError::Protocol("HMAC key rejected"))
+        };
+        let mut kdf = new(key)?;
         kdf.update(CONFIRM_KEY_LABEL);
         let confirm_key = kdf.finalize().into_bytes();
 
-        let mut mac =
-            <HmacSha256 as KeyInit>::new_from_slice(&confirm_key).expect("HMAC takes any key size");
+        let mut mac = new(&confirm_key)?;
         mac.update(&[sender.tag()]);
         mac.update(&PROTOCOL_VERSION.to_be_bytes());
         mac.update(&self.controller_id);
         mac.update(&self.target_id);
         for message in [self.controller_spake, self.target_spake] {
-            let len = u32::try_from(message.len()).expect("SPAKE2 messages are tiny");
+            let len = u32::try_from(message.len())
+                .map_err(|_| PairError::Protocol("oversized SPAKE2 message"))?;
             mac.update(&len.to_be_bytes());
             mac.update(message);
         }
-        mac
+        Ok(mac)
     }
 }
 
@@ -399,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_code_pairs() {
-        let code = Code::generate(Some(42));
+        let code = Code::generate(Some(42)).unwrap();
         let (c, t) = run(controller(&code, TARGET), target(&code, CONTROLLER)).await;
         c.unwrap();
         t.unwrap();
@@ -408,7 +414,7 @@ mod tests {
     /// Controller-shown code: the controller owns it, the target typed it.
     #[tokio::test]
     async fn same_code_pairs_with_sides_swapped() {
-        let code = Code::generate(None);
+        let code = Code::generate(None).unwrap();
         let c = PairParams {
             side: Side::OwnsCode,
             ..controller(&code, TARGET)
@@ -438,7 +444,7 @@ mod tests {
     async fn relay_attack_fails_on_both_sides() {
         const ATTACKER_TO_TARGET: EndpointIdBytes = [3; 32];
         const ATTACKER_TO_CONTROLLER: EndpointIdBytes = [4; 32];
-        let code = Code::generate(Some(7));
+        let code = Code::generate(Some(7)).unwrap();
 
         let (mut controller_side, mut attacker_a) = tokio::io::duplex(4096);
         let (mut target_side, mut attacker_b) = tokio::io::duplex(4096);
@@ -465,8 +471,8 @@ mod tests {
     /// (counted as a guess) once it sends a wrong one.
     #[tokio::test]
     async fn owner_reveals_nothing_to_a_guessing_typist() {
-        let code = Code::generate(Some(9));
-        let guess = Code::generate(Some(9));
+        let code = Code::generate(Some(9)).unwrap();
+        let guess = Code::generate(Some(9)).unwrap();
         assert_ne!(code, guess);
 
         let (mut honest, mut attacker) = tokio::io::duplex(4096);
@@ -499,13 +505,18 @@ mod tests {
     /// must not count it (otherwise anyone could force code rotations for free).
     #[tokio::test]
     async fn owner_does_not_count_a_hangup_before_confirmation() {
-        let code = Code::generate(Some(9));
+        let code = Code::generate(Some(9)).unwrap();
         let (mut honest, mut attacker) = tokio::io::duplex(4096);
         let owner =
             tokio::spawn(
                 async move { pair(&mut honest, target(&code, CONTROLLER), TIMEOUT).await },
             );
-        send_guess(&mut attacker, &Code::generate(Some(9)), Role::Controller).await;
+        send_guess(
+            &mut attacker,
+            &Code::generate(Some(9)).unwrap(),
+            Role::Controller,
+        )
+        .await;
         drop(attacker);
         let failure = owner.await.unwrap().unwrap_err();
         assert!(matches!(failure.error, PairError::Frame(_)), "{failure:?}");
@@ -516,13 +527,18 @@ mod tests {
     /// then hang up. The typist must count that.
     #[tokio::test]
     async fn typist_counts_a_hangup_after_its_confirmation() {
-        let code = Code::generate(Some(9));
+        let code = Code::generate(Some(9)).unwrap();
         let (mut honest, mut rogue_owner) = tokio::io::duplex(4096);
         let typist =
             tokio::spawn(
                 async move { pair(&mut honest, controller(&code, TARGET), TIMEOUT).await },
             );
-        send_guess(&mut rogue_owner, &Code::generate(Some(9)), Role::Target).await;
+        send_guess(
+            &mut rogue_owner,
+            &Code::generate(Some(9)).unwrap(),
+            Role::Target,
+        )
+        .await;
         let confirm: PairFrame = read_frame(&mut rogue_owner, MAX_FRAME).await.unwrap();
         assert!(matches!(confirm, PairFrame::Confirm { .. }), "{confirm:?}");
         drop(rogue_owner);
@@ -532,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_peer_times_out_without_spending_a_guess() {
-        let code = Code::generate(Some(9));
+        let code = Code::generate(Some(9)).unwrap();
         let (mut honest, _silent) = tokio::io::duplex(4096);
         let failure = pair(
             &mut honest,
@@ -547,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_controllers_refuse_each_other() {
-        let code = Code::generate(None);
+        let code = Code::generate(None).unwrap();
         let other_controller = PairParams {
             role: Role::Controller,
             ..target(&code, CONTROLLER)

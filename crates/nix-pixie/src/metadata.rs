@@ -117,8 +117,7 @@ pub fn local_flake_dir(flake: &str) -> Option<PathBuf> {
     let path = flake
         .strip_prefix("path:")
         .or_else(|| flake.strip_prefix("git+file://"))
-        .map(|rest| rest.split(['?', '#']).next().unwrap_or(rest))
-        .unwrap_or(flake);
+        .map_or(flake, |rest| rest.split(['?', '#']).next().unwrap_or(rest));
     // Anything else with a scheme (github:, git+https:, ...) is remote.
     if path.contains(':') {
         return None;
@@ -235,10 +234,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["db1"]
         );
-        assert!(
-            metadata
-                .suggest(&inventory("aa:aa:aa:aa:aa:aa", None))
-                .is_empty()
+        assert_eq!(
+            metadata.suggest(&inventory("aa:aa:aa:aa:aa:aa", None)),
+            Vec::new()
         );
     }
 
