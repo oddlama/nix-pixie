@@ -21,7 +21,10 @@ let
     machines = {
       web1 = {
         match.mac = [ "AA:BB:CC:DD:EE:FF" ];
-        hostKey.mode = "pull";
+        hostKey = {
+          mode = "pull";
+          publicKeyPath = "machines/web1/ssh_host_ed25519_key.pub";
+        };
         facter.reportPath = "machines/web1/facter.json";
       };
       rack-a.configuration = "generic";
@@ -55,7 +58,10 @@ let
           dmiSerial = [ ];
         };
         disks.file = null;
-        hostKey.mode = "pull";
+        hostKey = {
+          mode = "pull";
+          publicKeyPath = "machines/web1/ssh_host_ed25519_key.pub";
+        };
         facter.reportPath = "machines/web1/facter.json";
       };
       rack-a = {
@@ -65,7 +71,10 @@ let
           dmiSerial = [ ];
         };
         disks.file = null;
-        hostKey.mode = "none";
+        hostKey = {
+          mode = "none";
+          publicKeyPath = null;
+        };
         facter.reportPath = null;
       };
       db1 = {
@@ -75,7 +84,10 @@ let
           dmiSerial = [ ];
         };
         disks.file = "machines/db1/disks.json";
-        hostKey.mode = "none";
+        hostKey = {
+          mode = "none";
+          publicKeyPath = null;
+        };
         facter.reportPath = null;
       };
     };
@@ -99,6 +111,10 @@ let
     escaping-report-path = pixieLib.mkPixie {
       inherit nixosConfigurations;
       config.machines.web1.facter.reportPath = "machines/../../facter.json";
+    };
+    escaping-public-key-path = pixieLib.mkPixie {
+      inherit nixosConfigurations;
+      config.machines.web1.hostKey.publicKeyPath = "../web1.pub";
     };
     absolute-disks-file = pixieLib.mkPixie {
       inherit nixosConfigurations;

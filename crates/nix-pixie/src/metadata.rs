@@ -21,11 +21,13 @@ pub struct Metadata {
 /// One machine of the flake: which configuration it installs, and how to
 /// recognise it.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Machine {
     pub configuration: String,
     #[serde(rename = "match")]
     pub hints: Hints,
     pub disks: Disks,
+    pub host_key: HostKey,
     pub facter: Facter,
 }
 
@@ -36,6 +38,27 @@ pub struct Machine {
 pub struct Hints {
     pub mac: Vec<String>,
     pub dmi_serial: Vec<String>,
+}
+
+/// Where the installed system's SSH host key comes from.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostKey {
+    pub mode: HostKeyMode,
+    /// Pull mode: where to record the public key, relative to the flake.
+    pub public_key_path: Option<String>,
+}
+
+/// See `hostKey.mode` in `nix/options.nix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostKeyMode {
+    /// The installed system makes its own on first boot.
+    None,
+    /// The controller provides it (not implemented yet).
+    Push,
+    /// The target generates it during the install.
+    Pull,
 }
 
 /// How the machine's disks are chosen.

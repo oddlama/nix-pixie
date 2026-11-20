@@ -62,19 +62,35 @@ let
           '';
         };
 
-        hostKey.mode = mkOption {
-          type = types.enum [
-            "none"
-            "push"
-            "pull"
-          ];
-          default = "none";
-          description = ''
-            `none`: the installed system generates its host key on first boot.
-            `push`: the controller provides the host key.
-            `pull`: the target generates the key during install, and hooks
-            (e.g. rekeying) run before the system is built.
-          '';
+        hostKey = {
+          mode = mkOption {
+            type = types.enum [
+              "none"
+              "push"
+              "pull"
+            ];
+            default = "none";
+            description = ''
+              `none`: the installed system generates its host key on first
+              boot; the controller can only report the key it sees.
+              `push`: the controller provides the host key (not implemented
+              yet; the controller refuses it).
+              `pull`: the target generates an ed25519 key right after
+              approval, before anything is built, and the installed system
+              gets it at the path its `services.openssh.hostKeys` names. The
+              controller checks it over SSH after the first boot.
+            '';
+          };
+          publicKeyPath = mkOption {
+            type = types.nullOr repoRelativePath;
+            default = null;
+            example = "machines/web1/ssh_host_ed25519_key.pub";
+            description = ''
+              Pull mode: where the controller records the public key, relative
+              to the flake root, before building, so the configuration (or a
+              rekeying hook) can use it.
+            '';
+          };
         };
 
         facter.reportPath = mkOption {

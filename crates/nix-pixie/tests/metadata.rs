@@ -19,14 +19,14 @@ const METADATA: &str = r#"{
             "configuration": "web1",
             "match": { "mac": ["52:54:00:12:01:02"], "dmiSerial": [] },
             "disks": { "file": "machines/web1/disks.json" },
-            "hostKey": { "mode": "none" },
+            "hostKey": { "mode": "none", "publicKeyPath": null },
             "facter": { "reportPath": "machines/web1/facter.json" }
         },
         "db1": {
             "configuration": "db",
             "match": { "mac": [], "dmiSerial": ["SN-42"] },
             "disks": { "file": null },
-            "hostKey": { "mode": "pull" },
+            "hostKey": { "mode": "pull", "publicKeyPath": "machines/db1/host.pub" },
             "facter": { "reportPath": null }
         }
     }
@@ -55,6 +55,13 @@ fn parses_and_suggests() {
         metadata.machines["web1"].facter.report_path.as_deref(),
         Some("machines/web1/facter.json")
     );
+    let db1 = &metadata.machines["db1"];
+    assert_eq!(db1.host_key.mode, HostKeyMode::Pull);
+    assert_eq!(
+        db1.host_key.public_key_path.as_deref(),
+        Some("machines/db1/host.pub")
+    );
+    assert_eq!(metadata.machines["web1"].host_key.mode, HostKeyMode::None);
 
     let by_mac = metadata.suggest(&inventory("52:54:00:12:01:02", None));
     assert_eq!(
