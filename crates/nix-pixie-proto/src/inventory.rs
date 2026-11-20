@@ -81,11 +81,22 @@ pub struct Disk {
     /// stacked on them, like LUKS or LVM).
     pub contents: Vec<Content>,
     /// Something on it is mounted or used as swap, e.g. the installer's own
-    /// boot medium. Never offered for installation.
+    /// boot medium.
     pub in_use: bool,
+    /// nix-pixie formatted it earlier during this boot of the installer, so
+    /// whatever is mounted from it belongs to that attempt, and the next
+    /// disko run unmounts it.
+    pub formatted_this_boot: bool,
 }
 
 impl Disk {
+    /// Whether nix-pixie may install onto it. Not the installer's own boot
+    /// medium or anything else in use, unless it was nix-pixie's own doing.
+    #[must_use]
+    pub fn installable(&self) -> bool {
+        self.size_bytes > 0 && !self.read_only && (!self.in_use || self.formatted_this_boot)
+    }
+
     /// Whether installing onto this disk would destroy something.
     #[must_use]
     pub fn has_data(&self) -> bool {

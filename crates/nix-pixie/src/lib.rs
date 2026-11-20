@@ -13,6 +13,7 @@ pub mod agent;
 pub mod cli;
 pub mod controller;
 pub mod discovery;
+pub mod disko;
 pub mod identity;
 pub mod inventory;
 pub mod mdns;

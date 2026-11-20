@@ -29,6 +29,12 @@ impl StateDir {
         write_private(&self.path.join(name), contents)
     }
 
+    /// The file's contents without the trailing newline, if it exists.
+    pub fn read(&self, name: &str) -> Option<String> {
+        let contents = fs::read_to_string(self.path.join(name)).ok()?;
+        Some(contents.strip_suffix('\n').unwrap_or(&contents).to_string())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

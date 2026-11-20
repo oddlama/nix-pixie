@@ -14,7 +14,8 @@ use mdns_sd::ServiceEvent;
 use nix_pixie_proto::announce::{Announcement, Pairing};
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::ctrl::{
-    ControllerMsg, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, StreamRequest, TargetMsg,
+    ControllerMsg, DiskAssignment, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, StreamRequest,
+    TargetMsg,
 };
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use nix_pixie_proto::pair::Side;
@@ -22,6 +23,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+use crate::disko;
 use crate::inventory;
 use crate::mdns::{self, Mdns};
 use crate::net::{self, Stream};
@@ -261,9 +263,10 @@ async fn accept_streams(conn: Connection, approved: Arc<AtomicBool>) {
                     Err(anyhow::anyhow!("stream before approval"))
                 }
                 Ok(StreamRequest::Store { root }) => match store::check_root(&root) {
-                    Ok(_) => store::serve(&root, recv, send).await,
+                    Ok(_) => store::serve(Some(&root), recv, send).await,
                     Err(reason) => Err(anyhow::anyhow!(reason)),
                 },
+                Ok(StreamRequest::LiveStore) => store::serve(None, recv, send).await,
                 Err(e) => Err(e.into()),
             };
             if let Err(e) = result {
@@ -286,31 +289,23 @@ async fn refuse_incoming(endpoint: Endpoint) {
 async fn serve_controller(
     state: &StateDir,
     stream: &mut Stream,
-    approved_flag: &AtomicBool,
+    approved: &AtomicBool,
 ) -> Result<()> {
     let label = net::hostname();
     write_frame(stream, &TargetMsg::Hello { label }).await?;
-    let inventory = inventory::collect().await;
+    let inventory = inventory::collect(&disko::formatted(state)).await;
     write_frame(stream, &TargetMsg::Inventory(Box::new(inventory))).await?;
 
-    let mut approved = false;
+    // Checked (and linked) by `PrepareDisks`, for `RunDisko`.
+    let mut prepared: Option<Vec<DiskAssignment>> = None;
     loop {
         let Ok(message) = read_frame::<_, ControllerMsg>(stream, MAX_CONTROLLER_FRAME).await else {
             return Ok(());
         };
-        match message {
+        let reply = match message {
             ControllerMsg::Approve { machine } => {
-                approved = true;
-                approved_flag.store(true, Ordering::Relaxed);
-                let machine = machine.map(|m| net::sanitise(&m, 63));
-                state.write("approved", machine.as_deref().unwrap_or(""))?;
-                info!(?machine, "approved by the controller");
-                match machine {
-                    Some(machine) => {
-                        println!("\n    Approved as {machine}. Waiting for the controller.\n");
-                    }
-                    None => println!("\n    Approved. Waiting for the controller.\n"),
-                }
+                approve(state, approved, machine)?;
+                continue;
             }
             ControllerMsg::Reject { reason } => {
                 let reason = net::sanitise(&reason, 200);
@@ -318,44 +313,112 @@ async fn serve_controller(
                 println!("\n    Rejected by the controller: {reason}\n");
                 return Ok(());
             }
-            ControllerMsg::RequestFacterReport => {
-                let reply = if approved {
-                    match inventory::facter_report(state.path()).await {
-                        Ok(json) => TargetMsg::FacterReport { json },
-                        Err(e) => {
-                            warn!("facter report: {e:#}");
-                            TargetMsg::FacterFailed {
-                                error: format!("{e:#}"),
-                            }
-                        }
+            // Everything else needs approval first.
+            message if !approved.load(Ordering::Relaxed) => match refusal(&message) {
+                Some(reply) => reply,
+                None => continue,
+            },
+            ControllerMsg::RequestFacterReport => facter_report(state).await,
+            ControllerMsg::PrepareStore { root } => prepare_store(&root),
+            ControllerMsg::PrepareDisks { disks } => {
+                prepared = None;
+                match disko::prepare(&disks, &disko::formatted(state)).await {
+                    Ok(()) => {
+                        let names: Vec<String> = disks
+                            .iter()
+                            .map(|d| format!("{} ({})", d.device, d.role))
+                            .collect();
+                        info!(disks = ?names, "disks ready to format");
+                        println!("\n    About to format: {}\n", names.join(", "));
+                        prepared = Some(disks);
+                        TargetMsg::DisksReady
                     }
-                } else {
-                    TargetMsg::FacterFailed {
-                        error: "not approved yet".to_string(),
+                    Err(reason) => {
+                        warn!(%reason, "refusing to format");
+                        TargetMsg::DisksRefused { reason }
                     }
-                };
-                write_frame(stream, &reply).await?;
+                }
             }
-            ControllerMsg::PrepareStore { root } => {
-                let reply = if approved {
-                    match store::check_root(&root) {
-                        Ok(fstype) => {
-                            info!(%root, %fstype, "ready to receive store paths");
-                            println!("\n    Receiving the system into {root} ({fstype}).\n");
-                            TargetMsg::StoreReady { fstype }
-                        }
-                        Err(reason) => {
-                            warn!(%root, %reason, "refusing to receive store paths");
-                            TargetMsg::StoreRefused { reason }
-                        }
-                    }
-                } else {
-                    TargetMsg::StoreRefused {
-                        reason: "not approved yet".to_string(),
-                    }
-                };
-                write_frame(stream, &reply).await?;
+            ControllerMsg::RunDisko { script } => {
+                run_disko(state, stream, &script, prepared.take()).await?
+            }
+        };
+        write_frame(stream, &reply).await?;
+    }
+}
+
+fn approve(state: &StateDir, approved: &AtomicBool, machine: Option<String>) -> Result<()> {
+    approved.store(true, Ordering::Relaxed);
+    let machine = machine.map(|m| net::sanitise(&m, 63));
+    state.write("approved", machine.as_deref().unwrap_or(""))?;
+    info!(?machine, "approved by the controller");
+    match machine {
+        Some(machine) => println!("\n    Approved as {machine}. Waiting for the controller.\n"),
+        None => println!("\n    Approved. Waiting for the controller.\n"),
+    }
+    Ok(())
+}
+
+/// The reply to a request that needs approval, sent before it. `None` for
+/// messages that need none.
+fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
+    let reason = "not approved yet".to_string();
+    match message {
+        ControllerMsg::Approve { .. } | ControllerMsg::Reject { .. } => None,
+        ControllerMsg::RequestFacterReport => Some(TargetMsg::FacterFailed { error: reason }),
+        ControllerMsg::PrepareStore { .. } => Some(TargetMsg::StoreRefused { reason }),
+        ControllerMsg::PrepareDisks { .. } => Some(TargetMsg::DisksRefused { reason }),
+        ControllerMsg::RunDisko { .. } => Some(TargetMsg::DiskoFailed { error: reason }),
+    }
+}
+
+async fn facter_report(state: &StateDir) -> TargetMsg {
+    match inventory::facter_report(state.path()).await {
+        Ok(json) => TargetMsg::FacterReport { json },
+        Err(e) => {
+            warn!("facter report: {e:#}");
+            TargetMsg::FacterFailed {
+                error: format!("{e:#}"),
             }
         }
     }
+}
+
+fn prepare_store(root: &str) -> TargetMsg {
+    match store::check_root(root) {
+        Ok(fstype) => {
+            info!(%root, %fstype, "ready to receive store paths");
+            println!("\n    Receiving the system into {root} ({fstype}).\n");
+            TargetMsg::StoreReady { fstype }
+        }
+        Err(reason) => {
+            warn!(%root, %reason, "refusing to receive store paths");
+            TargetMsg::StoreRefused { reason }
+        }
+    }
+}
+
+async fn run_disko(
+    state: &StateDir,
+    stream: &mut Stream,
+    script: &str,
+    prepared: Option<Vec<DiskAssignment>>,
+) -> Result<TargetMsg> {
+    let Some(disks) = prepared else {
+        return Ok(TargetMsg::DiskoFailed {
+            error: "the disks were not prepared".to_string(),
+        });
+    };
+    println!("\n    Formatting...\n");
+    Ok(match disko::run(state, stream, script, &disks).await? {
+        Ok(()) => {
+            println!("\n    Formatted and mounted.\n");
+            TargetMsg::DiskoDone
+        }
+        Err(error) => {
+            warn!(%error, "disko");
+            println!("\n    Formatting failed: {error}\n");
+            TargetMsg::DiskoFailed { error }
+        }
+    })
 }

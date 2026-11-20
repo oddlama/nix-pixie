@@ -18,6 +18,28 @@ const REFUSED_FSTYPES: &[&str] = &[
     "tmpfs", "ramfs", "overlay", "squashfs", "iso9660", "devtmpfs", "proc", "sysfs",
 ];
 
+/// Whether `path` is a store path itself (`/nix/store/<hash>-<name>`), not a
+/// file inside one or anything elsewhere.
+pub fn is_store_path(path: &str) -> bool {
+    const BASE32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+    let Some((hash, name)) = path
+        .strip_prefix("/nix/store/")
+        .and_then(|base| base.split_at_checked(32))
+    else {
+        return false;
+    };
+    let Some(name) = name.strip_prefix('-') else {
+        return false;
+    };
+    hash.bytes().all(|b| BASE32.contains(&b))
+        && !name.is_empty()
+        && name.len() <= 211
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-._?=".contains(&b))
+}
+
 /// Checks that `<root>/nix/store` would be on a disk mounted under `root`.
 /// Returns its filesystem type.
 pub fn check_root(root: &str) -> Result<String, String> {
@@ -101,16 +123,23 @@ fn octal(digits: [u8; 3]) -> Option<u8> {
 /// stream until either side is done. The controller is trusted: it was paired
 /// and approved, and it pushes paths it built itself, which carry no
 /// signatures.
-pub async fn serve(root: &str, mut recv: RecvStream, mut send: SendStream) -> Result<()> {
-    let store = format!("local?root={root}");
-    let mut daemon = tokio::process::Command::new("nix")
-        // `--force-trusted` needs `daemon-trust-override`.
-        .args([
-            "--extra-experimental-features",
-            "nix-command daemon-trust-override",
-            "--store",
-            &store,
-        ])
+///
+/// `root: None` serves the live system's own store instead.
+pub async fn serve(root: Option<&str>, mut recv: RecvStream, mut send: SendStream) -> Result<()> {
+    let store = root.map_or_else(
+        || "the live store".to_string(),
+        |root| format!("local?root={root}"),
+    );
+    let mut command = tokio::process::Command::new("nix");
+    // `--force-trusted` needs `daemon-trust-override`.
+    command.args([
+        "--extra-experimental-features",
+        "nix-command daemon-trust-override",
+    ]);
+    if root.is_some() {
+        command.args(["--store", &store]);
+    }
+    let mut daemon = command
         .args(["daemon", "--stdio", "--force-trusted"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

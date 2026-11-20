@@ -1,7 +1,7 @@
 //! Collects the target's hardware inventory (the agent runs as root on the
 //! installer). Parsing is kept apart from reading, so it can be tested.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
@@ -19,8 +19,10 @@ const EFI_GLOBAL: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 /// Longest string we keep from sysfs or lsblk.
 const MAX_FIELD: usize = 128;
 
-pub async fn collect() -> Inventory {
-    let disks = match disks().await {
+/// Everything about this machine. `formatted` are the disks nix-pixie
+/// formatted earlier during this boot.
+pub async fn collect(formatted: &BTreeSet<String>) -> Inventory {
+    let disks = match disks(formatted).await {
         Ok(disks) => disks,
         Err(e) => {
             warn!("listing disks: {e:#}");
@@ -153,7 +155,8 @@ pub fn nics(dir: &Path) -> Vec<Nic> {
     nics
 }
 
-async fn disks() -> Result<Vec<Disk>> {
+/// The machine's disks, from lsblk and `/dev/disk/by-id`.
+pub async fn disks(formatted: &BTreeSet<String>) -> Result<Vec<Disk>> {
     let output = tokio::process::Command::new("lsblk")
         .args([
             "--json",
@@ -167,10 +170,11 @@ async fn disks() -> Result<Vec<Disk>> {
         .context("running lsblk (is util-linux installed?)")?;
     anyhow::ensure!(output.status.success(), "lsblk failed: {}", output.status);
     let json: Value = serde_json::from_slice(&output.stdout).context("parsing lsblk output")?;
-    Ok(parse_lsblk(
-        &json,
-        &by_id_links(Path::new("/dev/disk/by-id")),
-    ))
+    let mut disks = parse_lsblk(&json, &by_id_links(Path::new("/dev/disk/by-id")));
+    for disk in &mut disks {
+        disk.formatted_this_boot = formatted.contains(&disk.name);
+    }
+    Ok(disks)
 }
 
 /// Kernel device name -> the valid `/dev/disk/by-id` names pointing at it.
@@ -230,6 +234,7 @@ pub fn parse_lsblk<S: std::hash::BuildHasher>(
                 partition_table: text(dev, "pttype"),
                 contents,
                 in_use,
+                formatted_this_boot: false,
                 name,
             })
         })

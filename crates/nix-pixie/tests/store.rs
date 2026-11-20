@@ -58,3 +58,26 @@ fn unescapes_mount_points() {
     assert_eq!(unescape("/x\\400"), "/x\\400");
     assert_eq!(unescape("/x\\377"), "/x\u{fffd}");
 }
+
+#[test]
+fn store_paths() {
+    let hash = "0123456789abcdfghijklmnpqrsvwxyz";
+    assert!(is_store_path(&format!("/nix/store/{hash}-disko")));
+    assert!(is_store_path(&format!(
+        "/nix/store/{hash}-nixos-system-web1-26.11"
+    )));
+    for bad in [
+        format!("/nix/store/{hash}-disko/bin/disko"),
+        format!("/nix/store/{hash}-"),
+        format!("/nix/store/{hash}-.hidden"),
+        format!("/nix/store/{hash}"),
+        format!("/nix/store/{}-disko", hash.strip_prefix('0').unwrap()),
+        "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-disko".to_string(),
+        format!("/nix/store/{hash}-a b"),
+        format!("/nix/store/../{hash}-disko"),
+        format!("/tmp/{hash}-disko"),
+        format!("nix/store/{hash}-disko"),
+    ] {
+        assert!(!is_store_path(&bad), "{bad}");
+    }
+}
