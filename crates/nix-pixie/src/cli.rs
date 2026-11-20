@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::{agent, controller, discovery, identity};
+use crate::{agent, controller, discovery, identity, install};
 
 /// The command line.
 #[derive(Debug, Parser)]
@@ -80,6 +80,36 @@ pub enum ControllerCommand {
         #[arg(long, default_value = "/mnt", requires = "push")]
         store_root: String,
     },
+    /// Pair with the target showing CODE and install a machine of FLAKE onto
+    /// it: choose disks, build, format with disko, and send the system.
+    /// Prints the result as JSON.
+    Install {
+        /// The code shown on the target, e.g. 42-acid-acorn-acre.
+        #[arg(long)]
+        code: String,
+        /// Flake with the `pixie` output and the configurations.
+        #[arg(long, default_value = ".")]
+        flake: String,
+        /// Install this machine (default: the one whose hints match).
+        #[arg(long)]
+        machine: Option<String>,
+        /// Put ROLE (a disko disk) onto DISK: a kernel name like nvme0n1,
+        /// a /dev/disk/by-id name, or a serial number (repeatable).
+        #[arg(long = "disk", value_name = "ROLE=DISK")]
+        disks: Vec<String>,
+        /// Approve the target and format empty disks without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Erase disks that hold data without asking.
+        #[arg(long)]
+        wipe: bool,
+        /// Give up pairing after this many seconds.
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// How to find targets.
+        #[arg(long, value_enum, default_value_t = discovery::Method::Both)]
+        discovery: discovery::Method,
+    },
     /// Show a controller code for targets to type in; prints one JSON line
     /// per paired target.
     Serve {
@@ -129,6 +159,29 @@ pub async fn run(cli: Cli) -> Result<()> {
                         yes,
                         push,
                         store_root,
+                    })
+                    .await
+                }
+                ControllerCommand::Install {
+                    code,
+                    flake,
+                    machine,
+                    disks,
+                    yes,
+                    wipe,
+                    timeout,
+                    discovery,
+                } => {
+                    install::install(install::InstallArgs {
+                        identity,
+                        code,
+                        timeout: Duration::from_secs(timeout),
+                        method: discovery,
+                        flake,
+                        machine,
+                        disks,
+                        yes,
+                        wipe,
                     })
                     .await
                 }

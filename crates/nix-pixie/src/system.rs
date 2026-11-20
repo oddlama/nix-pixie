@@ -81,6 +81,11 @@ impl Configuration {
         })
     }
 
+    /// The configuration's attribute name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// The installable for `config<path>`, e.g. `.system.build.toplevel`.
     fn attr(&self, path: &str) -> String {
         format!(

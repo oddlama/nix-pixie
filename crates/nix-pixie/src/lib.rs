@@ -15,6 +15,7 @@ pub mod controller;
 pub mod discovery;
 pub mod disko;
 pub mod identity;
+pub mod install;
 pub mod inventory;
 pub mod mdns;
 pub mod metadata;

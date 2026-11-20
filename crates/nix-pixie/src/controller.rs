@@ -16,7 +16,7 @@ use nix_pixie_proto::announce::Pairing;
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::ctrl::{ControllerMsg, MAX_FACTER_FRAME, MAX_TARGET_FRAME, TargetMsg};
 use nix_pixie_proto::frame::{read_frame, write_frame};
-use nix_pixie_proto::inventory::Inventory;
+use nix_pixie_proto::inventory::{Disk, Inventory};
 use nix_pixie_proto::pair::{PairError, Side};
 use tracing::{info, warn};
 
@@ -101,7 +101,7 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     result
 }
 
-async fn pair_with_target(
+pub async fn pair_with_target(
     endpoint: &Endpoint,
     discovery: &mut Discovery,
     code: &Code,
@@ -161,25 +161,37 @@ async fn introduction(stream: &mut Stream) -> Result<(String, Inventory)> {
         .context("timed out waiting for the target to introduce itself")?
 }
 
-/// After pairing: show the target, ask for approval, fetch the facter report
-/// if the chosen machine wants one, and print the result as JSON.
-async fn review(
+/// A target the operator approved.
+pub struct Approved {
+    /// Sanitised.
+    pub label: String,
+    pub inventory: Inventory,
+    pub suggestions: Vec<Suggestion>,
+    /// The flake's machine it was approved as.
+    pub machine: Option<String>,
+}
+
+/// Reads the target's introduction, shows it, and asks the operator to
+/// approve it (unless `yes`), telling the target the answer. The machine is
+/// `chosen`, or the only one whose hints match. With `need_machine`, a
+/// target without one is rejected.
+pub async fn approve(
     stream: &mut Stream,
     conn: &Connection,
     peer: &Peer,
-    flake: Option<&(&str, Metadata)>,
-    args: &PairArgs,
-) -> Result<()> {
+    metadata: Option<&Metadata>,
+    chosen: Option<&str>,
+    yes: bool,
+    need_machine: bool,
+) -> Result<Approved> {
     let (label, inventory) = introduction(stream).await?;
-    let suggestions = flake.map_or_else(Vec::new, |(_, m)| m.suggest(&inventory));
-    let machine = match &args.machine {
-        Some(machine) => Some(machine.clone()),
-        None => match suggestions.as_slice() {
+    let suggestions = metadata.map_or_else(Vec::new, |m| m.suggest(&inventory));
+    let machine = chosen
+        .map(str::to_string)
+        .or_else(|| match suggestions.as_slice() {
             [only] => Some(only.machine.clone()),
             _ => None,
-        },
-    };
-
+        });
     eprintln!(
         "{}",
         summary(
@@ -191,14 +203,18 @@ async fn review(
             machine.as_deref()
         )
     );
-    if !(args.yes || confirm("Approve this machine? [y/N] ").await?) {
-        write_frame(
-            stream,
-            &ControllerMsg::Reject {
-                reason: "rejected by the operator".into(),
-            },
-        )
-        .await?;
+    if need_machine && machine.is_none() {
+        reject(stream, "no machine chosen on the controller").await?;
+        let known: Vec<&str> = metadata.map_or_else(Vec::new, |m| {
+            m.machines.keys().map(String::as_str).collect()
+        });
+        bail!(
+            "no machine of the flake matches this target; choose one with --machine ({})",
+            known.join(", ")
+        );
+    }
+    if !(yes || confirm("Approve this machine? [y/N] ").await?) {
+        reject(stream, "rejected by the operator").await?;
         bail!("rejected");
     }
     write_frame(
@@ -209,6 +225,51 @@ async fn review(
     )
     .await?;
     info!(target = %conn.remote_id(), ?machine, "approved");
+    Ok(Approved {
+        label,
+        inventory,
+        suggestions,
+        machine,
+    })
+}
+
+/// Tells the target it was rejected; it goes back to pairing.
+async fn reject(stream: &mut Stream, reason: &str) -> Result<()> {
+    write_frame(
+        stream,
+        &ControllerMsg::Reject {
+            reason: reason.into(),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// After pairing: approval, the facter report if the chosen machine wants
+/// one, the optional push, and the result as JSON.
+async fn review(
+    stream: &mut Stream,
+    conn: &Connection,
+    peer: &Peer,
+    flake: Option<&(&str, Metadata)>,
+    args: &PairArgs,
+) -> Result<()> {
+    let approved = approve(
+        stream,
+        conn,
+        peer,
+        flake.map(|(_, m)| m),
+        args.machine.as_deref(),
+        args.yes,
+        false,
+    )
+    .await?;
+    let Approved {
+        label,
+        inventory,
+        suggestions,
+        machine,
+    } = approved;
 
     let report_path = flake
         .zip(machine.as_ref())
@@ -253,7 +314,7 @@ async fn review(
 
 /// Asks the target for a facter report and writes it into the flake's
 /// repository. Returns the path, relative to the flake.
-async fn fetch_facter_report(
+pub async fn fetch_facter_report(
     stream: &mut Stream,
     flake: &str,
     report_path: &str,
@@ -287,7 +348,7 @@ async fn fetch_facter_report(
 }
 
 /// Reads a yes/no answer from stdin. End of input counts as no.
-async fn confirm(question: &str) -> Result<bool> {
+pub async fn confirm(question: &str) -> Result<bool> {
     use tokio::io::AsyncBufReadExt;
     eprint!("{question}");
     let mut answer = String::new();
@@ -353,32 +414,7 @@ fn summary(
         );
     }
     for disk in &inventory.disks {
-        let what = [opt(&disk.transport), opt(&disk.model)]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let state = if disk.in_use {
-            "in use, not installable".to_string()
-        } else if disk.has_data() {
-            let mut found: Vec<String> = disk.partition_table.iter().map(|t| clean(t)).collect();
-            found.extend(disk.contents.iter().map(|c| {
-                let fs = opt(&c.fstype).unwrap_or_else(|| "partition".into());
-                match opt(&c.label).or_else(|| opt(&c.partlabel)) {
-                    Some(label) => format!("{fs} \"{label}\""),
-                    None => fs,
-                }
-            }));
-            format!("HAS DATA: {}", found.join(", "))
-        } else {
-            "empty".to_string()
-        };
-        let _ = writeln!(
-            out,
-            "  disk      {} {} {what} [{state}]",
-            clean(&disk.name),
-            human_size(disk.size_bytes)
-        );
+        let _ = writeln!(out, "  disk      {}", describe_disk(disk));
     }
     let line = match (machine, suggestions) {
         (Some(machine), []) => format!("{machine} (chosen)"),
@@ -404,7 +440,44 @@ fn summary(
     out
 }
 
-fn human_size(bytes: u64) -> String {
+/// One line about `disk`: name, size, what it is, and what is on it.
+/// Sanitised: everything in it comes from the target.
+pub fn describe_disk(disk: &Disk) -> String {
+    let clean = |s: &str| sanitise(s, 128);
+    let opt = |s: &Option<String>| s.as_deref().map(clean);
+    let what = [opt(&disk.transport), opt(&disk.model)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let state = if !disk.installable() {
+        "in use, not installable".to_string()
+    } else if disk.has_data() {
+        let mut found: Vec<String> = disk.partition_table.iter().map(|t| clean(t)).collect();
+        found.extend(disk.contents.iter().map(|c| {
+            let fs = opt(&c.fstype).unwrap_or_else(|| "partition".into());
+            match opt(&c.label).or_else(|| opt(&c.partlabel)) {
+                Some(label) => format!("{fs} \"{label}\""),
+                None => fs,
+            }
+        }));
+        let earlier = if disk.formatted_this_boot {
+            ", from an earlier attempt"
+        } else {
+            ""
+        };
+        format!("HAS DATA: {}{earlier}", found.join(", "))
+    } else {
+        "empty".to_string()
+    };
+    format!(
+        "{} {} {what} [{state}]",
+        clean(&disk.name),
+        human_size(disk.size_bytes)
+    )
+}
+
+pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
     if bytes < 1024 {
         return format!("{bytes} B");

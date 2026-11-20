@@ -15,6 +15,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use nix_pixie_proto::ctrl::{DiskAssignment, TargetMsg};
 use nix_pixie_proto::frame::write_frame;
+use nix_pixie_proto::inventory::Disk;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{info, trace};
 
@@ -61,6 +62,16 @@ pub async fn prepare(disks: &[DiskAssignment], formatted: &BTreeSet<String>) -> 
     let present = inventory::disks(formatted)
         .await
         .map_err(|e| format!("can't list the disks: {e:#}"))?;
+    check_present(disks, &present)?;
+    for disk in disks.iter().filter(|d| d.link) {
+        link(Path::new(BY_PIXIE), &disk.role, &disk.device)
+            .map_err(|e| format!("linking {BY_PIXIE}/{}: {e:#}", disk.role))?;
+    }
+    Ok(())
+}
+
+/// Every disk must be `present` and installable right now.
+pub fn check_present(disks: &[DiskAssignment], present: &[Disk]) -> Result<(), String> {
     for wanted in disks {
         let disk = present
             .iter()
@@ -72,10 +83,6 @@ pub async fn prepare(disks: &[DiskAssignment], formatted: &BTreeSet<String>) -> 
                 wanted.device
             ));
         }
-    }
-    for disk in disks.iter().filter(|d| d.link) {
-        link(Path::new(BY_PIXIE), &disk.role, &disk.device)
-            .map_err(|e| format!("linking {BY_PIXIE}/{}: {e:#}", disk.role))?;
     }
     Ok(())
 }

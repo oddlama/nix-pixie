@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use nix_pixie::disko::*;
 use nix_pixie_proto::ctrl::DiskAssignment;
+use nix_pixie_proto::inventory::Disk;
 
 fn assignment(role: &str, device: &str) -> DiskAssignment {
     DiskAssignment {
@@ -78,4 +79,42 @@ fn links_like_udev_and_replaces_atomically() {
         .collect();
     assert_eq!(names, ["main"], "no temporary files left");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn refuses_disks_that_are_gone_or_in_use_right_now() {
+    let disk = |name: &str| Disk {
+        name: name.into(),
+        size_bytes: 1 << 30,
+        ..Disk::default()
+    };
+    let present = vec![
+        Disk {
+            in_use: true,
+            ..disk("vda")
+        },
+        disk("vdb"),
+        Disk {
+            in_use: true,
+            formatted_this_boot: true,
+            ..disk("vdc")
+        },
+        Disk {
+            read_only: true,
+            ..disk("sr0")
+        },
+    ];
+    assert_eq!(
+        check_present(&[assignment("main", "vdb")], &present),
+        Ok(())
+    );
+    // Mounted by an earlier attempt during this boot.
+    assert_eq!(
+        check_present(&[assignment("main", "vdc")], &present),
+        Ok(())
+    );
+    for (device, why) in [("vda", "in use"), ("sr0", "read-only"), ("vdz", "gone")] {
+        let err = check_present(&[assignment("main", device)], &present).unwrap_err();
+        assert!(err.contains(why), "{device}: {err}");
+    }
 }

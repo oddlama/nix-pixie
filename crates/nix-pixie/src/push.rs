@@ -56,12 +56,21 @@ pub async fn push(
     root: &str,
     paths: &[String],
 ) -> Result<PushReport> {
+    let fstype = prepare_disk_store(ctrl, root).await?;
+    let request = StreamRequest::Store { root: root.into() };
+    let seconds = copy(conn, &request, paths).await?;
+    Ok(PushReport { fstype, seconds })
+}
+
+/// Asks the target to check that the store under `root` is on a disk.
+/// Returns that disk's filesystem type.
+pub async fn prepare_disk_store(ctrl: &mut Stream, root: &str) -> Result<String> {
     write_frame(ctrl, &ControllerMsg::PrepareStore { root: root.into() }).await?;
     let reply = tokio::time::timeout(Duration::from_secs(30), read_frame(ctrl, MAX_TARGET_FRAME))
         .await
         .context("timed out waiting for the target to prepare its store")??;
-    let fstype = match reply {
-        TargetMsg::StoreReady { fstype } => sanitise(&fstype, 32),
+    match reply {
+        TargetMsg::StoreReady { fstype } => Ok(sanitise(&fstype, 32)),
         TargetMsg::StoreRefused { reason } => {
             bail!(
                 "the target refused to receive into {root}: {}",
@@ -69,15 +78,19 @@ pub async fn push(
             )
         }
         _ => bail!("unexpected reply to the store request"),
-    };
+    }
+}
 
+/// Runs `nix copy` for `paths` into the target store `request` names.
+/// Returns how long it took, in seconds.
+pub async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) -> Result<f64> {
     let dir = private_dir()?;
     let socket = dir.join("store.sock");
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("listening on {}", socket.display()))?;
-    let forwarder = tokio::spawn(forward(listener, conn.clone(), root.to_string()));
+    let forwarder = tokio::spawn(forward(listener, conn.clone(), request.clone()));
 
-    info!(%root, %fstype, ?paths, "pushing");
+    info!(?request, ?paths, "pushing");
     let started = Instant::now();
     let status = tokio::process::Command::new("nix")
         // Paths the controller built itself carry no signatures, and the
@@ -102,19 +115,20 @@ pub async fn push(
     }
     let seconds = started.elapsed().as_secs_f64();
     info!(seconds, "pushed");
-    Ok(PushReport { fstype, seconds })
+    Ok(seconds)
 }
 
-/// Connects every client of the local socket to a new store stream.
-async fn forward(listener: UnixListener, conn: Connection, root: String) {
+/// Connects every client of the local socket to a new stream of the kind
+/// `request` names.
+async fn forward(listener: UnixListener, conn: Connection, request: StreamRequest) {
     let mut tasks = JoinSet::new();
     while let Ok((mut local, _)) = listener.accept().await {
         let conn = conn.clone();
-        let root = root.clone();
+        let request = request.clone();
         tasks.spawn(async move {
             let result = async {
                 let (mut send, recv) = conn.open_bi().await?;
-                write_frame(&mut send, &StreamRequest::Store { root }).await?;
+                write_frame(&mut send, &request).await?;
                 let mut remote = tokio::io::join(recv, send);
                 let (up, down) = tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
                 debug!(up, down, "store connection done");

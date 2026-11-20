@@ -95,7 +95,8 @@ pub enum ControllerMsg {
 /// A disk the disko script is going to format, as the operator chose it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskAssignment {
-    /// The disko disk's name (the role in pinned and agnostic mode).
+    /// What the disk is for: its `/dev/disk/by-pixie` role in agnostic
+    /// mode, else the disko disk's name.
     pub role: String,
     /// Kernel name from the inventory, e.g. `nvme0n1`.
     pub device: String,
