@@ -36,3 +36,12 @@ fn sanitise_strips_control_characters() {
     assert_eq!(sanitise("web\x1b[31m1\n\tok", 63), "web[31m1  ok");
     assert_eq!(sanitise("abcdef", 3), "abc");
 }
+
+#[test]
+fn sanitise_strips_text_reordering_and_invisible_characters() {
+    // "nvme0n1" that would display as "nvme0n1" followed by reversed text.
+    assert_eq!(sanitise("disk\u{202E}1n0emvn\u{202C}", 63), "disk1n0emvn");
+    assert_eq!(sanitise("we\u{200B}b1\u{2066}\u{FEFF}", 63), "web1");
+    // Ordinary non-ASCII text stays.
+    assert_eq!(sanitise("Größe ✓", 63), "Größe ✓");
+}

@@ -175,13 +175,30 @@ pub async fn finish(stream: &mut Stream) {
 }
 
 /// Makes untrusted text safe to log and display: printable characters only,
-/// at most `max` of them.
+/// at most `max` of them. Besides control characters this drops the
+/// invisible formatting characters (bidi overrides, zero-width ones) that
+/// can make text display as something it isn't.
 pub fn sanitise(text: &str, max: usize) -> String {
     text.chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .filter(|c| !c.is_control())
+        .filter(|&c| !c.is_control() && !is_invisible_format(c))
         .take(max)
         .collect()
+}
+
+/// Unicode format characters that reorder or hide text.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// The machine's hostname, for labels.
