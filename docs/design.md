@@ -8,7 +8,7 @@ we build on them.
 
 | Area | State | Covered by |
 |---|---|---|
-| `pixie` metadata (lib + flake-parts module) | done (machines, match hints, disk/host-key modes, facter path) | `checks.eval-metadata` |
+| `pixie` metadata (lib + flake-parts module) | done (machines, match hints, pinned-disks file, host-key mode, facter path) | `checks.eval-metadata` |
 | Pairing codes, wordlist, layout normalization | done | `nix-pixie-proto` unit tests |
 | SPAKE2 pairing with channel binding | done | unit tests incl. relay attack and early-hangup guessing |
 | Firewall-free discovery (DNS-SD + neighbour-table probes), controller never listens | done | `checks.vm-pairing` (controller behind the default NixOS firewall) |
@@ -19,7 +19,9 @@ we build on them.
 | Installer ISO (`packages.installer-iso`) | builds and boots; code on tty1 | booted in QEMU by hand; no automated ISO boot test yet |
 | Inventory, matching against the flake's `pixie` hints, approval/rejection, facter report into the repo (`git add`) | done (scriptable `controller pair`; TUI later) | `checks.vm-inventory` |
 | Store push into the target's disk (`--push`, stock Nix worker protocol, never into RAM) | done | `checks.vm-push` (512 MiB under a 192 MiB memory cap; a whole system) |
-| Disk selection, disko, install | not started | |
+| Disk selection (pinned, agnostic, fixed), disko, system pushed into the mounted root (`controller install`) | done | `checks.vm-disko`, `checks.eval-disks`, unit tests of the disk plan |
+| By-pixie links on the installed system (udev rule from the GPT labels) | done | `checks.vm-disko` (rule on the target), `checks.eval-disks` |
+| `nixos-install`, finalize, reboot, post-boot verification | not started | |
 | Long sessions across link-local flaps | not verified | needs the store push |
 
 ## Goal
@@ -436,29 +438,72 @@ re-copy.
 
 ## 5. Disks
 
-### Pinned mode
+Implemented in `crates/nix-pixie/src/{plan,system,install,disko}.rs`,
+`nix/nixos/disks.nix`, `lib.pinnedDisk`; tested by `checks.vm-disko`.
 
-- The controller writes the selected `/dev/disk/by-id/…` into a data file in
-  the repo, e.g. `machines/<name>/pixie.json`, which the disko config reads.
-- That's the simplest and most explicit option. Use it for one-off machines.
+The configuration's own `disko.devices.disk` says which disks exist; there
+is no separate role list that could disagree with it. The controller
+evaluates each disk's `device` (unset ones as `null`) and classifies it:
 
-### Agnostic mode
+| Device in the disko config | Mode | What happens |
+|---|---|---|
+| `nix-pixie.lib.pinnedDisk ./disks.json "main"`, and the machine has `disks.file` | pinned | The operator chooses (or keeps the recorded disk). The controller writes `{ "main": "/dev/disk/by-id/…" }` to `disks.file`, `git add`s it, re-evaluates, and checks that the configuration now uses it. |
+| `/dev/disk/by-pixie/<role>` | agnostic | The operator chooses; the agent links the disk there before disko. One configuration installs many machines. |
+| anything else (`/dev/disk/by-id/…`, `/dev/<name>`) | fixed | Must exist on the target. Not choosable. |
 
-- The disko config references `/dev/disk/by-pixie/<role>` (e.g. `main`,
-  `data0`). Before disko, the agent creates those symlinks to the disks the
-  operator selected.
-- **The catch:** some installed-system options keep the disk path after
-  install. The main one is BIOS GRUB: `boot.loader.grub.devices` comes from
-  disko's disk device, so every later `nixos-rebuild` runs `grub-install` on
-  that path.
-- **Fix:** `nixosModules.default` (installed-system side) ships a udev rule
-  that recreates `/dev/disk/by-pixie/<role>` → parent disk of the partition
-  whose PARTLABEL is `disk-<role>-*`. The same path then resolves at install
-  time (agent symlink) and on every boot (udev).
-  - Warn on duplicate partlabels, e.g. a disk moved over from another pixie
-    machine.
-  - **VERIFY** this for each disko layout type: ZFS vdevs, mdadm, LUKS. disko
-    mounts by partlabel, so most of it should be fine.
+### Choosing
+
+- `--disk ROLE=DISK`: DISK is a kernel name (`nvme0n1`, `/dev/nvme0n1`), a
+  `/dev/disk/by-id` name, or a serial number. Roles are checked before
+  pairing when `--machine` is given.
+- Order: fixed devices, then `--disk`, then a pinned disk keeps its
+  recorded disk, then a last open role with exactly one free disk takes it.
+  Anything else asks on a terminal; under `--yes` it fails with the list of
+  candidates instead of guessing.
+- Never chosen: disks that are mounted or swapped (the installer's own boot
+  medium among them), read-only, or empty card readers. Exception: disks
+  nix-pixie formatted earlier during this boot of the installer. What is
+  mounted from them is that attempt's, and disko's destroy step unmounts it,
+  so reinstalling in the same session works. The agent records them in its
+  tmpfs state directory.
+- Pinned mode records the most descriptive by-id name (model and serial)
+  over opaque ones (`wwn-`, `nvme-eui.`). A disk without any by-id name
+  can't be pinned; use agnostic mode.
+
+### Order of operations
+
+Everything that can fail without touching the disks happens first:
+evaluate, choose, record pins, build the disko script **and** the system.
+Then the operator sees exactly what gets erased:
+
+- only empty disks: `y/N`, or `--yes`
+- any disk with a partition table or signatures: type the machine's name,
+  or `--wipe`. `--yes` alone refuses.
+
+Then the disko script (`system.build.diskoScript`, which destroys without
+prompting) goes into the installer's live store, the agent re-checks every
+disk against a fresh lsblk (defence in depth against a stale inventory or a
+confused controller) and links agnostic roles, runs disko with its output
+streamed back (the tail is shown on failure), and the system is pushed into
+`disko.rootMountPoint`.
+
+### The by-pixie path after the install
+
+- Some options keep using the disk path after the install. The main one is
+  BIOS GRUB: disko puts the device of a disk with an EF02 partition into
+  `boot.loader.grub.devices`, so every `nixos-rebuild` runs `grub-install`
+  on it (checked in `checks.eval-disks`).
+- `nixosModules.default` (installed system) recreates
+  `/dev/disk/by-pixie/<role>` with a udev rule. A helper recognises the disk
+  by its partitions' GPT labels (the kernel's `PARTNAME`), using the labels
+  disko actually assigned. They are evaluated, never reconstructed, since
+  disko hashes labels longer than 36 characters.
+- Disks without a GPT can't be recognised; an assertion says so.
+- Two disks with the same labels (e.g. one moved over from another machine
+  with the same configuration) both claim the link, and udev picks one.
+  Documented, not detected.
+- **VERIFY** layouts beyond plain GPT + ext4: ZFS vdevs, mdadm, LUKS. disko
+  mounts by partlabel, so they should work.
 
 ### Facter in fleet mode
 
@@ -563,8 +608,11 @@ console, next to the autologin prompt, until the tty1 UI exists.
 - `lib.mkPixie { self, machines, hooks, … }`: the **source of truth**. The
   flake-parts module is a thin wrapper, so the two can't drift apart.
 - `nixosModules.installer`: the agent side.
-- `nixosModules.default`: installed-system side (by-pixie udev rule, facter
-  wiring).
+- `nixosModules.default`: installed-system side (by-pixie udev rule; later
+  host keys).
+- `lib.pinnedDisk file name`: pinned mode's device for disko disk `name`,
+  falling back to `/dev/disk/by-pixie/<name>` until one is recorded, so the
+  configuration builds before the first install.
 - Our own `packages.<system>.{pixie, installer-iso, netboot}` work standalone:
   `nix run github:…/nix-pixie -- controller --flake .`.
 - **Unknown output `pixie`:** `nix flake check` warns about it. That's
@@ -575,11 +623,11 @@ console, next to the autologin prompt, until the tty1 UI exists.
 ```nix
 pixie = {
   controller.trustedKeys = [ "<endpoint-id>" ];   # for baked images
-  defaults = { hostKey.mode = "pull"; disks.mode = "pinned"; };
+  defaults = { hostKey.mode = "pull"; };
   machines.web1 = {
     configuration = "web1";                       # nixosConfigurations attr
     match = { mac = [ "aa:bb:cc:dd:ee:ff" ]; dmiSerial = [ ]; };  # hints only
-    disks = { mode = "agnostic"; roles = [ "main" ]; };
+    disks.file = "machines/web1/disks.json";      # pinned mode
     facter.reportPath = ./machines/web1/facter.json;
     hostKey = { mode = "push"; source = "pass show hosts/web1/ssh_host_ed25519_key"; };
     hooks.pre-build = [ /* derivations */ ];
@@ -591,7 +639,8 @@ pixie = {
 ### Our repo layout
 
 - **One flake, no partition.** Inputs: nixpkgs, flake-parts, nci, devshell,
-  treefmt-nix (later nix-grpc-store, disko for tests). All follow our nixpkgs.
+  treefmt-nix, disko (non-flake, only for the checks; later nix-grpc-store).
+  All flake inputs follow our nixpkgs.
   A dev partition would only keep devshell out of consumers' lockfiles: nci
   already depends on treefmt-nix, and Nix fetches unused inputs lazily. Not
   worth the extra flake. Revisit if consumers complain about lockfile size.
@@ -607,7 +656,8 @@ crates/nix-pixie-proto            # wire protocol, shared with tests
 nix/lib.nix                       # mkPixie: source of truth
 nix/flake-module.nix              # flakeModules.default, thin wrapper over lib
 nix/options.nix                   # option tree shared by both
-nix/tests/                        # eval checks now, NixOS VM tests later
+nix/nixos/                        # agent, installer, installed-system modules
+nix/tests/                        # eval checks and NixOS VM tests
 docs/
 ```
 
@@ -618,7 +668,7 @@ NixOS VM tests are the backbone. They cover:
 - controller + target over a private VLAN without internet (airgapped)
 - RAM-limited target with a closure bigger than its RAM
 - each pairing mode, including a MITM relay attempt that must fail
-- pinned and agnostic disks, BIOS and UEFI
+- pinned and agnostic disks (done: `checks.vm-disko`), BIOS and UEFI boot
 - pull-mode rekey (agenix-rekey fixture)
 - interrupted push + resume
 
