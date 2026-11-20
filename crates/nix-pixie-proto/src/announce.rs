@@ -1,0 +1,276 @@
+//! What a target tells controllers about itself, so a controller can find it
+//! and dial it. Only targets announce. The controller never listens, so the
+//! operator's machine needs no open ports.
+//!
+//! The same [`Announcement`] travels two ways:
+//!
+//! * **DNS-SD** TXT records on `_nix-pixie._udp`. This works when the
+//!   controller's firewall lets mDNS replies in. Many don't: replies to a
+//!   multicast query come from the responder's unicast address, which
+//!   connection tracking can't match to the query, so a stateful firewall
+//!   drops them.
+//! * **Probe replies** on UDP [`PROBE_PORT`]. The controller sends probes and
+//!   reads the replies on the same socket. A reply to a *unicast* probe
+//!   matches the probe's connection-tracking entry, so it passes any stateful
+//!   firewall. The controller learns which addresses to probe from its
+//!   neighbour table (see the binary's `net` module).
+//!
+//! Everything here comes from the network and is untrusted. The endpoint id
+//! is only a claim until iroh authenticates it when dialing.
+
+use serde::{Deserialize, Serialize};
+
+use crate::PROTOCOL_VERSION;
+use crate::code::MAX_NAMEPLATE;
+use crate::hex;
+
+/// UDP port where targets answer probes.
+pub const PROBE_PORT: u16 = 47_012;
+/// Longest label, in characters.
+pub const MAX_LABEL: usize = 63;
+
+/// How the target wants to pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Pairing {
+    /// The target shows a code starting with this nameplate.
+    ShowsCode { nameplate: u8 },
+    /// The operator typed a controller's code on the target.
+    TypedControllerCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Announcement {
+    pub version: u32,
+    /// Raw ed25519 public key of the target's iroh endpoint.
+    pub id: [u8; 32],
+    /// UDP port of the target's iroh endpoint.
+    pub port: u16,
+    pub pairing: Pairing,
+    /// Human-readable name, e.g. the hostname. Sanitise before display.
+    pub label: String,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AnnounceError {
+    #[error("missing `{0}`")]
+    Missing(&'static str),
+    #[error("invalid `{0}`")]
+    Invalid(&'static str),
+    #[error("protocol version {0}, we speak {PROTOCOL_VERSION}")]
+    Version(u32),
+}
+
+impl Announcement {
+    /// Builds an announcement for this protocol version, truncating the label.
+    pub fn new(id: [u8; 32], port: u16, pairing: Pairing, label: &str) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            id,
+            port,
+            pairing,
+            label: label.chars().take(MAX_LABEL).collect(),
+        }
+    }
+
+    /// TXT record entries. The port goes into the SRV record instead.
+    pub fn txt(&self) -> Vec<(&'static str, String)> {
+        let mut txt = vec![
+            ("v", self.version.to_string()),
+            ("id", hex::encode(&self.id)),
+            ("label", self.label.clone()),
+        ];
+        match self.pairing {
+            Pairing::ShowsCode { nameplate } => {
+                txt.push(("pair", "show".to_string()));
+                txt.push(("np", nameplate.to_string()));
+            }
+            Pairing::TypedControllerCode => txt.push(("pair", "typed".to_string())),
+        }
+        txt
+    }
+
+    /// Parses TXT record entries (looked up through `get`) plus the SRV port.
+    pub fn from_txt<'a>(
+        get: impl Fn(&str) -> Option<&'a str>,
+        port: u16,
+    ) -> Result<Self, AnnounceError> {
+        let field = |key: &'static str| get(key).ok_or(AnnounceError::Missing(key));
+        let version = field("v")?
+            .parse()
+            .map_err(|_| AnnounceError::Invalid("v"))?;
+        let id = hex::decode(field("id")?)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(AnnounceError::Invalid("id"))?;
+        let pairing = match field("pair")? {
+            "show" => Pairing::ShowsCode {
+                nameplate: field("np")?
+                    .parse()
+                    .map_err(|_| AnnounceError::Invalid("np"))?,
+            },
+            "typed" => Pairing::TypedControllerCode,
+            _ => return Err(AnnounceError::Invalid("pair")),
+        };
+        Self {
+            version,
+            id,
+            port,
+            pairing,
+            label: get("label").unwrap_or("").to_string(),
+        }
+        .validated()
+    }
+
+    fn validated(self) -> Result<Self, AnnounceError> {
+        if self.version != PROTOCOL_VERSION {
+            return Err(AnnounceError::Version(self.version));
+        }
+        if let Pairing::ShowsCode { nameplate } = self.pairing
+            && !(1..=MAX_NAMEPLATE).contains(&nameplate)
+        {
+            return Err(AnnounceError::Invalid("np"));
+        }
+        if self.label.chars().count() > MAX_LABEL {
+            return Err(AnnounceError::Invalid("label"));
+        }
+        Ok(self)
+    }
+}
+
+/// Random per-discovery value that replies must echo.
+pub type Nonce = [u8; 16];
+
+pub fn new_nonce() -> Nonce {
+    rand::random()
+}
+
+/// Probes are padded to this size. Replies are always smaller, so a forged
+/// source address can't turn a target into a traffic amplifier.
+pub const PROBE_LEN: usize = 512;
+const PROBE_MAGIC: &[u8; 16] = b"nix-pixie/probe1";
+const REPLY_MAGIC: &[u8; 16] = b"nix-pixie/reply1";
+
+pub fn encode_probe(nonce: &Nonce) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(PROBE_LEN);
+    probe.extend_from_slice(PROBE_MAGIC);
+    probe.extend_from_slice(nonce);
+    probe.resize(PROBE_LEN, 0);
+    probe
+}
+
+/// The probe's nonce, if `datagram` is a well-formed probe.
+pub fn decode_probe(datagram: &[u8]) -> Option<Nonce> {
+    if datagram.len() != PROBE_LEN || !datagram.starts_with(PROBE_MAGIC) {
+        return None;
+    }
+    datagram[16..32].try_into().ok()
+}
+
+pub fn encode_reply(nonce: &Nonce, announcement: &Announcement) -> Vec<u8> {
+    let mut reply = Vec::with_capacity(PROBE_LEN);
+    reply.extend_from_slice(REPLY_MAGIC);
+    reply.extend_from_slice(nonce);
+    reply.extend(postcard::to_allocvec(announcement).expect("announcements always serialise"));
+    debug_assert!(reply.len() < PROBE_LEN, "reply of {} bytes", reply.len());
+    reply
+}
+
+/// The announcement in a reply to our probe with `nonce`.
+pub fn decode_reply(datagram: &[u8], nonce: &Nonce) -> Result<Announcement, AnnounceError> {
+    if datagram.len() < 32 || !datagram.starts_with(REPLY_MAGIC) {
+        return Err(AnnounceError::Invalid("reply"));
+    }
+    if &datagram[16..32] != nonce {
+        return Err(AnnounceError::Invalid("nonce"));
+    }
+    postcard::from_bytes::<Announcement>(&datagram[32..])
+        .map_err(|_| AnnounceError::Invalid("reply"))?
+        .validated()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn shows(nameplate: u8) -> Announcement {
+        Announcement::new([7; 32], 47011, Pairing::ShowsCode { nameplate }, "target")
+    }
+
+    fn from_map(map: &HashMap<&'static str, String>) -> Result<Announcement, AnnounceError> {
+        Announcement::from_txt(|k| map.get(k).map(String::as_str), 47011)
+    }
+
+    #[test]
+    fn txt_round_trip() {
+        let typed = Announcement::new([9; 32], 47011, Pairing::TypedControllerCode, "x");
+        for announcement in [shows(42), typed] {
+            let map: HashMap<_, _> = announcement.txt().into_iter().collect();
+            assert_eq!(from_map(&map), Ok(announcement));
+        }
+    }
+
+    #[test]
+    fn txt_rejects_bad_records() {
+        let good: HashMap<_, _> = shows(42).txt().into_iter().collect();
+        let with = |key, value: &str| {
+            let mut map = good.clone();
+            map.insert(key, value.to_string());
+            from_map(&map)
+        };
+        assert_eq!(with("v", "2"), Err(AnnounceError::Version(2)));
+        assert_eq!(with("np", "0"), Err(AnnounceError::Invalid("np")));
+        assert_eq!(with("np", "100"), Err(AnnounceError::Invalid("np")));
+        assert_eq!(with("id", "abcd"), Err(AnnounceError::Invalid("id")));
+        assert_eq!(with("pair", "maybe"), Err(AnnounceError::Invalid("pair")));
+        assert_eq!(
+            with("label", &"x".repeat(64)),
+            Err(AnnounceError::Invalid("label"))
+        );
+        let mut missing = good.clone();
+        missing.remove("id");
+        assert_eq!(from_map(&missing), Err(AnnounceError::Missing("id")));
+    }
+
+    #[test]
+    fn probe_round_trip_and_rejects_garbage() {
+        let nonce = [5; 16];
+        let probe = encode_probe(&nonce);
+        assert_eq!(probe.len(), PROBE_LEN);
+        assert_eq!(decode_probe(&probe), Some(nonce));
+        assert_eq!(decode_probe(&probe[..PROBE_LEN - 1]), None);
+        let mut wrong_magic = probe.clone();
+        wrong_magic[0] ^= 1;
+        assert_eq!(decode_probe(&wrong_magic), None);
+    }
+
+    #[test]
+    fn reply_round_trip_checks_nonce() {
+        let nonce = [5; 16];
+        let reply = encode_reply(&nonce, &shows(42));
+        assert_eq!(decode_reply(&reply, &nonce), Ok(shows(42)));
+        assert_eq!(
+            decode_reply(&reply, &[6; 16]),
+            Err(AnnounceError::Invalid("nonce"))
+        );
+        assert_eq!(
+            decode_reply(&reply[..20], &nonce),
+            Err(AnnounceError::Invalid("reply"))
+        );
+        assert!(decode_reply(&encode_probe(&nonce), &nonce).is_err());
+    }
+
+    /// The biggest possible reply (63 four-byte characters) still fits in a
+    /// probe, so targets never send more than they receive.
+    #[test]
+    fn replies_are_smaller_than_probes() {
+        let label = "\u{10348}".repeat(100);
+        let announcement = Announcement::new(
+            [0xff; 32],
+            u16::MAX,
+            Pairing::ShowsCode { nameplate: 99 },
+            &label,
+        );
+        assert_eq!(announcement.label.chars().count(), MAX_LABEL);
+        assert!(encode_reply(&[0; 16], &announcement).len() < PROBE_LEN);
+    }
+}

@@ -1,0 +1,361 @@
+//! The installer-side agent: announces itself, waits for a controller to dial
+//! in and pair, and (for now) holds the session open until the controller
+//! leaves.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use iroh::endpoint::{Connection, VarInt};
+use iroh::{Endpoint, SecretKey};
+use mdns_sd::ServiceEvent;
+use nix_pixie_proto::announce::{Announcement, Pairing};
+use nix_pixie_proto::code::Code;
+use nix_pixie_proto::ctrl::{
+    ControllerMsg, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, StreamRequest, TargetMsg,
+};
+use nix_pixie_proto::frame::{read_frame, write_frame};
+use nix_pixie_proto::pair::Side;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use tracing::{info, warn};
+
+use crate::inventory;
+use crate::mdns::{self, Mdns};
+use crate::net::{self, Stream};
+use crate::probe::Responder;
+use crate::state::StateDir;
+use crate::store;
+
+/// Spent guesses before a code is given up: the owner shows a new one, the
+/// typist asks for it to be entered again. Each guess has ~1 in 2^31 odds.
+pub const MAX_FAILURES: u32 = 3;
+/// How long to listen for other targets' nameplates before picking ours.
+const NAMEPLATE_SURVEY: Duration = Duration::from_secs(2);
+
+pub struct AgentArgs {
+    pub state_dir: PathBuf,
+    pub port: u16,
+    pub controller_code: Option<String>,
+}
+
+pub async fn run(args: AgentArgs) -> Result<()> {
+    // Parse a typed code before touching the network, so typos fail fast.
+    let controller_code = args
+        .controller_code
+        .as_deref()
+        .map(Code::parse)
+        .transpose()?;
+    if let Some(code) = controller_code
+        && code.nameplate().is_some()
+    {
+        bail!(
+            "{code} starts with a number, so it is a target code; enter the code shown by the controller"
+        );
+    }
+
+    let state = StateDir::create(args.state_dir)?;
+    // A fresh identity per boot. Nothing persists on the installer.
+    let endpoint = net::bind(SecretKey::generate(), args.port).await?;
+    let mdns = Mdns::new()?;
+    let responder = Responder::bind().await?;
+    let (announce_tx, announce_rx) = watch::channel(None);
+    let responder = tokio::spawn(responder.run(announce_rx));
+    state.write("endpoint-id", &endpoint.id().to_string())?;
+    info!(id = %endpoint.id(), port = net::bound_port(&endpoint)?, "agent started");
+
+    let mut announcer = Announcer {
+        endpoint: &endpoint,
+        mdns: &mdns,
+        probe: &announce_tx,
+        advertised: None,
+    };
+    let result = tokio::select! {
+        r = async {
+            match &controller_code {
+                None => show_code(&mut announcer, &state).await,
+                Some(code) => typed_code(&mut announcer, &state, code).await,
+            }
+        } => r,
+        () = crate::shutdown_signal() => Ok(()),
+    };
+    responder.abort();
+    mdns.shutdown();
+    endpoint.close().await;
+    result
+}
+
+/// Publishes our announcement via DNS-SD and probe replies.
+struct Announcer<'a> {
+    endpoint: &'a Endpoint,
+    mdns: &'a Mdns,
+    probe: &'a watch::Sender<Option<Announcement>>,
+    advertised: Option<String>,
+}
+
+impl Announcer<'_> {
+    fn announce(&mut self, pairing: Pairing) -> Result<()> {
+        self.withdraw();
+        let announcement = Announcement::new(
+            *self.endpoint.id().as_bytes(),
+            net::bound_port(self.endpoint)?,
+            pairing,
+            &net::hostname(),
+        );
+        self.advertised = Some(self.mdns.advertise(&announcement)?);
+        self.probe.send_replace(Some(announcement));
+        Ok(())
+    }
+
+    fn withdraw(&mut self) {
+        if let Some(name) = self.advertised.take() {
+            self.mdns.withdraw(&name);
+        }
+        self.probe.send_replace(None);
+    }
+}
+
+/// Default mode: show a code, let the operator type it on the controller.
+async fn show_code(announcer: &mut Announcer<'_>, state: &StateDir) -> Result<()> {
+    let endpoint = announcer.endpoint;
+    loop {
+        let taken = nameplates_in_use(announcer.mdns, endpoint).await?;
+        let nameplate =
+            Code::free_nameplate(&taken).context("all nameplates on this network are in use")?;
+        let code = Code::generate(Some(nameplate));
+        announcer.announce(Pairing::ShowsCode { nameplate })?;
+        state.write("code", &code.to_string())?;
+        println!(
+            "\n    nix-pixie pairing code:  {code}\n\n    On the controller: nix-pixie controller pair --code {code}\n"
+        );
+
+        let paired = accept_pairing(endpoint, &code, Side::OwnsCode).await;
+        announcer.withdraw();
+        state.remove("code");
+        match paired? {
+            Some((conn, stream)) => {
+                if let Err(e) = session(endpoint, state, &conn, stream).await {
+                    warn!("session ended with an error: {e:#}");
+                }
+            }
+            None => warn!(
+                "{MAX_FAILURES} pairing attempts with a wrong code; someone may be guessing. Showing a new code."
+            ),
+        }
+    }
+}
+
+/// Nameplates other targets currently advertise via DNS-SD.
+async fn nameplates_in_use(mdns: &Mdns, endpoint: &Endpoint) -> Result<Vec<u8>> {
+    let events = mdns.browse()?;
+    let mut taken = Vec::new();
+    let _ = tokio::time::timeout(NAMEPLATE_SURVEY, async {
+        while let Ok(event) = events.recv_async().await {
+            if let ServiceEvent::ServiceResolved(service) = event
+                && let Ok((announcement, _)) = mdns::parse(&service)
+                && announcement.id != *endpoint.id().as_bytes()
+                && let Pairing::ShowsCode { nameplate } = announcement.pairing
+            {
+                taken.push(nameplate);
+            }
+        }
+    })
+    .await;
+    Ok(taken)
+}
+
+/// Alternative mode: the operator typed the controller's code here. The
+/// controller finds us and dials in.
+async fn typed_code(announcer: &mut Announcer<'_>, state: &StateDir, code: &Code) -> Result<()> {
+    announcer.announce(Pairing::TypedControllerCode)?;
+    println!("\n    Waiting for the controller to connect...\n");
+    let paired = accept_pairing(announcer.endpoint, code, Side::TypedCode).await;
+    announcer.withdraw();
+    match paired? {
+        Some((conn, stream)) => session(announcer.endpoint, state, &conn, stream).await,
+        None => bail!(
+            "the code was rejected {MAX_FAILURES} times; check the code shown by the controller and enter it again"
+        ),
+    }
+}
+
+/// Accepts connections until one pairs with `code`. `None` after
+/// [`MAX_FAILURES`] spent guesses.
+async fn accept_pairing(
+    endpoint: &Endpoint,
+    code: &Code,
+    side: Side,
+) -> Result<Option<(Connection, Stream)>> {
+    let mut failures = 0;
+    loop {
+        let incoming = endpoint.accept().await.context("endpoint closed")?;
+        let conn = match tokio::time::timeout(net::CONNECT_TIMEOUT, incoming).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                warn!("incoming connection failed: {e}");
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let peer = conn.remote_id();
+        match net::accept_and_pair(endpoint, &conn, side, code).await {
+            Ok(stream) => return Ok(Some((conn, stream))),
+            Err(failure) => {
+                conn.close(VarInt::from_u32(1), b"pairing failed");
+                if failure.guess_spent {
+                    failures += 1;
+                    warn!(%peer, failures, "pairing failed: {}", failure.error);
+                    if failures >= MAX_FAILURES {
+                        return Ok(None);
+                    }
+                } else {
+                    warn!(%peer, "pairing attempt failed: {}", failure.error);
+                }
+            }
+        }
+    }
+}
+
+/// After pairing: introduce ourselves, then serve this controller until it
+/// disconnects. Other controllers are refused meanwhile.
+async fn session(
+    endpoint: &Endpoint,
+    state: &StateDir,
+    conn: &Connection,
+    mut stream: Stream,
+) -> Result<()> {
+    let controller = conn.remote_id();
+    info!(%controller, "paired with controller");
+    state.write("paired-controller", &controller.to_string())?;
+    println!("\n    Paired with controller {controller}.\n");
+
+    // Separate tasks: reading a frame inside `select!` would lose data
+    // whenever another branch won.
+    let approved = Arc::new(AtomicBool::new(false));
+    let refuser = tokio::spawn(refuse_incoming(endpoint.clone()));
+    let streams = tokio::spawn(accept_streams(conn.clone(), approved.clone()));
+    let result = serve_controller(state, &mut stream, &approved).await;
+    streams.abort();
+    refuser.abort();
+    if result.is_ok() {
+        let reason = conn.closed().await;
+        info!(%controller, "controller disconnected: {reason}");
+    }
+    state.remove("paired-controller");
+    state.remove("approved");
+    result
+}
+
+/// Serves the extra streams the controller opens (store connections). Each
+/// runs in a task owned by this one, so aborting it ends them all.
+async fn accept_streams(conn: Connection, approved: Arc<AtomicBool>) {
+    let mut tasks = JoinSet::new();
+    while let Ok((send, mut recv)) = conn.accept_bi().await {
+        let approved = approved.clone();
+        tasks.spawn(async move {
+            let request = read_frame::<_, StreamRequest>(&mut recv, MAX_STREAM_REQUEST).await;
+            let result = match request {
+                Ok(_) if !approved.load(Ordering::Relaxed) => {
+                    Err(anyhow::anyhow!("stream before approval"))
+                }
+                Ok(StreamRequest::Store { root }) => match store::check_root(&root) {
+                    Ok(_) => store::serve(&root, recv, send).await,
+                    Err(reason) => Err(anyhow::anyhow!(reason)),
+                },
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
+                warn!("stream: {e:#}");
+            }
+        });
+        // Reap finished tasks as we go.
+        while tasks.try_join_next().is_some() {}
+    }
+}
+
+async fn refuse_incoming(endpoint: Endpoint) {
+    while let Some(incoming) = endpoint.accept().await {
+        incoming.refuse();
+    }
+}
+
+/// Answers the paired controller's requests until it disconnects or rejects
+/// us. Disconnecting is the normal end of a session.
+async fn serve_controller(
+    state: &StateDir,
+    stream: &mut Stream,
+    approved_flag: &AtomicBool,
+) -> Result<()> {
+    let label = net::hostname();
+    write_frame(stream, &TargetMsg::Hello { label }).await?;
+    let inventory = inventory::collect().await;
+    write_frame(stream, &TargetMsg::Inventory(Box::new(inventory))).await?;
+
+    let mut approved = false;
+    loop {
+        let Ok(message) = read_frame::<_, ControllerMsg>(stream, MAX_CONTROLLER_FRAME).await else {
+            return Ok(());
+        };
+        match message {
+            ControllerMsg::Approve { machine } => {
+                approved = true;
+                approved_flag.store(true, Ordering::Relaxed);
+                let machine = machine.map(|m| net::sanitise(&m, 63));
+                state.write("approved", machine.as_deref().unwrap_or(""))?;
+                info!(?machine, "approved by the controller");
+                match machine {
+                    Some(machine) => {
+                        println!("\n    Approved as {machine}. Waiting for the controller.\n")
+                    }
+                    None => println!("\n    Approved. Waiting for the controller.\n"),
+                }
+            }
+            ControllerMsg::Reject { reason } => {
+                let reason = net::sanitise(&reason, 200);
+                warn!(%reason, "rejected by the controller");
+                println!("\n    Rejected by the controller: {reason}\n");
+                return Ok(());
+            }
+            ControllerMsg::RequestFacterReport => {
+                let reply = if approved {
+                    match inventory::facter_report(state.path()).await {
+                        Ok(json) => TargetMsg::FacterReport { json },
+                        Err(e) => {
+                            warn!("facter report: {e:#}");
+                            TargetMsg::FacterFailed {
+                                error: format!("{e:#}"),
+                            }
+                        }
+                    }
+                } else {
+                    TargetMsg::FacterFailed {
+                        error: "not approved yet".to_string(),
+                    }
+                };
+                write_frame(stream, &reply).await?;
+            }
+            ControllerMsg::PrepareStore { root } => {
+                let reply = if !approved {
+                    TargetMsg::StoreRefused {
+                        reason: "not approved yet".to_string(),
+                    }
+                } else {
+                    match store::check_root(&root) {
+                        Ok(fstype) => {
+                            info!(%root, %fstype, "ready to receive store paths");
+                            println!("\n    Receiving the system into {root} ({fstype}).\n");
+                            TargetMsg::StoreReady { fstype }
+                        }
+                        Err(reason) => {
+                            warn!(%root, %reason, "refusing to receive store paths");
+                            TargetMsg::StoreRefused { reason }
+                        }
+                    }
+                };
+                write_frame(stream, &reply).await?;
+            }
+        }
+    }
+}

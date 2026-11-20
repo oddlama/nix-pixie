@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+# iroh 1.4.1 drops IPv6 scope ids, which breaks link-local connections
+# (https://github.com/n0-computer/iroh/issues/4584). The fork adds the fix
+# (and a dream2nix workaround); drop this once upstream releases it.
+[patch.crates-io]
+iroh = { git = "https://github.com/oddlama/iroh", branch = "nix-pixie-link-local" }

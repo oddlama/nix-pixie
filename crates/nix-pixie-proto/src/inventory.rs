@@ -1,0 +1,169 @@
+//! What a target reports about its hardware after pairing.
+//!
+//! The controller shows it for approval, matches it against the hints in the
+//! user's flake, and later uses it to pick disks. It comes from the target and
+//! is untrusted: sanitise strings before display, and validate anything that
+//! ends up in a path or a script (see [`is_valid_disk_id`]).
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inventory {
+    /// Nix system double, e.g. `x86_64-linux`.
+    pub system: String,
+    pub hostname: String,
+    pub dmi: Dmi,
+    pub cpu: Cpu,
+    pub memory_bytes: u64,
+    pub firmware: Firmware,
+    pub nics: Vec<Nic>,
+    pub disks: Vec<Disk>,
+}
+
+/// SMBIOS identification; absent on many ARM boards.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dmi {
+    pub vendor: Option<String>,
+    pub product: Option<String>,
+    pub serial: Option<String>,
+    pub uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cpu {
+    pub model: Option<String>,
+    pub threads: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Firmware {
+    pub uefi: bool,
+    /// `None` when unknown (BIOS, or the variable is missing).
+    pub secure_boot: Option<bool>,
+    /// Secure Boot setup mode: keys can be enrolled.
+    pub setup_mode: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Nic {
+    pub name: String,
+    /// Lowercase, colon-separated.
+    pub mac: String,
+    pub link_up: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Disk {
+    /// Kernel name, e.g. `nvme0n1`.
+    pub name: String,
+    /// Names in `/dev/disk/by-id` that point at this disk (not partitions).
+    pub by_id: Vec<String>,
+    pub size_bytes: u64,
+    pub model: Option<String>,
+    pub serial: Option<String>,
+    /// `nvme`, `sata`, `usb`, `virtio`, ...
+    pub transport: Option<String>,
+    pub rotational: bool,
+    pub removable: bool,
+    pub read_only: bool,
+    /// `gpt` or `dos`, if there is one.
+    pub partition_table: Option<String>,
+    /// Signatures found on the disk itself and its partitions (and anything
+    /// stacked on them, like LUKS or LVM).
+    pub contents: Vec<Content>,
+    /// Something on it is mounted or used as swap, e.g. the installer's own
+    /// boot medium. Never offered for installation.
+    pub in_use: bool,
+}
+
+impl Disk {
+    /// Whether installing onto this disk would destroy something.
+    pub fn has_data(&self) -> bool {
+        self.partition_table.is_some() || !self.contents.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Content {
+    /// Kernel name of the device carrying it, e.g. `nvme0n1p2`.
+    pub device: String,
+    pub size_bytes: u64,
+    pub fstype: Option<String>,
+    pub label: Option<String>,
+    pub partlabel: Option<String>,
+}
+
+/// Whether `id` is acceptable as a `/dev/disk/by-id` name. These end up in
+/// generated disko configs and shell scripts, so only a conservative set of
+/// characters passes.
+pub fn is_valid_disk_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 255
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'+' | b'-'))
+}
+
+/// The Nix system double for a Rust `target_arch` on Linux.
+pub fn nix_system(arch: &str) -> String {
+    let arch = match arch {
+        "x86" => "i686",
+        "arm" => "armv7l",
+        other => other,
+    };
+    format!("{arch}-linux")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_ids() {
+        for ok in [
+            "nvme-Samsung_SSD_980_1TB_S64ANS0T123456",
+            "virtio-pixie-data",
+            "wwn-0x5000c500a1b2c3d4",
+            "ata-WDC_WD40EFRX-68N32N0_WD-WCC7K1234567",
+        ] {
+            assert!(is_valid_disk_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a b",
+            "x;rm -rf /",
+            "$(id)",
+            "a\nb",
+            "ä",
+        ] {
+            assert!(!is_valid_disk_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn has_data() {
+        let empty = Disk::default();
+        assert!(!empty.has_data());
+        let gpt = Disk {
+            partition_table: Some("gpt".into()),
+            ..Disk::default()
+        };
+        assert!(gpt.has_data());
+        let fs = Disk {
+            contents: vec![Content::default()],
+            ..Disk::default()
+        };
+        assert!(fs.has_data());
+    }
+
+    #[test]
+    fn systems() {
+        assert_eq!(nix_system("x86_64"), "x86_64-linux");
+        assert_eq!(nix_system("aarch64"), "aarch64-linux");
+        assert_eq!(nix_system("riscv64"), "riscv64-linux");
+    }
+}

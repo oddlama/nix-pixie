@@ -1,0 +1,588 @@
+//! Controller commands. The TUI comes later; these are the scriptable
+//! building blocks it will use, and what the VM tests drive.
+//!
+//! The controller only ever dials out. It needs no open ports on the
+//! operator's machine.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use iroh::endpoint::{Connection, VarInt};
+use iroh::{Endpoint, EndpointId};
+use nix_pixie_proto::announce::Pairing;
+use nix_pixie_proto::code::Code;
+use nix_pixie_proto::ctrl::{ControllerMsg, MAX_FACTER_FRAME, MAX_TARGET_FRAME, TargetMsg};
+use nix_pixie_proto::frame::{read_frame, write_frame};
+use nix_pixie_proto::inventory::Inventory;
+use nix_pixie_proto::pair::{PairError, Side};
+use tracing::{info, warn};
+
+use crate::agent::MAX_FAILURES;
+use crate::discovery::{Discovery, Method, Peer};
+use crate::identity;
+use crate::metadata::{self, Metadata, Suggestion};
+use crate::net::{self, DialError, Stream, sanitise};
+use crate::push;
+use crate::state::write_private;
+
+/// How long to collect a newly found target's addresses before dialing it.
+const SETTLE: Duration = Duration::from_millis(600);
+/// For the target's hello and inventory (lsblk and sysfs reads).
+const INTRODUCTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// nixos-facter takes a few seconds; give slow machines plenty of room.
+const FACTER_TIMEOUT: Duration = Duration::from_secs(180);
+
+pub fn print_id(identity_path: &Path) -> Result<()> {
+    println!("{}", identity::load_or_create(identity_path)?.public());
+    Ok(())
+}
+
+pub struct PairArgs {
+    pub identity: PathBuf,
+    pub code: String,
+    pub timeout: Duration,
+    pub method: Method,
+    /// Flake with the `pixie` output, for matching and writing reports.
+    pub flake: Option<String>,
+    /// Install the target as this machine of the flake.
+    pub machine: Option<String>,
+    /// Approve without asking.
+    pub yes: bool,
+    /// Store paths to copy (with their closures) into the target's disk.
+    pub push: Vec<String>,
+    /// Where the target's filesystems are mounted.
+    pub store_root: String,
+}
+
+/// Pairs with the target showing a code (default mode), shows what it is,
+/// asks the operator to approve it, and prints one JSON object describing it.
+pub async fn pair(args: PairArgs) -> Result<()> {
+    let code = Code::parse(&args.code)?;
+    let nameplate = code.nameplate().context(
+        "target codes start with the number shown on the target, e.g. 42-acid-acorn-acre",
+    )?;
+    // Check everything we can first: a mistake shouldn't cost a pairing code.
+    push::check_local_paths(&args.push).await?;
+    let flake = match &args.flake {
+        Some(flake) => Some((flake.as_str(), metadata::load(flake).await?)),
+        None => None,
+    };
+    match (&args.machine, &flake) {
+        (Some(_), None) => bail!("--machine needs --flake"),
+        (Some(machine), Some((flake, metadata))) if !metadata.machines.contains_key(machine) => {
+            let known: Vec<&str> = metadata.machines.keys().map(String::as_str).collect();
+            bail!(
+                "{flake} has no machine `{machine}`; it has: {}",
+                known.join(", ")
+            );
+        }
+        _ => {}
+    }
+
+    let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
+    let mut discovery = Discovery::start(args.method).await?;
+    let result = tokio::select! {
+        r = async {
+            let (conn, mut stream, peer) =
+                pair_with_target(&endpoint, &mut discovery, &code, nameplate, args.timeout).await?;
+            let result = review(&mut stream, &conn, &peer, flake.as_ref(), &args).await;
+            net::finish(&mut stream).await;
+            conn.close(VarInt::from_u32(0), b"done");
+            result
+        } => r,
+        () = crate::shutdown_signal() => Err(anyhow!("interrupted")),
+    };
+    discovery.shutdown();
+    endpoint.close().await;
+    result
+}
+
+async fn pair_with_target(
+    endpoint: &Endpoint,
+    discovery: &mut Discovery,
+    code: &Code,
+    nameplate: u8,
+    timeout: Duration,
+) -> Result<(Connection, Stream, Peer)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut dialer = Dialer::default();
+    loop {
+        let Ok(peer) = tokio::time::timeout_at(deadline, discovery.next()).await else {
+            if dialer.paired_with_any() {
+                bail!(
+                    "no target with nameplate {nameplate} accepted the code ({})",
+                    discovery.describe()
+                );
+            }
+            if let Some(error) = &dialer.last_connect_error {
+                bail!(
+                    "found a target with nameplate {nameplate}, but could not connect to it: {error}"
+                );
+            }
+            bail!(
+                "no target with nameplate {nameplate} found ({}). Check that the target shows this code and is on the same network segment",
+                discovery.describe()
+            );
+        };
+        let peer = peer?;
+        // Nameplates are random and small, so two targets can share one; try each.
+        if peer.pairing != (Pairing::ShowsCode { nameplate }) || !dialer.would_dial(&peer) {
+            continue;
+        }
+        let peer = discovery.settle(peer.id, SETTLE).await.unwrap_or(peer);
+        match dialer.attempt(endpoint, &peer, Side::TypedCode, code).await {
+            Attempt::Paired(conn, stream) => return Ok((conn, stream, peer)),
+            Attempt::TooManyFailures => bail!(
+                "{MAX_FAILURES} machines with nameplate {nameplate} rejected the code. Someone may be impersonating targets; get a new code from the target"
+            ),
+            Attempt::Skipped | Attempt::Failed => {}
+        }
+    }
+}
+
+/// Reads the target's hello and inventory, the first two messages after
+/// pairing.
+async fn introduction(stream: &mut Stream) -> Result<(String, Inventory)> {
+    let read = async {
+        let TargetMsg::Hello { label } = read_frame(stream, MAX_TARGET_FRAME).await? else {
+            bail!("the target did not start with a hello");
+        };
+        let TargetMsg::Inventory(inventory) = read_frame(stream, MAX_TARGET_FRAME).await? else {
+            bail!("the target did not send its inventory");
+        };
+        Ok((sanitise(&label, 63), *inventory))
+    };
+    tokio::time::timeout(INTRODUCTION_TIMEOUT, read)
+        .await
+        .context("timed out waiting for the target to introduce itself")?
+}
+
+/// After pairing: show the target, ask for approval, fetch the facter report
+/// if the chosen machine wants one, and print the result as JSON.
+async fn review(
+    stream: &mut Stream,
+    conn: &Connection,
+    peer: &Peer,
+    flake: Option<&(&str, Metadata)>,
+    args: &PairArgs,
+) -> Result<()> {
+    let (label, inventory) = introduction(stream).await?;
+    let suggestions = flake
+        .map(|(_, m)| m.suggest(&inventory))
+        .unwrap_or_default();
+    let machine = match &args.machine {
+        Some(machine) => Some(machine.clone()),
+        None => match suggestions.as_slice() {
+            [only] => Some(only.machine.clone()),
+            _ => None,
+        },
+    };
+
+    eprintln!(
+        "{}",
+        summary(
+            conn,
+            &label,
+            peer,
+            &inventory,
+            &suggestions,
+            machine.as_deref()
+        )
+    );
+    if !(args.yes || confirm("Approve this machine? [y/N] ").await?) {
+        write_frame(
+            stream,
+            &ControllerMsg::Reject {
+                reason: "rejected by the operator".into(),
+            },
+        )
+        .await?;
+        bail!("rejected");
+    }
+    write_frame(
+        stream,
+        &ControllerMsg::Approve {
+            machine: machine.clone(),
+        },
+    )
+    .await?;
+    info!(target = %conn.remote_id(), ?machine, "approved");
+
+    let report_path = flake
+        .zip(machine.as_ref())
+        .and_then(|((flake, metadata), machine)| {
+            let path = metadata.machines.get(machine)?.facter.report_path.clone()?;
+            Some((*flake, path))
+        });
+    let facter = match report_path {
+        Some((flake, path)) => Some(fetch_facter_report(stream, flake, &path).await),
+        None => None,
+    };
+    let pushed = if args.push.is_empty() {
+        None
+    } else {
+        Some(push::push(conn, stream, &args.store_root, &args.push).await?)
+    };
+
+    let report = serde_json::json!({
+        "target": conn.remote_id().to_string(),
+        "label": label,
+        "addrs": peer.addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "inventory": inventory,
+        "suggestions": suggestions.iter().map(|s| serde_json::json!({
+            "machine": s.machine, "reasons": s.reasons,
+        })).collect::<Vec<_>>(),
+        "machine": machine,
+        "configuration": flake
+            .zip(machine.as_ref())
+            .and_then(|((_, metadata), machine)| metadata.machines.get(machine))
+            .map(|m| m.configuration.clone()),
+        "push": pushed.map(|p| serde_json::json!({
+            "root": args.store_root, "fstype": p.fstype, "paths": args.push, "seconds": p.seconds,
+        })),
+        "facterReport": facter.map(|f| match f {
+            Ok(path) => serde_json::json!({ "path": path }),
+            Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+        }),
+    });
+    println!("{report}");
+    Ok(())
+}
+
+/// Asks the target for a facter report and writes it into the flake's
+/// repository. Returns the path, relative to the flake.
+async fn fetch_facter_report(
+    stream: &mut Stream,
+    flake: &str,
+    report_path: &str,
+) -> Result<String> {
+    let root = metadata::local_flake_dir(flake).with_context(|| {
+        format!("{flake} is not a local checkout, so the report can't be written")
+    })?;
+    let path = metadata::repo_path(&root, report_path)?;
+    write_frame(stream, &ControllerMsg::RequestFacterReport).await?;
+    let reply = tokio::time::timeout(FACTER_TIMEOUT, read_frame(stream, MAX_FACTER_FRAME))
+        .await
+        .context("timed out waiting for the facter report")??;
+    let json = match reply {
+        TargetMsg::FacterReport { json } => json,
+        TargetMsg::FacterFailed { error } => {
+            bail!(
+                "the target could not run nixos-facter: {}",
+                sanitise(&error, 500)
+            )
+        }
+        _ => bail!("unexpected reply to the facter request"),
+    };
+    // It goes into the user's repository and gets imported by Nix: insist on
+    // a JSON object.
+    let value: serde_json::Value =
+        serde_json::from_slice(&json).context("the facter report is not valid JSON")?;
+    anyhow::ensure!(value.is_object(), "the facter report is not a JSON object");
+    metadata::write_into_repo(&root, &path, &json).await?;
+    info!(path = %path.display(), "wrote facter report");
+    Ok(report_path.to_string())
+}
+
+/// Reads a yes/no answer from stdin. End of input counts as no.
+async fn confirm(question: &str) -> Result<bool> {
+    use tokio::io::AsyncBufReadExt;
+    eprint!("{question}");
+    let mut answer = String::new();
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut answer)
+        .await
+        .context("reading the answer")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// What the operator sees before approving. Everything from the target is
+/// sanitised again here: the controller doesn't trust the target's cleanup.
+fn summary(
+    conn: &Connection,
+    label: &str,
+    peer: &Peer,
+    inventory: &Inventory,
+    suggestions: &[Suggestion],
+    machine: Option<&str>,
+) -> String {
+    use std::fmt::Write;
+    let clean = |s: &str| sanitise(s, 128);
+    let opt = |s: &Option<String>| s.as_deref().map(clean);
+    let mut out = String::new();
+    let addrs: Vec<String> = net::dial_addrs(&peer.addrs)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let _ = writeln!(out, "\nPaired with {} ({})", clean(label), addrs.join(", "));
+    let _ = writeln!(out, "  id        {}", conn.remote_id());
+    let firmware = match (inventory.firmware.uefi, inventory.firmware.secure_boot) {
+        (false, _) => "BIOS",
+        (true, Some(true)) => "UEFI, Secure Boot on",
+        (true, Some(false)) => "UEFI, Secure Boot off",
+        (true, None) => "UEFI",
+    };
+    let _ = writeln!(
+        out,
+        "  system    {}, {} threads, {} RAM, {firmware}",
+        clean(&inventory.system),
+        inventory.cpu.threads,
+        human_size(inventory.memory_bytes)
+    );
+    let hardware: Vec<String> = [&inventory.dmi.vendor, &inventory.dmi.product]
+        .into_iter()
+        .filter_map(opt)
+        .collect();
+    if !hardware.is_empty() || inventory.dmi.serial.is_some() {
+        let serial = opt(&inventory.dmi.serial)
+            .map(|s| format!(" (serial {s})"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "  hardware  {}{serial}", hardware.join(" "));
+    }
+    for nic in &inventory.nics {
+        let link = if nic.link_up { "up" } else { "down" };
+        let _ = writeln!(
+            out,
+            "  nic       {} {} ({link})",
+            clean(&nic.name),
+            clean(&nic.mac)
+        );
+    }
+    for disk in &inventory.disks {
+        let what = [opt(&disk.transport), opt(&disk.model)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let state = if disk.in_use {
+            "in use, not installable".to_string()
+        } else if disk.has_data() {
+            let mut found: Vec<String> = disk.partition_table.iter().map(|t| clean(t)).collect();
+            found.extend(disk.contents.iter().map(|c| {
+                let fs = opt(&c.fstype).unwrap_or_else(|| "partition".into());
+                match opt(&c.label).or_else(|| opt(&c.partlabel)) {
+                    Some(label) => format!("{fs} \"{label}\""),
+                    None => fs,
+                }
+            }));
+            format!("HAS DATA: {}", found.join(", "))
+        } else {
+            "empty".to_string()
+        };
+        let _ = writeln!(
+            out,
+            "  disk      {} {} {what} [{state}]",
+            clean(&disk.name),
+            human_size(disk.size_bytes)
+        );
+    }
+    let line = match (machine, suggestions) {
+        (Some(machine), []) => format!("{machine} (chosen)"),
+        (Some(machine), _) => {
+            let reasons: Vec<&str> = suggestions
+                .iter()
+                .filter(|s| s.machine == machine)
+                .flat_map(|s| s.reasons.iter().map(String::as_str))
+                .collect();
+            if reasons.is_empty() {
+                format!("{machine} (chosen; the hints suggest otherwise)")
+            } else {
+                format!("{machine} (matched: {})", reasons.join(", "))
+            }
+        }
+        (None, []) => "none matched".to_string(),
+        (None, many) => {
+            let names: Vec<&str> = many.iter().map(|s| s.machine.as_str()).collect();
+            format!("ambiguous: {}; pick one with --machine", names.join(", "))
+        }
+    };
+    let _ = writeln!(out, "  machine   {line}");
+    out
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    #[allow(clippy::cast_precision_loss)]
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Dials discovered targets, at most once per target and code, but again
+/// when new addresses show up after a failed connection attempt.
+#[derive(Default)]
+struct Dialer {
+    attempted: HashMap<EndpointId, BTreeSet<SocketAddr>>,
+    /// Targets we ran pairing with, successfully or not.
+    done: HashSet<EndpointId>,
+    /// Spent guesses at the current code.
+    spent: u32,
+    /// Why the last connection attempt failed, for error messages.
+    last_connect_error: Option<String>,
+}
+
+enum Attempt {
+    Paired(Connection, Stream),
+    Skipped,
+    Failed,
+    TooManyFailures,
+}
+
+impl Dialer {
+    /// Whether `peer` is new, or has addresses we haven't tried yet.
+    fn would_dial(&self, peer: &Peer) -> bool {
+        !self.done.contains(&peer.id)
+            && self.attempted.get(&peer.id).is_none_or(|tried| {
+                !net::dial_addrs(&peer.addrs)
+                    .iter()
+                    .all(|a| tried.contains(a))
+            })
+    }
+
+    async fn attempt(
+        &mut self,
+        endpoint: &Endpoint,
+        peer: &Peer,
+        side: Side,
+        code: &Code,
+    ) -> Attempt {
+        if !self.would_dial(peer) {
+            return Attempt::Skipped;
+        }
+        self.attempted
+            .entry(peer.id)
+            .or_default()
+            .extend(net::dial_addrs(&peer.addrs));
+        info!(target = %peer.id, label = %peer.label, addrs = ?net::dial_addrs(&peer.addrs), "dialing target");
+        match net::dial_and_pair(endpoint, peer, side, code).await {
+            Ok((conn, stream)) => {
+                self.done.insert(peer.id);
+                Attempt::Paired(conn, stream)
+            }
+            Err(DialError::Connect(e)) => {
+                warn!(target = %peer.id, "could not connect: {e:#}");
+                let addrs: Vec<String> = peer.addrs.iter().map(ToString::to_string).collect();
+                self.last_connect_error = Some(format!("{e:#} (tried {})", addrs.join(", ")));
+                Attempt::Failed
+            }
+            Err(DialError::Pair(failure)) => {
+                warn!(target = %peer.id, label = %peer.label, "pairing failed: {}", failure.error);
+                if failure.guess_spent {
+                    self.done.insert(peer.id);
+                    self.spent += 1;
+                    if self.spent >= MAX_FAILURES {
+                        return Attempt::TooManyFailures;
+                    }
+                } else if matches!(failure.error, PairError::Frame(_) | PairError::Timeout) {
+                    // The connection broke before anything was revealed:
+                    // safe to try again once other addresses show up.
+                    self.last_connect_error = Some(failure.error.to_string());
+                } else {
+                    self.done.insert(peer.id);
+                }
+                Attempt::Failed
+            }
+        }
+    }
+
+    fn paired_with_any(&self) -> bool {
+        !self.done.is_empty()
+    }
+}
+
+pub struct ServeArgs {
+    pub identity: PathBuf,
+    pub code_file: Option<PathBuf>,
+    pub max_targets: Option<usize>,
+    pub method: Method,
+}
+
+/// Alternative mode: show a controller code that operators type on targets,
+/// and pair with every target that did. Prints one JSON object per target.
+pub async fn serve(args: ServeArgs) -> Result<()> {
+    let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
+    let mut discovery = Discovery::start(args.method).await?;
+    info!(id = %endpoint.id(), "controller ready");
+
+    let mut paired = Vec::new();
+    let result = tokio::select! {
+        r = pair_with_targets(&endpoint, &mut discovery, &args, &mut paired) => r,
+        () = crate::shutdown_signal() => Ok(()),
+    };
+    for conn in paired {
+        conn.close(VarInt::from_u32(0), b"done");
+    }
+    discovery.shutdown();
+    endpoint.close().await;
+    result
+}
+
+async fn pair_with_targets(
+    endpoint: &Endpoint,
+    discovery: &mut Discovery,
+    args: &ServeArgs,
+    paired: &mut Vec<Connection>,
+) -> Result<()> {
+    let mut code = new_code(args.code_file.as_deref())?;
+    let mut dialer = Dialer::default();
+    loop {
+        if args.max_targets.is_some_and(|max| paired.len() >= max) {
+            return Ok(());
+        }
+        let peer = discovery.next().await?;
+        if peer.pairing != Pairing::TypedControllerCode || !dialer.would_dial(&peer) {
+            continue;
+        }
+        let peer = discovery.settle(peer.id, SETTLE).await.unwrap_or(peer);
+        match dialer.attempt(endpoint, &peer, Side::OwnsCode, &code).await {
+            Attempt::Paired(conn, mut stream) => match introduction(&mut stream).await {
+                Ok((label, inventory)) => {
+                    let report = serde_json::json!({
+                        "target": conn.remote_id().to_string(),
+                        "label": label,
+                        "addrs": peer.addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                        "inventory": inventory,
+                    });
+                    println!("{report}");
+                    paired.push(conn);
+                }
+                Err(e) => {
+                    warn!(target = %peer.id, "target paired but did not introduce itself: {e:#}")
+                }
+            },
+            Attempt::TooManyFailures => {
+                warn!(
+                    "{MAX_FAILURES} targets tried a wrong code; someone may be guessing. New code."
+                );
+                dialer.spent = 0;
+                code = new_code(args.code_file.as_deref())?;
+            }
+            Attempt::Skipped | Attempt::Failed => {}
+        }
+    }
+}
+
+fn new_code(code_file: Option<&Path>) -> Result<Code> {
+    let code = Code::generate(None);
+    eprintln!(
+        "\n    Controller code:  {code}\n\n    On the target: nix-pixie agent --controller-code {code}\n"
+    );
+    if let Some(path) = code_file {
+        write_private(path, &code.to_string())?;
+    }
+    Ok(code)
+}
