@@ -11,12 +11,15 @@ use serde::Deserialize;
 /// Must match `metadataVersion` in `nix/lib.nix`.
 const METADATA_VERSION: u32 = 1;
 
+/// The flake's `pixie` output (`nix/lib.nix`'s `mkMetadata`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Metadata {
     pub version: u32,
     pub machines: BTreeMap<String, Machine>,
 }
 
+/// One machine of the flake: which configuration it installs, and how to
+/// recognise it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Machine {
     pub configuration: String,
@@ -25,6 +28,8 @@ pub struct Machine {
     pub facter: Facter,
 }
 
+/// Identifiers that suggest a target is this machine. Not authentication:
+/// the operator approves every target.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hints {
@@ -32,6 +37,7 @@ pub struct Hints {
     pub dmi_serial: Vec<String>,
 }
 
+/// Where the machine's nixos-facter report goes, if it wants one.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Facter {

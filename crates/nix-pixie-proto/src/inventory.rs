@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The target's hardware, sent once right after pairing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inventory {
     /// Nix system double, e.g. `x86_64-linux`.
@@ -29,12 +30,14 @@ pub struct Dmi {
     pub uuid: Option<String>,
 }
 
+/// The CPU, as far as it matters for choosing a configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cpu {
     pub model: Option<String>,
     pub threads: u32,
 }
 
+/// Boot firmware, from efivars. Decides which bootloaders can work.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Firmware {
     pub uefi: bool,
@@ -44,6 +47,7 @@ pub struct Firmware {
     pub setup_mode: Option<bool>,
 }
 
+/// A physical network interface. Its MAC can match a machine's hints.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Nic {
     pub name: String,
@@ -89,6 +93,8 @@ impl Disk {
     }
 }
 
+/// Something found on or inside a disk: a partition, a filesystem, LUKS or
+/// LVM. Shown to the operator before anything is wiped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Content {
     /// Kernel name of the device carrying it, e.g. `nvme0n1p2`.

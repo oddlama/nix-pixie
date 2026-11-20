@@ -18,6 +18,7 @@ use crate::probe::{Prober, RoundReport};
 
 const PROBE_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// Which discovery mechanisms the controller uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Method {
     /// DNS-SD and probes.
@@ -45,6 +46,9 @@ pub struct Stats {
     pub probe_replies: usize,
 }
 
+/// Finds announcing targets via DNS-SD and probes, and merges what both
+/// report into one [`Peer`] per endpoint. Owns the mDNS daemon and the probe
+/// task; call `shutdown` when done.
 pub struct Discovery {
     mdns: Option<(Mdns, mdns_sd::Receiver<ServiceEvent>)>,
     prober: Option<(

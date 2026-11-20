@@ -38,6 +38,9 @@ pub enum Pairing {
     TypedControllerCode,
 }
 
+/// What a waiting target publishes, via DNS-SD TXT records and in probe
+/// replies: enough to dial it and to tell which code it is waiting for.
+/// Unauthenticated; pairing proves who is behind it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Announcement {
     pub version: u32,
@@ -50,6 +53,7 @@ pub struct Announcement {
     pub label: String,
 }
 
+/// Why an announcement from the network was ignored.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AnnounceError {
     #[error("missing `{0}`")]

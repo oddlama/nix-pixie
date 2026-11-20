@@ -12,6 +12,8 @@ use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInf
 use nix_pixie_proto::DNS_SD_SERVICE;
 use nix_pixie_proto::announce::{Announcement, Pairing};
 
+/// Our DNS-SD service: advertising (agent) and browsing (both roles) for
+/// `_nix-pixie._udp`.
 pub struct Mdns {
     daemon: ServiceDaemon,
 }

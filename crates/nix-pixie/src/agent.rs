@@ -35,6 +35,7 @@ pub const MAX_FAILURES: u32 = 3;
 /// How long to listen for other targets' nameplates before picking ours.
 const NAMEPLATE_SURVEY: Duration = Duration::from_secs(2);
 
+/// How `nix-pixie agent` was invoked.
 pub struct AgentArgs {
     pub state_dir: PathBuf,
     pub port: u16,

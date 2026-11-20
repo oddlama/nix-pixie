@@ -40,6 +40,7 @@ pub fn print_id(identity_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How `nix-pixie controller pair` was invoked.
 pub struct PairArgs {
     pub identity: PathBuf,
     pub code: String,
@@ -435,6 +436,7 @@ struct Dialer {
     last_connect_error: Option<String>,
 }
 
+/// Outcome of trying one discovered target.
 enum Attempt {
     Paired(Connection, Stream),
     Skipped,
@@ -504,6 +506,7 @@ impl Dialer {
     }
 }
 
+/// How `nix-pixie controller serve` was invoked.
 pub struct ServeArgs {
     pub identity: PathBuf,
     pub code_file: Option<PathBuf>,

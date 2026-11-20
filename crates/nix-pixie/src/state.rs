@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// A private (0700) directory of status files, written atomically.
 pub struct StateDir {
     path: PathBuf,
 }

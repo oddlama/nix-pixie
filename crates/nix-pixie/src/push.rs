@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::net::{Stream, sanitise};
 
+/// What a finished push reports.
 pub struct PushReport {
     pub fstype: String,
     pub seconds: f64,
