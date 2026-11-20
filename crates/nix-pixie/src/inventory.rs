@@ -96,7 +96,7 @@ fn is_placeholder(value: &str) -> bool {
     PLACEHOLDERS.contains(&value.to_ascii_lowercase().as_str())
 }
 
-fn dmi(dir: &Path) -> Dmi {
+pub fn dmi(dir: &Path) -> Dmi {
     let field = |name: &str| read_field(&dir.join(name)).filter(|v| !is_placeholder(v));
     Dmi {
         vendor: field("sys_vendor"),
@@ -106,20 +106,20 @@ fn dmi(dir: &Path) -> Dmi {
     }
 }
 
-fn cpu_model(cpuinfo: &str) -> Option<String> {
+pub fn cpu_model(cpuinfo: &str) -> Option<String> {
     cpuinfo.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
         (key.trim() == "model name").then(|| sanitise(value.trim(), MAX_FIELD))
     })
 }
 
-fn mem_total(meminfo: &str) -> Option<u64> {
+pub fn mem_total(meminfo: &str) -> Option<u64> {
     let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     kib.checked_mul(1024)
 }
 
-fn firmware(efi: &Path) -> Firmware {
+pub fn firmware(efi: &Path) -> Firmware {
     let var = |name: &str| {
         // 4 bytes of attributes, then the value.
         let bytes = std::fs::read(efi.join("efivars").join(format!("{name}-{EFI_GLOBAL}"))).ok()?;
@@ -133,7 +133,7 @@ fn firmware(efi: &Path) -> Firmware {
 }
 
 /// Physical NICs (with a `device` link), sorted by name.
-fn nics(dir: &Path) -> Vec<Nic> {
+pub fn nics(dir: &Path) -> Vec<Nic> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -199,7 +199,10 @@ fn by_id_links(dir: &Path) -> HashMap<String, Vec<String>> {
     links
 }
 
-fn parse_lsblk(json: &Value, by_id: &HashMap<String, Vec<String>>) -> Vec<Disk> {
+pub fn parse_lsblk<S: std::hash::BuildHasher>(
+    json: &Value,
+    by_id: &HashMap<String, Vec<String>, S>,
+) -> Vec<Disk> {
     let Some(devices) = json.get("blockdevices").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -283,123 +286,5 @@ fn number(dev: &Value, key: &str) -> u64 {
         Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
         Some(Value::String(s)) => s.parse().unwrap_or(0),
         _ => 0,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_lsblk() {
-        let json: Value = serde_json::from_str(
-            r#"{"blockdevices": [
-              {"name":"sr0","type":"rom","size":1048576,"model":"QEMU DVD-ROM","serial":"QM00003","tran":"ata","rota":true,"rm":true,"ro":false,"pttype":null,"fstype":"iso9660","label":"nixos","partlabel":null,"mountpoints":["/iso"]},
-              {"name":"vda","type":"disk","size":1073741824,"model":null,"serial":"pixie-data","tran":"virtio","rota":true,"rm":false,"ro":false,"pttype":"gpt","fstype":null,"label":null,"partlabel":null,"mountpoints":[null],
-               "children":[
-                 {"name":"vda1","type":"part","size":536870912,"model":null,"serial":null,"tran":null,"rota":true,"rm":false,"ro":false,"pttype":"gpt","fstype":"ext4","label":"old-root","partlabel":"disk-main-root","mountpoints":[null]},
-                 {"name":"vda2","type":"part","size":536870912,"model":null,"serial":null,"tran":null,"rota":true,"rm":false,"ro":false,"pttype":"gpt","fstype":"crypto_LUKS","label":null,"partlabel":null,"mountpoints":[null],
-                  "children":[{"name":"luks","type":"crypt","size":520093696,"fstype":"swap","label":null,"partlabel":null,"mountpoints":["[SWAP]"]}]}
-               ]},
-              {"name":"nvme0n1","type":"disk","size":"500107862016","model":"Samsung SSD 980 \u001b[31m","serial":"S64A","tran":"nvme","rota":"0","rm":"0","ro":"1","pttype":null,"fstype":null,"label":null,"partlabel":null,"mountpoints":[null]},
-              {"name":"zram0","type":"disk","size":1024,"mountpoints":["[SWAP]"]}
-            ]}"#,
-        )
-        .unwrap();
-        let by_id = HashMap::from([("vda".to_string(), vec!["virtio-pixie-data".to_string()])]);
-        let disks = parse_lsblk(&json, &by_id);
-        assert_eq!(
-            disks.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            ["vda", "nvme0n1"]
-        );
-
-        let vda = &disks[0];
-        assert_eq!(vda.by_id, ["virtio-pixie-data"]);
-        assert_eq!(vda.size_bytes, 1 << 30);
-        assert_eq!(vda.partition_table.as_deref(), Some("gpt"));
-        assert!(vda.rotational && !vda.removable && !vda.read_only);
-        assert!(vda.in_use, "swap inside LUKS counts as in use");
-        let fstypes: Vec<_> = vda.contents.iter().map(|c| c.fstype.as_deref()).collect();
-        assert_eq!(fstypes, [Some("ext4"), Some("crypto_LUKS"), Some("swap")]);
-        assert_eq!(vda.contents[0].partlabel.as_deref(), Some("disk-main-root"));
-
-        let nvme = &disks[1];
-        assert_eq!(nvme.size_bytes, 500_107_862_016);
-        assert_eq!(
-            nvme.model.as_deref(),
-            Some("Samsung SSD 980 [31m"),
-            "control characters stripped"
-        );
-        assert!(!nvme.rotational && nvme.read_only && !nvme.in_use && !nvme.has_data());
-    }
-
-    #[test]
-    fn parses_proc_files() {
-        assert_eq!(
-            mem_total("MemTotal:        2034232 kB\nMemFree: 1 kB\n"),
-            Some(2_034_232 * 1024)
-        );
-        assert_eq!(mem_total("garbage"), None);
-        let cpuinfo =
-            "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) CPU\n";
-        assert_eq!(cpu_model(cpuinfo).as_deref(), Some("Intel(R) Xeon(R) CPU"));
-        assert_eq!(cpu_model("processor : 0\n"), None);
-    }
-
-    #[test]
-    fn reads_sysfs_like_trees() {
-        let root = std::env::temp_dir().join(format!("nix-pixie-inventory-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let write = |path: &str, contents: &[u8]| {
-            let path = root.join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, contents).unwrap();
-        };
-        write("dmi/sys_vendor", b"QEMU\n");
-        write("dmi/product_name", b"Standard PC\n");
-        write("dmi/product_serial", b"To Be Filled By O.E.M.\n");
-        write(
-            "efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
-            &[6, 0, 0, 0, 1],
-        );
-        write(
-            "efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c",
-            &[6, 0, 0, 0, 0],
-        );
-        write("net/eth0/address", b"52:54:00:12:01:02\n");
-        write("net/eth0/operstate", b"up\n");
-        write("net/eth0/device/vendor", b"x");
-        write("net/br0/address", b"aa:bb:cc:dd:ee:ff\n");
-
-        let dmi = dmi(&root.join("dmi"));
-        assert_eq!(dmi.vendor.as_deref(), Some("QEMU"));
-        assert_eq!(dmi.serial, None, "placeholder serials are dropped");
-        let efi = firmware(&root.join("efi"));
-        assert_eq!(
-            efi,
-            Firmware {
-                uefi: true,
-                secure_boot: Some(true),
-                setup_mode: Some(false)
-            }
-        );
-        assert_eq!(
-            firmware(&root.join("missing")),
-            Firmware {
-                uefi: false,
-                secure_boot: None,
-                setup_mode: None
-            }
-        );
-        let nics = nics(&root.join("net"));
-        assert_eq!(
-            nics,
-            [Nic {
-                name: "eth0".into(),
-                mac: "52:54:00:12:01:02".into(),
-                link_up: true
-            }]
-        );
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

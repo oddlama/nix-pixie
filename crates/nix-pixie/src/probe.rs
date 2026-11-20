@@ -145,6 +145,15 @@ pub struct RoundReport {
 }
 
 impl Prober {
+    /// Sends one probe to `to`. Rounds do this for every neighbour.
+    pub async fn probe(&self, to: SocketAddr) {
+        let socket = match (to, &self.v6) {
+            (SocketAddr::V6(_), Some(v6)) => v6,
+            _ => &self.v4,
+        };
+        send(socket, to, &encode_probe(&self.nonce)).await;
+    }
+
     pub async fn new() -> Result<Self> {
         let v4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
         v4.set_broadcast(true)?;
@@ -312,7 +321,7 @@ async fn neighbours() -> Result<Vec<SocketAddr>> {
     }))
 }
 
-fn parse_neighbours(json: &[u8], ifindex: impl Fn(&str) -> Option<u32>) -> Vec<SocketAddr> {
+pub fn parse_neighbours(json: &[u8], ifindex: impl Fn(&str) -> Option<u32>) -> Vec<SocketAddr> {
     let Ok(serde_json::Value::Array(entries)) = serde_json::from_slice(json) else {
         warn!("unexpected output from `{IP} -json neigh`");
         return Vec::new();
@@ -343,106 +352,17 @@ fn parse_neighbours(json: &[u8], ifindex: impl Fn(&str) -> Option<u32>) -> Vec<S
 }
 
 /// The directed broadcast address of `ip`'s subnet.
-fn subnet_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
+pub fn subnet_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(ip) | !u32::from(netmask))
 }
 
 /// Turns v4-mapped IPv6 addresses (from dual-stack sockets) back into IPv4.
-fn canonical(addr: SocketAddr) -> SocketAddr {
+pub fn canonical(addr: SocketAddr) -> SocketAddr {
     match addr {
         SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
             Some(v4) => SocketAddr::from((v4, v6.port())),
             None => addr,
         },
         v4 @ SocketAddr::V4(_) => v4,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_neighbour_table() {
-        let json = br#"[
-            {"dst":"192.168.1.2","dev":"eth1","lladdr":"52:54:00:12:01:02","state":["REACHABLE"]},
-            {"dst":"192.168.1.9","dev":"eth1","state":["FAILED"]},
-            {"dst":"fe80::5054:ff:fe12:102","dev":"eth1","lladdr":"52:54:00:12:01:02","router":null,"state":["STALE"]},
-            {"dst":"fe80::1","dev":"gone0","state":["STALE"]},
-            {"dst":"2001:db8::7","dev":"eth1","state":["DELAY"]},
-            {"dst":"ff02::1","dev":"eth1","state":["NOARP"]}
-        ]"#;
-        let parsed = parse_neighbours(json, |dev| (dev == "eth1").then_some(3));
-        let expected: Vec<SocketAddr> = vec![
-            "192.168.1.2:0".parse().unwrap(),
-            SocketAddrV6::new("fe80::5054:ff:fe12:102".parse().unwrap(), 0, 0, 3).into(),
-            "[2001:db8::7]:0".parse().unwrap(),
-        ];
-        assert_eq!(parsed, expected);
-    }
-
-    #[test]
-    fn computes_subnet_broadcast() {
-        let b = |ip: &str, mask: &str| {
-            subnet_broadcast(ip.parse().unwrap(), mask.parse().unwrap()).to_string()
-        };
-        assert_eq!(b("192.168.1.1", "255.255.255.0"), "192.168.1.255");
-        assert_eq!(b("10.1.2.3", "255.255.0.0"), "10.1.255.255");
-        assert_eq!(b("169.254.7.7", "255.255.0.0"), "169.254.255.255");
-        assert_eq!(b("192.168.1.5", "255.255.255.252"), "192.168.1.7");
-    }
-
-    #[test]
-    fn garbage_neighbour_output_is_empty() {
-        assert_eq!(
-            parse_neighbours(b"not json", |_| None),
-            Vec::<SocketAddr>::new()
-        );
-    }
-
-    #[test]
-    fn canonicalises_mapped_addresses() {
-        let mapped: SocketAddr = "[::ffff:192.168.1.2]:5".parse().unwrap();
-        assert_eq!(canonical(mapped), "192.168.1.2:5".parse().unwrap());
-        let v6: SocketAddr = "[fe80::1]:5".parse().unwrap();
-        assert_eq!(canonical(v6), v6);
-    }
-
-    /// End to end on loopback: a responder answers a unicast probe.
-    #[tokio::test]
-    async fn responder_answers_probes_while_announcing() {
-        use nix_pixie_proto::announce::Pairing;
-        let announcement =
-            Announcement::new([7; 32], 4242, Pairing::ShowsCode { nameplate: 5 }, "t");
-        let (tx, rx) = watch::channel(Some(announcement.clone()));
-        let responder = tokio::spawn(Responder::bind().await.unwrap().run(rx));
-        let prober = Prober::new().await.unwrap();
-        let probe = encode_probe(&prober.nonce);
-
-        let to = SocketAddr::from((Ipv4Addr::LOCALHOST, PROBE_PORT));
-        let reply = async {
-            loop {
-                send(&prober.v4, to, &probe).await;
-                if let Ok(r) = tokio::time::timeout(Duration::from_millis(100), prober.recv()).await
-                {
-                    return r;
-                }
-            }
-        };
-        let (got, from) = tokio::time::timeout(Duration::from_secs(5), reply)
-            .await
-            .unwrap();
-        assert_eq!(got, announcement);
-        assert_eq!(from, SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)));
-
-        // Paired targets stop answering.
-        tx.send_replace(None);
-        send(&prober.v4, to, &probe).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), prober.recv())
-                .await
-                .is_err()
-        );
-        responder.abort();
     }
 }

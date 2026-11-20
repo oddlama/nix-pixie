@@ -29,18 +29,3 @@ pub const ALPN_CTRL: &[u8] = b"nix-pixie/ctrl/1";
 pub const ALPN_STORE: &[u8] = b"nix-pixie/store/1";
 /// iroh ALPN for log and progress streaming.
 pub const ALPN_LOG: &[u8] = b"nix-pixie/log/1";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn alpns_carry_the_protocol_version() {
-        let suffix = format!("/{PROTOCOL_VERSION}");
-        for alpn in [ALPN_CTRL, ALPN_STORE, ALPN_LOG] {
-            let alpn = std::str::from_utf8(alpn).unwrap();
-            assert!(alpn.starts_with("nix-pixie/"), "{alpn}");
-            assert!(alpn.ends_with(&suffix), "{alpn}");
-        }
-    }
-}

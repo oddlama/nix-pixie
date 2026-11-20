@@ -35,22 +35,3 @@ fn nibble(digit: u8) -> Option<u8> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn round_trip() {
-        let bytes = [0u8, 1, 0xab, 0xff];
-        assert_eq!(super::encode(&bytes), "0001abff");
-        assert_eq!(super::decode("0001abff").as_deref(), Some(&bytes[..]));
-        assert_eq!(super::decode("0001ABFF").as_deref(), Some(&bytes[..]));
-        assert_eq!(super::decode("").as_deref(), Some(&[][..]));
-    }
-
-    #[test]
-    fn rejects_anything_but_digit_pairs() {
-        for bad in ["abc", "zz", "é0", "+f", "-1", " f", "0x"] {
-            assert_eq!(super::decode(bad), None, "{bad:?}");
-        }
-    }
-}
