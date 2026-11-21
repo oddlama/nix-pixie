@@ -21,7 +21,9 @@ we build on them.
 | Store push into the target's disk (`--push`, stock Nix worker protocol, never into RAM) | done | `checks.vm-push` (512 MiB under a 192 MiB memory cap; a whole system) |
 | Disk selection (pinned, agnostic, fixed), disko, system pushed into the mounted root (`controller install`) | done | `checks.vm-disko`, `checks.eval-disks`, unit tests of the disk plan |
 | By-pixie links on the installed system (udev rule from the GPT labels) | done | `checks.vm-disko` (rule on the target), `checks.eval-disks` |
-| `nixos-install`, finalize (unmount, `zpool export`), reboot or power off, post-boot host key check | done | `checks.vm-install` (boots the installed disk in a second VM; a run where the key doesn't arrive fails with a mismatch) |
+| `nixos-install`, finalize (unmount, `zpool export`), reboot or power off, post-boot host key check | done | `checks.vm-install-*` (boots the installed disks in a second VM; a run where the key doesn't arrive fails with a mismatch) |
+| Disk layouts, installed and booted: ext4, ZFS (pool exported, no forced import), btrfs subvolumes, LVM, mdadm RAID 1 on two disks, tmpfs root | done | `checks.vm-install-{ext4,zfs,btrfs,lvm,mdadm,tmpfs-root}` |
+| Encrypted layouts (LUKS, ZFS native encryption) | not started: disko runs without a terminal, so its passphrase prompts fail; needs delivering keys to the target before disko, and a wait step for unlocking on the first boot | |
 | Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
 | Host keys: push mode | not started; the controller refuses it | |
 | Long sessions across link-local flaps | not verified | needs the store push |
@@ -703,10 +705,19 @@ NixOS VM tests are the backbone. They cover:
 - RAM-limited target with a closure bigger than its RAM
 - each pairing mode, including a MITM relay attempt that must fail
 - pinned and agnostic disks (done: `checks.vm-disko`)
-- BIOS boot of the installed system with the host key check (done:
-  `checks.vm-install`); UEFI and Secure Boot still to do
+- each disk layout installed and booted from its own disks, with the host
+  key check (done: `checks.vm-install-<layout>`, layouts in
+  `nix/tests/layouts.nix`); BIOS GRUB only, UEFI and Secure Boot still to do
 - pull-mode rekey (agenix-rekey fixture)
 - interrupted push + resume
+
+Running them: `checks [PATTERN]` in the devshell builds the matching checks
+`JOBS` at a time (default 2). Evaluating a VM test takes about 1.4 GiB, and
+`nix flake check` evaluates all of them in one process, which needs more
+memory than a busy machine has; `checks` evaluates each on its own first.
+A layout test takes about 3 minutes and about 3 GiB while it runs; all
+eighteen checks take about 20 minutes with `JOBS=2`. The install tests fail
+as soon as the install fails instead of waiting out their timeouts.
 
 ## Future ideas
 
