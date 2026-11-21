@@ -22,8 +22,9 @@ we build on them.
 | Disk selection (pinned, agnostic, fixed), disko, system pushed into the mounted root (`controller install`) | done | `checks.vm-disko`, `checks.eval-disks`, unit tests of the disk plan |
 | By-pixie links on the installed system (udev rule from the GPT labels) | done | `checks.vm-disko` (rule on the target), `checks.eval-disks` |
 | `nixos-install`, finalize (unmount, `zpool export`), reboot or power off, post-boot host key check | done | `checks.vm-install-*` (boots the installed disks in a second VM; a run where the key doesn't arrive fails with a mismatch) |
-| Disk layouts, installed and booted: ext4, ZFS (pool exported, no forced import), btrfs subvolumes, LVM, mdadm RAID 1 on two disks, tmpfs root | done | `checks.vm-install-{ext4,zfs,btrfs,lvm,mdadm,tmpfs-root}` |
-| Encrypted layouts (LUKS, ZFS native encryption) | not started: disko runs without a terminal, so its passphrase prompts fail; needs delivering keys to the target before disko, and a wait step for unlocking on the first boot | |
+| Disk layouts, installed and booted: ext4, ZFS (pool exported, no forced import), btrfs subvolumes, LVM, mdadm RAID 1 on two disks, tmpfs root, LUKS, encrypted ZFS | done | `checks.vm-install-<layout>` |
+| Encrypted layouts: LUKS (`passwordFile`, `settings.keyFile`), ZFS native encryption (created from `keylocation=file://`), passphrases typed in on the controller | done, interactive only | `checks.vm-install-{luks,zfs-encrypted}`, unit tests of what is needed and refused |
+| Secrets from scripts instead of a terminal | not started (Future ideas) | |
 | Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
 | Host keys: push mode | not started; the controller refuses it | |
 | Long sessions across link-local flaps | not verified | needs the store push |
@@ -541,6 +542,34 @@ streamed back (the tail is shown on failure), and the system is pushed into
 - **VERIFY** layouts beyond plain GPT + ext4: ZFS vdevs, mdadm, LUKS. disko
   mounts by partlabel, so they should work.
 
+### Encryption
+
+disko reads encryption keys from files on the target (LUKS `passwordFile`
+and `settings.keyFile`, ZFS `keylocation = "file://..."`) or asks on its own
+terminal (`askPassword`, `keylocation = "prompt"`). The agent runs disko
+without a terminal, so only files work:
+
+- The configuration's facts list its LUKS devices and ZFS key locations;
+  the controller works out which key files disko reads. Each must be under
+  `/tmp` or `/run`.
+- Refused, before pairing when `--machine` is given, each with what to
+  configure instead: `askPassword` (use `passwordFile`; when *creating* a
+  device disko always reads the passphrase from its stdin, so the agent
+  can't answer it, and feeding stdin would also feed other tools' questions,
+  e.g. mdadm's), `keylocation = "prompt"` (create from a file and switch
+  with `postCreateHook = "zfs set keylocation=prompt <dataset>"`, as in
+  disko's own example), `additionalKeyFiles` and raw or hex ZFS keys (not
+  typeable).
+- The controller asks for each passphrase on the terminal, twice and
+  without echo (ZFS: 8 to 512 characters), after the disk plan and before
+  the build, so the build runs unattended. Without a terminal it refuses.
+- `RunDisko` carries the key files. The agent writes them 0400 only to tmpfs
+  or ramfs (checked against mountinfo), so they never touch a disk, runs
+  disko, and removes them whatever the outcome. `KeyFile` zeroizes its
+  contents on drop and never shows them in `Debug` output.
+- The installed system asks for the passphrase on its console at boot; the
+  controller says so while it waits for the host key.
+
 ### Facter in fleet mode
 
 Facter reports are per machine, so they conflict with "one config for many
@@ -716,12 +745,19 @@ Running them: `checks [PATTERN]` in the devshell builds the matching checks
 `nix flake check` evaluates all of them in one process, which needs more
 memory than a busy machine has; `checks` evaluates each on its own first.
 A layout test takes about 3 minutes and about 3 GiB while it runs; all
-eighteen checks take about 20 minutes with `JOBS=2`. The install tests fail
+twenty checks take about 25 minutes with `JOBS=2`. The install tests fail
 as soon as the install fails instead of waiting out their timeouts.
 
 ## Future ideas
 
 Not in v1. Recorded so the v1 design doesn't block them.
+
+- **Secrets from scripts.** Encryption passphrases are typed in on the
+  controller's terminal for now. Scripted installs need them from somewhere
+  else: files, a command (`pass show ...`), or a hook; the same mechanism
+  would serve key files that can't be typed (`additionalKeyFiles`, raw ZFS
+  keys) and host-key push mode. Possibly also relaying disko's own terminal
+  to the operator, which would make `askPassword` work.
 
 - **WAN pairing.** The controller publishes its endpoint id via pkarr on the
   mainline DHT (`iroh-mainline-address-lookup`) under a key derived from the
