@@ -368,12 +368,13 @@ pub fn stable_id(disk: &Disk) -> Option<&str> {
 }
 
 /// Names disko creates and then finds its devices by: GPT partition labels
-/// (it mounts `/dev/disk/by-partlabel/<label>`).
+/// (it mounts `/dev/disk/by-partlabel/<label>`) and ZFS pool names.
 pub fn created_names(disko: &Disko) -> BTreeSet<String> {
     disko
         .disks
         .values()
         .flat_map(|d| d.part_labels.iter().cloned())
+        .chain(disko.zpools.iter().cloned())
         .collect()
 }
 

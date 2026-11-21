@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, VarInt};
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::ctrl::{
-    ControllerMsg, DiskAssignment, MAX_TARGET_FRAME, StreamRequest, TargetMsg,
+    ControllerMsg, DiskAssignment, MAX_TARGET_FRAME, Shutdown, StreamRequest, TargetMsg,
 };
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use nix_pixie_proto::inventory::Disk;
@@ -23,18 +23,22 @@ use tracing::{info, trace};
 
 use crate::controller::{self, Approved, confirm, describe_disk};
 use crate::discovery::{Discovery, Method, Peer};
+use crate::hostkey::{self, PublicKey};
 use crate::identity;
-use crate::metadata::{self, Machine, Metadata};
+use crate::metadata::{self, HostKeyMode, Machine, Metadata};
 use crate::net::{self, Stream, sanitise};
 use crate::plan::{self, Choice, Resolution};
 use crate::push;
-use crate::system::{Configuration, Disko};
+use crate::system::{Built, Configuration, Disko, Ssh};
 
 /// For the agent's checks before formatting (a fresh lsblk).
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
-/// How much of disko's output to keep for showing a failure.
-const DISKO_TAIL_BYTES: usize = 64 * 1024;
-const DISKO_TAIL_LINES: usize = 40;
+/// Unmounting and exporting pools.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(120);
+/// How much of disko's and nixos-install's output to keep for showing a
+/// failure.
+const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+const OUTPUT_TAIL_LINES: usize = 40;
 
 /// How `nix-pixie controller install` was invoked.
 pub struct InstallArgs {
@@ -52,6 +56,22 @@ pub struct InstallArgs {
     pub yes: bool,
     /// Erase disks that hold data without asking.
     pub wipe: bool,
+    /// What the target does once the system is installed.
+    pub then: Then,
+    /// How long to wait for the installed system's SSH server.
+    pub boot_timeout: Duration,
+}
+
+/// What the target does once the system is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Then {
+    /// Boot the installed system, then check its host key.
+    Reboot,
+    /// Power off (e.g. to remove the installer medium), then wait for the
+    /// operator to power it on and check its host key.
+    Poweroff,
+    /// Keep the installer running with everything mounted, for inspection.
+    Stay,
 }
 
 /// Pairs with the target showing the code, and installs the machine onto it.
@@ -65,6 +85,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     // Check what we can before pairing: a mistake shouldn't cost the code.
     if let Some(name) = &args.machine {
         let machine = machine(&metadata, &args.flake, name)?;
+        refuse_push(name, machine)?;
         let disko = disko_of(&Configuration::new(&args.flake, &machine.configuration)?).await?;
         plan::check_requested(&disko, machine.disks.file.is_some(), &requested)?;
         if machine.disks.file.is_some() {
@@ -81,6 +102,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
             )
             .await?;
             let result = session(&mut stream, &conn, &peer, &metadata, &args, requested).await;
+            // Closing is what lets the target shut down.
             net::finish(&mut stream).await;
             conn.close(VarInt::from_u32(0), b"done");
             result
@@ -89,18 +111,134 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     };
     discovery.shutdown();
     endpoint.close().await;
-    result
+    let Installed { mut report, check } = result?;
+    let verified = match check {
+        Some(check) => tokio::select! {
+            r = verify(check, &args, &mut report) => r,
+            () = crate::shutdown_signal() => Err(anyhow!("interrupted")),
+        },
+        None => Ok(()),
+    };
+    println!("{}", serde_json::Value::Object(report));
+    verified
 }
 
-/// Everything after pairing.
+/// What the session leaves for after the connection is closed.
+struct Installed {
+    report: serde_json::Map<String, serde_json::Value>,
+    /// How to check the installed system's host key, if it can be.
+    check: Option<Check>,
+}
+
+/// Where and what to ask the installed system's SSH server.
+struct Check {
+    addrs: Vec<std::net::SocketAddr>,
+    port: u16,
+    /// Pull mode: the key generated during the install.
+    expected: Option<PublicKey>,
+    /// The installer's own key, which may still answer for a moment.
+    live: Option<PublicKey>,
+    machine: String,
+}
+
+/// Waits for the installed system and compares its host key; records the
+/// result in `report`.
+async fn verify(
+    check: Check,
+    args: &InstallArgs,
+    report: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let wait = args.boot_timeout.as_secs();
+    if args.then == Then::Poweroff {
+        eprintln!(
+            "\n{} is powered off. Remove the installer medium if needed and power it on; \
+             waiting up to {wait} s for it.",
+            check.machine
+        );
+    } else {
+        eprintln!("\nWaiting up to {wait} s for {} to boot.", check.machine);
+    }
+    let result = hostkey::wait_for(
+        &check.addrs,
+        check.port,
+        check.expected.as_ref(),
+        check.live.as_ref(),
+        args.boot_timeout,
+    )
+    .await;
+    let entry = match &result {
+        Ok(seen) => {
+            let verified = check.expected.is_some();
+            if verified {
+                eprintln!(
+                    "{} is up, with the host key generated during the install.",
+                    check.machine
+                );
+            } else {
+                eprintln!(
+                    "{} is up. Its host key is new, so it can't be checked: {}",
+                    check.machine, seen.key
+                );
+            }
+            serde_json::json!({
+                "verified": verified,
+                "seen": seen.key.to_string(),
+                "address": seen.addr.to_string(),
+            })
+        }
+        Err(e) => serde_json::json!({ "verified": false, "error": format!("{e:#}") }),
+    };
+    report.insert("hostKey".into(), entry);
+    result.map(|_| ())
+}
+
+fn refuse_push(name: &str, machine: &Machine) -> Result<()> {
+    if machine.host_key.mode == HostKeyMode::Push {
+        bail!(
+            "{name} has hostKey.mode = \"push\", which nix-pixie doesn't implement yet; \
+             use \"pull\" or \"none\""
+        );
+    }
+    Ok(())
+}
+
+/// Everything after pairing: first deciding and building, which touches
+/// nothing on the target's disks, then applying.
 async fn session(
     stream: &mut Stream,
     conn: &Connection,
     peer: &Peer,
     metadata: &Metadata,
     args: &InstallArgs,
+    requested: BTreeMap<String, String>,
+) -> Result<Installed> {
+    let plan = prepare(stream, conn, peer, metadata, args, requested).await?;
+    apply(stream, conn, peer, args, plan).await
+}
+
+/// Everything decided and built before anything is erased.
+struct Plan {
+    label: String,
+    name: String,
+    configuration: String,
+    disks: Vec<Disk>,
+    choices: Vec<Choice>,
+    built: Built,
+    disko: Disko,
+    ssh: Ssh,
+    /// Pull mode: the generated key, and where the installed system wants it.
+    host_key: Option<(PublicKey, String)>,
+}
+
+/// Approval, the facter report and host key, the disk plan, the build.
+async fn prepare(
+    stream: &mut Stream,
+    conn: &Connection,
+    peer: &Peer,
+    metadata: &Metadata,
+    args: &InstallArgs,
     mut requested: BTreeMap<String, String>,
-) -> Result<()> {
+) -> Result<Plan> {
     let Approved {
         label,
         inventory,
@@ -118,11 +256,17 @@ async fn session(
     .await?;
     let name = name.context("approved without a machine")?;
     let machine = machine(metadata, &args.flake, &name)?;
+    refuse_push(&name, machine)?;
     if let Some(path) = &machine.facter.report_path {
         controller::fetch_facter_report(stream, &args.flake, path)
             .await
             .context("getting the facter report")?;
     }
+    // Before building: the configuration (or a rekeying hook) may use it.
+    let pulled = match machine.host_key.mode {
+        HostKeyMode::Pull => Some(pull_host_key(stream, &args.flake, &name, machine).await?),
+        HostKeyMode::None | HostKeyMode::Push => None,
+    };
 
     let configuration = Configuration::new(&args.flake, &machine.configuration)?;
     let facts = configuration.facts().await?;
@@ -134,6 +278,15 @@ async fn session(
             sanitise(&inventory.system, 32)
         );
     }
+    let host_key = match (pulled, &facts.ssh.host_key_path) {
+        (None, _) => None,
+        (Some(key), Some(path)) => Some((key, path.clone())),
+        (Some(_), None) => bail!(
+            "hostKey.mode = \"pull\" needs an ed25519 key in nixosConfigurations.{}'s \
+             services.openssh.hostKeys",
+            machine.configuration
+        ),
+    };
     let disko = facts
         .disko
         .with_context(|| no_disko(&machine.configuration))?;
@@ -154,7 +307,40 @@ async fn session(
 
     eprintln!("\nBuilding nixosConfigurations.{}", machine.configuration);
     let built = configuration.build().await?;
-    confirm_erase(&inventory.disks, &choices, &name, args.yes, args.wipe).await?;
+    Ok(Plan {
+        label,
+        name,
+        configuration: machine.configuration.clone(),
+        disks: inventory.disks,
+        choices,
+        built,
+        disko,
+        ssh: facts.ssh,
+        host_key,
+    })
+}
+
+/// From the confirmation to erase on: format, send the system, install,
+/// and leave the target ready to boot.
+async fn apply(
+    stream: &mut Stream,
+    conn: &Connection,
+    peer: &Peer,
+    args: &InstallArgs,
+    plan: Plan,
+) -> Result<Installed> {
+    let Plan {
+        label,
+        name,
+        configuration,
+        disks,
+        choices,
+        built,
+        disko,
+        ssh,
+        host_key,
+    } = plan;
+    confirm_erase(&disks, &choices, &name, args.yes, args.wipe).await?;
 
     eprintln!("Sending the disko script");
     push::copy(
@@ -178,20 +364,157 @@ async fn session(
         std::slice::from_ref(&built.toplevel),
     )
     .await?;
+    eprintln!("Installing the boot loader");
+    let (expected, key_path) = host_key.unzip();
+    install_system(stream, &root, &built.toplevel, key_path).await?;
 
-    let report = serde_json::json!({
-        "target": conn.remote_id().to_string(),
-        "label": label,
-        "machine": name,
-        "configuration": machine.configuration,
-        "disks": choices,
-        "system": built.toplevel,
-        "root": root,
-        "fstype": fstype,
-        "pushSeconds": seconds,
-    });
-    println!("{report}");
-    Ok(())
+    let mut report = serde_json::Map::new();
+    for (key, value) in [
+        ("target", conn.remote_id().to_string().into()),
+        ("label", label.into()),
+        ("machine", name.clone().into()),
+        ("configuration", configuration.into()),
+        ("disks", serde_json::to_value(&choices)?),
+        ("system", built.toplevel.clone().into()),
+        ("root", root.clone().into()),
+        ("fstype", fstype.into()),
+        ("pushSeconds", seconds.into()),
+        (
+            "then",
+            format!("{:?}", args.then).to_ascii_lowercase().into(),
+        ),
+    ] {
+        report.insert(key.into(), value);
+    }
+    let shutdown = match args.then {
+        Then::Stay => {
+            eprintln!("Installed; {root} stays mounted on the target.");
+            return Ok(Installed {
+                report,
+                check: None,
+            });
+        }
+        Then::Reboot => Shutdown::Reboot,
+        Then::Poweroff => Shutdown::PowerOff,
+    };
+    let live = finish(stream, &root, &disko.zpools, shutdown).await?;
+    let check = if ssh.enable {
+        Some(Check {
+            addrs: peer.addrs.iter().copied().collect(),
+            port: ssh.ports.first().copied().unwrap_or(22),
+            expected,
+            live,
+            machine: name,
+        })
+    } else {
+        report.insert(
+            "hostKey".into(),
+            serde_json::json!({ "skipped": "services.openssh is not enabled" }),
+        );
+        None
+    };
+    Ok(Installed { report, check })
+}
+
+/// Has the target generate the host key and records its public half.
+async fn pull_host_key(
+    stream: &mut Stream,
+    flake: &str,
+    name: &str,
+    machine: &Machine,
+) -> Result<PublicKey> {
+    write_frame(stream, &ControllerMsg::GenerateHostKey).await?;
+    let reply = tokio::time::timeout(PREPARE_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
+        .await
+        .context("timed out waiting for the target's host key")??;
+    let key = match reply {
+        TargetMsg::HostKey { public } => {
+            PublicKey::parse(&public).context("the target's host key")?
+        }
+        TargetMsg::HostKeyFailed { error } => bail!(
+            "the target could not generate a host key: {}",
+            sanitise(&error, 300)
+        ),
+        _ => bail!("unexpected reply to the host key request"),
+    };
+    info!(%key, "pulled the host key");
+    if let Some(path) = &machine.host_key.public_key_path {
+        let root = repo_root(flake)?;
+        let file = metadata::repo_path(&root, path)?;
+        let line = key.to_line(Some(&format!("root@{name}")));
+        metadata::write_into_repo(&root, &file, line.as_bytes()).await?;
+        info!(%path, "recorded the host key");
+    }
+    Ok(key)
+}
+
+/// Reads `Output` frames until the reply that ends them.
+async fn follow(stream: &mut Stream) -> Result<(TargetMsg, Tail)> {
+    let mut tail = Tail::default();
+    loop {
+        match read_frame(stream, MAX_TARGET_FRAME).await? {
+            TargetMsg::Output { chunk } => {
+                trace!(bytes = chunk.len(), "output");
+                tail.push(&chunk);
+            }
+            reply => return Ok((reply, tail)),
+        }
+    }
+}
+
+async fn install_system(
+    stream: &mut Stream,
+    root: &str,
+    system: &str,
+    host_key_path: Option<String>,
+) -> Result<()> {
+    write_frame(
+        stream,
+        &ControllerMsg::Install {
+            root: root.into(),
+            system: system.into(),
+            host_key_path,
+        },
+    )
+    .await?;
+    match follow(stream).await? {
+        (TargetMsg::InstallDone, _) => Ok(()),
+        (TargetMsg::InstallFailed { error }, tail) => {
+            eprintln!("{}", tail.lines(OUTPUT_TAIL_LINES));
+            bail!("installing failed: {}", sanitise(&error, 300))
+        }
+        _ => bail!("unexpected message while installing"),
+    }
+}
+
+/// Unmounts and exports on the target. Returns the installer's own host key.
+async fn finish(
+    stream: &mut Stream,
+    root: &str,
+    zpools: &[String],
+    then: Shutdown,
+) -> Result<Option<PublicKey>> {
+    write_frame(
+        stream,
+        &ControllerMsg::Finish {
+            root: root.into(),
+            zpools: zpools.to_vec(),
+            then,
+        },
+    )
+    .await?;
+    let reply = tokio::time::timeout(FINISH_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
+        .await
+        .context("timed out waiting for the target to unmount")??;
+    match reply {
+        TargetMsg::Finished { live_host_key } => {
+            Ok(live_host_key.and_then(|key| PublicKey::parse(&key).ok()))
+        }
+        TargetMsg::FinishFailed { error } => {
+            bail!("the target could not unmount: {}", sanitise(&error, 300))
+        }
+        _ => bail!("unexpected reply to finishing"),
+    }
 }
 
 /// `ROLE=DISK` arguments, each role at most once.
@@ -376,20 +699,13 @@ async fn run_disko(stream: &mut Stream, script: &str) -> Result<()> {
         },
     )
     .await?;
-    let mut tail = Tail::default();
-    loop {
-        match read_frame(stream, MAX_TARGET_FRAME).await? {
-            TargetMsg::Output { chunk } => {
-                trace!(bytes = chunk.len(), "disko output");
-                tail.push(&chunk);
-            }
-            TargetMsg::DiskoDone => return Ok(()),
-            TargetMsg::DiskoFailed { error } => {
-                eprintln!("{}", tail.lines(DISKO_TAIL_LINES));
-                bail!("formatting failed: {}", sanitise(&error, 300));
-            }
-            _ => bail!("unexpected message while formatting"),
+    match follow(stream).await? {
+        (TargetMsg::DiskoDone, _) => Ok(()),
+        (TargetMsg::DiskoFailed { error }, tail) => {
+            eprintln!("{}", tail.lines(OUTPUT_TAIL_LINES));
+            bail!("formatting failed: {}", sanitise(&error, 300))
         }
+        _ => bail!("unexpected message while formatting"),
     }
 }
 
@@ -402,7 +718,7 @@ pub struct Tail {
 impl Tail {
     pub fn push(&mut self, chunk: &[u8]) {
         self.bytes.extend_from_slice(chunk);
-        if let Some(excess) = self.bytes.len().checked_sub(DISKO_TAIL_BYTES) {
+        if let Some(excess) = self.bytes.len().checked_sub(OUTPUT_TAIL_BYTES) {
             self.bytes.drain(..excess);
         }
     }

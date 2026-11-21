@@ -107,8 +107,10 @@
                 # get the same flags so cargo can reuse the prebuilt dependencies.
                 drvConfig.env = {
                   RUSTFLAGS = "-D warnings";
-                  # Discovery reads the neighbour table with `ip`; pin it.
+                  # Discovery reads the neighbour table with `ip`, and the
+                  # host key check after an install uses ssh-keyscan; pin them.
                   NIX_PIXIE_IP = lib.getExe' pkgs.iproute2 "ip";
+                  NIX_PIXIE_SSH_KEYSCAN = lib.getExe' pkgs.openssh "ssh-keyscan";
                 };
                 depsDrvConfig.env.RUSTFLAGS = "-D warnings";
               };

@@ -381,49 +381,18 @@ async fn serve_controller(
             ControllerMsg::RunDisko { script } => {
                 run_disko(state, stream, &script, prepared.take()).await?
             }
-            ControllerMsg::GenerateHostKey => {
-                let comment = state
-                    .read("approved")
-                    .filter(|m| !m.is_empty())
-                    .map_or_else(String::new, |machine| format!("root@{machine}"));
-                match nixos::generate_host_key(state, &comment).await {
-                    Ok(public) => TargetMsg::HostKey { public },
-                    Err(e) => {
-                        warn!("host key: {e:#}");
-                        TargetMsg::HostKeyFailed {
-                            error: format!("{e:#}"),
-                        }
-                    }
-                }
-            }
+            ControllerMsg::GenerateHostKey => generate_host_key(state).await,
             ControllerMsg::Install {
                 root,
                 system,
                 host_key_path,
-            } => {
-                println!("\n    Installing the boot loader...\n");
-                match nixos::install(state, stream, &root, &system, host_key_path.as_deref())
-                    .await?
-                {
-                    Ok(()) => TargetMsg::InstallDone,
-                    Err(error) => {
-                        warn!(%error, "nixos-install");
-                        println!("\n    Installing failed: {error}\n");
-                        TargetMsg::InstallFailed { error }
-                    }
-                }
-            }
+            } => install(state, stream, &root, &system, host_key_path.as_deref()).await?,
             ControllerMsg::Finish { root, zpools, then } => {
-                match nixos::finish(&root, &zpools).await {
-                    Ok(()) => {
-                        shutdown = Some(then);
-                        TargetMsg::Finished
-                    }
-                    Err(error) => {
-                        warn!(%error, "finishing");
-                        TargetMsg::FinishFailed { error }
-                    }
+                let reply = finish(&root, &zpools).await;
+                if matches!(reply, TargetMsg::Finished { .. }) {
+                    shutdown = Some(then);
                 }
+                reply
             }
         };
         write_frame(stream, &reply).await?;
@@ -480,6 +449,59 @@ fn prepare_store(root: &str) -> TargetMsg {
         Err(reason) => {
             warn!(%root, %reason, "refusing to receive store paths");
             TargetMsg::StoreRefused { reason }
+        }
+    }
+}
+
+async fn generate_host_key(state: &StateDir) -> TargetMsg {
+    let comment = state
+        .read("approved")
+        .filter(|m| !m.is_empty())
+        .map_or_else(String::new, |machine| format!("root@{machine}"));
+    match nixos::generate_host_key(state, &comment).await {
+        Ok(public) => TargetMsg::HostKey { public },
+        Err(e) => {
+            warn!("host key: {e:#}");
+            TargetMsg::HostKeyFailed {
+                error: format!("{e:#}"),
+            }
+        }
+    }
+}
+
+async fn install(
+    state: &StateDir,
+    stream: &mut Stream,
+    root: &str,
+    system: &str,
+    host_key_path: Option<&str>,
+) -> Result<TargetMsg> {
+    println!("\n    Installing the boot loader...\n");
+    Ok(
+        match nixos::install(state, stream, root, system, host_key_path).await? {
+            Ok(()) => TargetMsg::InstallDone,
+            Err(error) => {
+                warn!(%error, "nixos-install");
+                println!("\n    Installing failed: {error}\n");
+                TargetMsg::InstallFailed { error }
+            }
+        },
+    )
+}
+
+async fn finish(root: &str, zpools: &[String]) -> TargetMsg {
+    match nixos::finish(root, zpools).await {
+        Ok(()) => {
+            // So the controller can tell the installer from the installed
+            // system while the target reboots.
+            let live_host_key = std::fs::read_to_string("/etc/ssh/ssh_host_ed25519_key.pub")
+                .ok()
+                .map(|key| key.trim().to_string());
+            TargetMsg::Finished { live_host_key }
+        }
+        Err(error) => {
+            warn!(%error, "finishing");
+            TargetMsg::FinishFailed { error }
         }
     }
 }

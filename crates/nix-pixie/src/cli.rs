@@ -103,6 +103,14 @@ pub enum ControllerCommand {
         /// Erase disks that hold data without asking.
         #[arg(long)]
         wipe: bool,
+        /// What the target does once the system is installed. After a
+        /// reboot or power-off, the controller waits for the installed
+        /// system's SSH server and checks its host key.
+        #[arg(long, value_enum, default_value_t = install::Then::Reboot)]
+        then: install::Then,
+        /// How long to wait for the installed system, in seconds.
+        #[arg(long, default_value_t = 600)]
+        boot_timeout: u64,
         /// Give up pairing after this many seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -169,6 +177,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     disks,
                     yes,
                     wipe,
+                    then,
+                    boot_timeout,
                     timeout,
                     discovery,
                 } => {
@@ -182,6 +192,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                         disks,
                         yes,
                         wipe,
+                        then,
+                        boot_timeout: Duration::from_secs(boot_timeout),
                     })
                     .await
                 }

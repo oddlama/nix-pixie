@@ -24,7 +24,14 @@ const FACTS: &str = r#"config: {
           then map (p: p.label) (builtins.attrValues disk.content.partitions)
           else [ ];
       }) config.disko.devices.disk;
+      zpools = builtins.attrNames (config.disko.devices.zpool or { });
     } else null;
+  ssh = {
+    inherit (config.services.openssh) enable ports;
+    hostKeyPath =
+      let keys = builtins.filter (k: (k.type or null) == "ed25519") config.services.openssh.hostKeys;
+      in if keys == [ ] then null else (builtins.head keys).path;
+  };
 }"#;
 
 /// `nixosConfigurations.<name>` of a flake.
@@ -41,6 +48,20 @@ pub struct Facts {
     pub system: String,
     /// `None` when the configuration doesn't import disko.
     pub disko: Option<Disko>,
+    pub ssh: Ssh,
+}
+
+/// The configuration's SSH server.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ssh {
+    /// `services.openssh.enable`: whether the host key can be checked after
+    /// the first boot.
+    pub enable: bool,
+    pub ports: Vec<u16>,
+    /// The first ed25519 entry of `services.openssh.hostKeys`: where a
+    /// pulled host key goes.
+    pub host_key_path: Option<String>,
 }
 
 /// The configuration's disko setup.
@@ -51,6 +72,8 @@ pub struct Disko {
     pub root_mount_point: String,
     /// `disko.devices.disk`, by name.
     pub disks: BTreeMap<String, DiskoDisk>,
+    /// `disko.devices.zpool` names, exported before the first boot.
+    pub zpools: Vec<String>,
 }
 
 /// One of disko's disks.

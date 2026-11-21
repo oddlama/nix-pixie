@@ -49,6 +49,7 @@ fn target() -> Vec<Disk> {
 fn disko(disks: &[(&str, Option<&str>)]) -> Disko {
     Disko {
         root_mount_point: "/mnt".into(),
+        zpools: Vec::new(),
         disks: disks
             .iter()
             .map(|(name, device)| {
@@ -316,10 +317,12 @@ fn build_results_come_in_installable_order() {
 
 #[test]
 fn refuses_other_disks_carrying_names_disko_creates() {
-    let names = created_names(&agnostic());
+    let mut config = agnostic();
+    config.zpools = vec!["zroot".into()];
+    let names = created_names(&config);
     assert_eq!(
         names.iter().map(String::as_str).collect::<Vec<_>>(),
-        ["disk-main-root"]
+        ["disk-main-root", "zroot"]
     );
 
     let old_install = Disk {
@@ -331,25 +334,34 @@ fn refuses_other_disks_carrying_names_disko_creates() {
         }],
         ..disk("vdc", &["virtio-pixie-b"])
     };
+    let old_pool = Disk {
+        contents: vec![Content {
+            device: "sda1".into(),
+            fstype: Some("zfs_member".into()),
+            label: Some("zroot".into()),
+            ..Content::default()
+        }],
+        ..disk("sda", &[])
+    };
     // An unrelated label, and a filesystem label that merely equals a name.
     let unrelated = Disk {
         contents: vec![Content {
             device: "sdb1".into(),
             partlabel: Some("data".into()),
             fstype: Some("ext4".into()),
-            label: Some("disk-main-root".into()),
+            label: Some("zroot".into()),
             ..Content::default()
         }],
         ..disk("sdb", &[])
     };
-    let disks = vec![disk("vdb", &[]), old_install, unrelated];
+    let disks = vec![disk("vdb", &[]), old_install, old_pool, unrelated];
 
     let formatting = ["vdb"].into_iter().collect();
     let err = check_name_clashes(&names, &formatting, &disks).unwrap_err();
-    assert!(err.contains("vdc (disk-main-root) already"), "{err}");
+    assert!(err.contains("vdc (disk-main-root), sda (zroot)"), "{err}");
     assert!(!err.contains("sdb"), "{err}");
 
     // Formatting the old disk too erases its names.
-    let formatting = ["vdb", "vdc"].into_iter().collect();
+    let formatting = ["vdb", "vdc", "sda"].into_iter().collect();
     assert_eq!(check_name_clashes(&names, &formatting, &disks), Ok(()));
 }

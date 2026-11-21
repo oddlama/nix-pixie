@@ -15,6 +15,7 @@ pub mod cli;
 pub mod controller;
 pub mod discovery;
 pub mod disko;
+pub mod hostkey;
 pub mod identity;
 pub mod install;
 pub mod inventory;

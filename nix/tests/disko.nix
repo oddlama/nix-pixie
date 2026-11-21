@@ -163,7 +163,8 @@ pkgs.testers.runNixOSTest {
 
     def install(args, expect_success=True):
         current = code()
-        cmd = f"su - alice -c 'cd repo && nix-pixie controller install --code {current} {args}'"
+        # Stay in the installer: the test inspects what is mounted.
+        cmd = f"su - alice -c 'cd repo && nix-pixie controller install --code {current} --then stay {args}'"
         if expect_success:
             report = json.loads(controller.succeed(cmd))
             next_code(current)

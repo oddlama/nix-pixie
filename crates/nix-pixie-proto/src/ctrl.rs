@@ -87,8 +87,10 @@ pub enum TargetMsg {
     /// `nixos-install` could not run or failed.
     InstallFailed { error: String },
     /// Unmounted and exported; the target shuts down once the controller is
-    /// gone.
-    Finished,
+    /// gone. `live_host_key`: the installer's own SSH host key, if it has
+    /// one, so the controller doesn't mistake it for the installed system's
+    /// while the target reboots.
+    Finished { live_host_key: Option<String> },
     /// Why the disks could not be left ready to boot.
     FinishFailed { error: String },
 }
@@ -107,10 +109,10 @@ pub enum ControllerMsg {
     /// filesystems) can receive paths. Only after `Approve`.
     PrepareStore { root: String },
     /// Check that these disks may be formatted and that no other disk
-    /// carries any of `labels` (names disko will create and then find its
-    /// devices by), and link the disks disko addresses by role. Only after
-    /// `Approve`, once the operator confirmed that their contents will be
-    /// destroyed.
+    /// carries any of `labels` (GPT partition labels and ZFS pool names
+    /// disko will create, and then find by name), and link the disks disko
+    /// addresses by role. Only after `Approve`, once the operator confirmed
+    /// that their contents will be destroyed.
     PrepareDisks {
         disks: Vec<DiskAssignment>,
         labels: Vec<String>,
