@@ -21,7 +21,9 @@ we build on them.
 | Store push into the target's disk (`--push`, stock Nix worker protocol, never into RAM) | done | `checks.vm-push` (512 MiB under a 192 MiB memory cap; a whole system) |
 | Disk selection (pinned, agnostic, fixed), disko, system pushed into the mounted root (`controller install`) | done | `checks.vm-disko`, `checks.eval-disks`, unit tests of the disk plan |
 | By-pixie links on the installed system (udev rule from the GPT labels) | done | `checks.vm-disko` (rule on the target), `checks.eval-disks` |
-| `nixos-install`, finalize, reboot, post-boot verification | not started | |
+| `nixos-install`, finalize (unmount, `zpool export`), reboot or power off, post-boot host key check | done | `checks.vm-install` (boots the installed disk in a second VM; a run where the key doesn't arrive fails with a mismatch) |
+| Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
+| Host keys: push mode | not started; the controller refuses it | |
 | Long sessions across link-local flaps | not verified | needs the store push |
 
 ## Goal
@@ -331,8 +333,16 @@ target boots ─► network (DHCP | IPv4LL | IPv6LL) ─► DNS-SD ─► pair �
   controller then rekeys and builds **once**. The disk is wiped only after
   everything is built, and there's no second build/push round. The agent
   copies the key into `/mnt` after disko.
+  - Implemented (`hostKey.mode = "pull"`): `ssh-keygen -t ed25519` on the
+    target, the public key checked strictly on the controller and written
+    to `hostKey.publicKeyPath` (`git add`) before the configuration is
+    evaluated. The key goes to the first ed25519 path in the configuration's
+    `services.openssh.hostKeys` (so impermanence setups work), 0600, right
+    before `nixos-install`. Rekeying hooks come with the hooks interface.
 - **Preflight (fail before wiping):**
-  - `hostPlatform.system` of the config == target arch
+  - `hostPlatform.system` of the config == target arch (implemented)
+  - no other disk carries partition labels or pool names the layout creates
+    (implemented, see Disks)
   - bootloader vs firmware (systemd-boot/lanzaboote config on a BIOS machine
     can't boot)
   - lanzaboote with Secure Boot not in setup mode → plan a wait step
@@ -350,9 +360,23 @@ target boots ─► network (DHCP | IPv4LL | IPv6LL) ─► DNS-SD ─► pair �
   uses raw public keys, so it isn't affected.
 - **Finalize:** run `zpool export` for every pool disko created (otherwise the
   first boot needs a force import), unmount, then reboot, power off or kexec.
+  - Implemented: `--then reboot` (default), `poweroff` (e.g. to remove the
+    installer medium) or `stay` (everything stays mounted for inspection).
+    The agent syncs, unmounts the root recursively, exports the
+    configuration's `disko.devices.zpool`s, and shuts down once the
+    controller has disconnected (at most 30 s later). kexec isn't done.
 - **Post-boot verification:** wait for the host and compare `ssh-keyscan`
   against the expected host key (known in both push and pull mode). Optional
   `post-reboot` hooks.
+  - Implemented: after closing the session, the controller asks every
+    address the target had for its ed25519 key (`--boot-timeout`, default
+    600 s), on the configuration's first `services.openssh.ports` entry.
+    `Finished` carries the installer's own host key, which is ignored, since
+    it may still answer while the target goes down. Any other key than the
+    expected one fails at once with HOST KEY MISMATCH. In mode `none` the
+    new key is reported, unverified. Skipped if the configuration doesn't
+    enable sshd. The result is `hostKey` in the JSON; exit status 1 if the
+    check fails.
 - **Persistence:** a session journal (no secrets) in
   `$XDG_STATE_HOME/nix-pixie/sessions/`. A controller restart resumes. The
   agent reconnects using the pinned keys, and store pushes are idempotent per
@@ -433,8 +457,10 @@ the controller pushes the full closure; paths already valid are skipped.
 
 `nixos-install --system <toplevel> --no-root-passwd --no-channel-copy`. The
 path is already valid in `/mnt`, so it only sets the profile and runs
-`switch-to-configuration boot` in the chroot. **VERIFY** that it doesn't
-re-copy.
+`switch-to-configuration boot` in the chroot. Verified in `checks.vm-install`:
+the installed system's store holds exactly the system's closure, so nothing
+was copied again or added. The chroot bind-mounts `/dev`, so the by-pixie link
+resolves for `grub-install`.
 
 ## 5. Disks
 
@@ -466,6 +492,14 @@ evaluates each disk's `device` (unset ones as `null`) and classifies it:
   mounted from them is that attempt's, and disko's destroy step unmounts it,
   so reinstalling in the same session works. The agent records them in its
   tmpfs state directory.
+- Refused before building: a disk that is not being formatted but already
+  carries a GPT partition label or ZFS pool name the layout creates (e.g. a
+  disk from an earlier install with the same layout). disko finds its
+  partitions and pools by name, so it could mount the old partition: the
+  system would land on the wrong disk and the boot loader on the new one.
+  `checks.vm-disko` hit exactly that before the check existed. The agent
+  repeats the check right before disko, in case a disk was attached since
+  the inventory.
 - Pinned mode records the most descriptive by-id name (model and serial)
   over opaque ones (`wwn-`, `nvme-eui.`). A disk without any by-id name
   can't be pinned; use agnostic mode.
@@ -668,7 +702,9 @@ NixOS VM tests are the backbone. They cover:
 - controller + target over a private VLAN without internet (airgapped)
 - RAM-limited target with a closure bigger than its RAM
 - each pairing mode, including a MITM relay attempt that must fail
-- pinned and agnostic disks (done: `checks.vm-disko`), BIOS and UEFI boot
+- pinned and agnostic disks (done: `checks.vm-disko`)
+- BIOS boot of the installed system with the host key check (done:
+  `checks.vm-install`); UEFI and Secure Boot still to do
 - pull-mode rekey (agenix-rekey fixture)
 - interrupted push + resume
 
