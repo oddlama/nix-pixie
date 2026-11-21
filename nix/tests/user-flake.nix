@@ -8,7 +8,12 @@
 # evaluations must yield the same derivations, which is why the target module
 # may not depend on where it lives. If they diverge, `nix build` in the VM
 # fails at once and lists what it would have to build.
-{ pkgs, disko }:
+{
+  pkgs,
+  # Flake inputs, for their original store paths and NAR hashes.
+  nixpkgs,
+  disko,
+}:
 {
   # A file in `targets/`, imported by every configuration. It sets everything
   # but the disks' devices.
@@ -24,7 +29,40 @@
 let
   inherit (pkgs) lib;
   system = pkgs.stdenv.hostPlatform.system;
-  nixpkgsSource = "${pkgs.path}";
+  # The original store path, not `pkgs.path` coerced to a string: that is a
+  # copy under another name, which `nix flake lock` in the VM copies yet
+  # again (47 s and 340 MB of the VM's RAM). The original is just looked up.
+  nixpkgsSource = nixpkgs.outPath;
+
+  # What `nix flake lock` writes for the inputs below, so the VM needn't.
+  pathInput = input: {
+    locked = {
+      lastModified = 0;
+      inherit (input) narHash;
+      path = input.outPath;
+      type = "path";
+    };
+    original = {
+      path = input.outPath;
+      type = "path";
+    };
+  };
+  flakeLock = pkgs.writeText "flake.lock" (
+    builtins.toJSON {
+      nodes = {
+        nixpkgs = pathInput nixpkgs;
+        disko = pathInput disko // {
+          flake = false;
+        };
+        root.inputs = {
+          nixpkgs = "nixpkgs";
+          disko = "disko";
+        };
+      };
+      root = "root";
+      version = 7;
+    }
+  );
 
   evalTarget =
     devices:
@@ -93,6 +131,7 @@ let
   flakeDir = pkgs.runCommand "nix-pixie-test-flake" { } ''
     mkdir -p $out/nix-pixie/nixos
     cp ${flakeNix} $out/flake.nix
+    cp ${flakeLock} $out/flake.lock
     # Readable, and a syntax error fails here rather than inside the VM.
     ${lib.getExe pkgs.nixfmt} $out/flake.nix
     cp -r ${./targets} $out/targets
@@ -107,7 +146,8 @@ in
 
   # For the controller node.
   controllerModule = {
-    virtualisation.memorySize = 3072;
+    # Evaluating a NixOS configuration takes about 1 GiB.
+    virtualisation.memorySize = 2048;
     environment.systemPackages = [ pkgs.git ];
     users.users.alice.isNormalUser = true;
     nix.settings = {
@@ -130,11 +170,11 @@ in
     ]) (lib.attrValues prebuilt);
   };
 
-  # Python: puts the flake into ~alice/repo as a git checkout, locked.
+  # Python: puts the flake into ~alice/repo as a git checkout.
   setupScript = ''
     controller.succeed(
         "su - alice -c 'cp -r --no-preserve=mode ${flakeDir} repo && cd repo"
-        + " && git init -q && git add -A && nix flake lock && git add flake.lock'"
+        + " && git init -q && git add -A'"
     )
   '';
 }

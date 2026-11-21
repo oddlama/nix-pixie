@@ -9,10 +9,11 @@
   pkgs,
   package,
   agentModule,
+  nixpkgs,
   disko,
 }:
 let
-  flake = import ./user-flake.nix { inherit pkgs disko; } {
+  flake = import ./user-flake.nix { inherit pkgs nixpkgs disko; } {
     target = "minimal.nix";
     configurations = {
       # Pinned: the controller records the disk in the repository. QEMU

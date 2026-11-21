@@ -165,7 +165,7 @@
                 };
                 vm-disko = import ./nix/tests/disko.nix {
                   inherit pkgs;
-                  inherit (inputs) disko;
+                  inherit (inputs) nixpkgs disko;
                   package = config.packages.default;
                   agentModule = ./nix/nixos/agent.nix;
                 };

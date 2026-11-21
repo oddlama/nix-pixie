@@ -10,6 +10,7 @@
   pkgs,
   package,
   agentModule,
+  nixpkgs,
   disko,
   layout,
 }:
@@ -22,7 +23,7 @@ let
   // (import ./layouts.nix).${layout};
   byPixie = disk: "/dev/disk/by-pixie/${disk}";
 
-  flake = import ./user-flake.nix { inherit pkgs disko; } {
+  flake = import ./user-flake.nix { inherit pkgs nixpkgs disko; } {
     target = "${layout}.nix";
     configurations.web1.disks = lib.genAttrs spec.disks (disk: {
       device = ''"${byPixie disk}"'';
@@ -62,7 +63,6 @@ pkgs.testers.runNixOSTest {
         agentModule
         ../nixos/storage.nix
       ];
-      virtualisation.memorySize = 1536;
       services.nix-pixie-agent = {
         enable = true;
         inherit package;
@@ -86,7 +86,6 @@ pkgs.testers.runNixOSTest {
     # Boots the target's disks with their own boot loader. Its own
     # configuration only matters for QEMU's command line.
     installed = {
-      virtualisation.memorySize = 1536;
       virtualisation.useBootLoader = true;
       virtualisation.useDefaultFilesystems = false;
       virtualisation.diskImage = "./empty0.qcow2";
