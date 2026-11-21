@@ -169,18 +169,24 @@
                   package = config.packages.default;
                   agentModule = ./nix/nixos/agent.nix;
                 };
-                vm-install = import ./nix/tests/install.nix {
-                  inherit pkgs;
-                  inherit (inputs) disko;
-                  package = config.packages.default;
-                  agentModule = ./nix/nixos/agent.nix;
-                };
                 vm-link-local = import ./nix/tests/link-local.nix {
                   inherit pkgs;
                   package = config.packages.default;
                   installerModule = ./nix/nixos/installer.nix;
                 };
-              };
+              }
+              # Install, boot and check each disk layout.
+              // lib.mapAttrs' (
+                layout: _:
+                lib.nameValuePair "vm-install-${layout}" (
+                  import ./nix/tests/install.nix {
+                    inherit pkgs layout;
+                    inherit (inputs) disko;
+                    package = config.packages.default;
+                    agentModule = ./nix/nixos/agent.nix;
+                  }
+                )
+              ) (import ./nix/tests/layouts.nix);
 
             devshells.default.packages = [ config.treefmt.build.wrapper ];
 
