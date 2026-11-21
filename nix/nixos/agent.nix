@@ -40,12 +40,15 @@ in
       after = [ "network.target" ];
       # Inventory: lsblk for disks, nixos-facter for the hardware report.
       # Store push: `nix daemon --stdio` serving the store under /mnt.
+      # Formatting: disko's scripts call modprobe (dm-snapshot for LVM,
+      # md_mod for mdadm) and expect it on the PATH.
       # Install: ssh-keygen for pulled host keys, nixos-install, and zpool
       # to export pools before the first boot.
       path = [
         pkgs.util-linux
         pkgs.nixos-facter
         config.nix.package
+        pkgs.kmod
         pkgs.openssh
         pkgs.nixos-install
       ]

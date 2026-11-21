@@ -1,11 +1,15 @@
-# What the nix-pixie installer adds to a NixOS live system: the agent, and
-# networking that works on any wired link, with or without a DHCP server.
+# What the nix-pixie installer adds to a NixOS live system: the agent, what
+# disko needs for any storage stack, and networking that works on any wired
+# link, with or without a DHCP server.
 #
 # Used by the installer ISO, and importable into custom images:
 #   nixosSystem { modules = [ "${modulesPath}/installer/cd-dvd/installation-cd-minimal.nix" nix-pixie.nixosModules.installer ]; }
 { lib, ... }:
 {
-  imports = [ ./agent.nix ];
+  imports = [
+    ./agent.nix
+    ./storage.nix
+  ];
 
   services.nix-pixie-agent.enable = true;
 
