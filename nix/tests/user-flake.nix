@@ -1,6 +1,6 @@
 # The operator's flake for VM tests that install: nixosConfigurations built
-# from `targetModule` (with disko and nix-pixie's system module) plus the
-# `pixie` output, as a directory the test puts into the controller VM.
+# from a module in `targets/` (with disko and nix-pixie's system module) plus
+# the `pixie` output, as a directory the test puts into the controller VM.
 #
 # The controller evaluates it inside its VM, like on a real controller, but
 # must not build anything there (max-jobs = 0). So the same configurations are
@@ -10,10 +10,13 @@
 # fails at once and lists what it would have to build.
 { pkgs, disko }:
 {
-  # Imported by every configuration; sets everything but disk "main"'s device.
-  targetModule,
-  # name -> { device = <Nix source for the device, with `pixieLib` in scope>;
-  #           built = <the device it evaluates to when the test prebuilds>; }
+  # A file in `targets/`, imported by every configuration. It sets everything
+  # but the disks' devices.
+  target,
+  # name -> { disks.<disko disk> = {
+  #             device = <Nix source for the device, with `pixieLib` in scope>;
+  #             built = <the device it evaluates to when the test prebuilds>;
+  #           }; }
   configurations,
   # Nix source for mkPixie's `config.machines`.
   machines,
@@ -24,21 +27,21 @@ let
   nixpkgsSource = "${pkgs.path}";
 
   evalTarget =
-    device:
+    devices:
     (import "${pkgs.path}/nixos/lib/eval-config.nix" {
       system = null;
       modules = [
         "${disko}/module.nix"
         ../nixos/system.nix
-        targetModule
+        (./targets + "/${target}")
         {
           nixpkgs.hostPlatform = system;
-          disko.devices.disk.main.device = device;
+          disko.devices.disk = lib.mapAttrs (_: device: { inherit device; }) devices;
         }
       ];
     }).config;
 
-  prebuilt = lib.mapAttrs (_: c: evalTarget c.built) configurations;
+  prebuilt = lib.mapAttrs (_: c: evalTarget (lib.mapAttrs (_: d: d.built) c.disks)) configurations;
 
   flakeNix = pkgs.writeText "flake.nix" ''
     {
@@ -54,16 +57,16 @@ let
         let
           pixieLib = import ./nix-pixie/lib.nix { inherit (nixpkgs) lib; };
           target =
-            device:
+            devices:
             import "''${nixpkgs}/nixos/lib/eval-config.nix" {
               system = null;
               modules = [
                 "''${disko}/module.nix"
                 ./nix-pixie/nixos/system.nix
-                ./target.nix
+                ./targets/${target}
                 {
                   nixpkgs.hostPlatform = "${system}";
-                  disko.devices.disk.main.device = device;
+                  disko.devices.disk = nixpkgs.lib.mapAttrs (_: device: { inherit device; }) devices;
                 }
               ];
             };
@@ -72,7 +75,9 @@ let
           nixosConfigurations = {
             ${lib.concatStrings (
               lib.mapAttrsToList (name: c: ''
-                ${name} = target (${c.device});
+                ${name} = target {
+                  ${lib.concatStrings (lib.mapAttrsToList (disk: d: "${disk} = ${d.device};\n") c.disks)}
+                };
               '') configurations
             )}
           };
@@ -88,7 +93,9 @@ let
   flakeDir = pkgs.runCommand "nix-pixie-test-flake" { } ''
     mkdir -p $out/nix-pixie/nixos
     cp ${flakeNix} $out/flake.nix
-    cp ${targetModule} $out/target.nix
+    # Readable, and a syntax error fails here rather than inside the VM.
+    ${lib.getExe pkgs.nixfmt} $out/flake.nix
+    cp -r ${./targets} $out/targets
     cp ${../lib.nix} $out/nix-pixie/lib.nix
     cp ${../options.nix} $out/nix-pixie/options.nix
     cp ${../nixos/system.nix} $out/nix-pixie/nixos/system.nix
@@ -96,7 +103,7 @@ let
   '';
 in
 {
-  inherit prebuilt;
+  inherit prebuilt flakeDir;
 
   # For the controller node.
   controllerModule = {

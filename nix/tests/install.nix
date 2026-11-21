@@ -4,7 +4,7 @@
 # like the target would after the operator removes the installer medium.
 #
 # Node names matter: nodes are numbered alphabetically, so `target` is
-# 192.168.1.3, which the installed system takes over (`install-target.nix`).
+# 192.168.1.3, which the installed system takes over (`targets/base.nix`).
 {
   pkgs,
   package,
@@ -13,8 +13,8 @@
 }:
 let
   flake = import ./user-flake.nix { inherit pkgs disko; } {
-    targetModule = ./install-target.nix;
-    configurations.web1 = {
+    target = "ext4.nix";
+    configurations.web1.disks.main = {
       device = ''"/dev/disk/by-pixie/main"'';
       built = "/dev/disk/by-pixie/main";
     };

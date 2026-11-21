@@ -13,16 +13,16 @@
 }:
 let
   flake = import ./user-flake.nix { inherit pkgs disko; } {
-    targetModule = ./disko-target.nix;
+    target = "minimal.nix";
     configurations = {
       # Pinned: the controller records the disk in the repository. QEMU
       # names virtio disks by their serial.
-      web1 = {
+      web1.disks.main = {
         device = ''pixieLib.pinnedDisk ./machines/web1/disks.json "main"'';
         built = "/dev/disk/by-id/virtio-pixie-b";
       };
       # Agnostic: any machine, the disk is chosen at install time.
-      fleet = {
+      fleet.disks.main = {
         device = ''"/dev/disk/by-pixie/main"'';
         built = "/dev/disk/by-pixie/main";
       };
