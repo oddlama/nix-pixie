@@ -19,6 +19,7 @@ let
   spec = {
     zfs = false;
     hostKeyPath = "/etc/ssh/ssh_host_ed25519_key";
+    passphrase = null;
   }
   // (import ./layouts.nix).${layout};
   byPixie = disk: "/dev/disk/by-pixie/${disk}";
@@ -47,6 +48,22 @@ let
     installed = "/dev/vd${lib.elemAt [ "a" "b" ] i}";
   }) spec.disks;
   diskArgs = lib.concatMapStringsSep " " (d: "--disk ${d.name}=${d.onTarget}") disks;
+
+  install = "nix-pixie controller install --code CODE --machine web1 ${diskArgs} --yes --then poweroff --boot-timeout 300";
+  encrypted = spec.passphrase != null;
+  # Passphrases are typed in on a terminal: give it one (`script`), fed from
+  # a file with the passphrase twice (it is asked again to confirm).
+  command =
+    if encrypted then "script --quiet --return --flush --command '${install}' /dev/null" else install;
+  stdin = lib.optionalString encrypted " -p StandardInput=file:/tmp/answers";
+  writeAnswers = lib.optionalString encrypted ''
+    controller.succeed("printf '%s\\n' ${spec.passphrase} ${spec.passphrase} > /tmp/answers")
+  '';
+  # Python, at the indentation of a subtest's body.
+  unlockAtBoot = lib.optionalString encrypted ''
+    installed.wait_for_console_text(${builtins.toJSON spec.bootPrompt})
+        installed.send_console("${spec.passphrase}\n")
+  '';
 in
 assert lib.length spec.disks <= 2;
 pkgs.testers.runNixOSTest {
@@ -79,6 +96,9 @@ pkgs.testers.runNixOSTest {
         }
       ];
       boot.supportedFilesystems.zfs = spec.zfs;
+      # Like the installer, whose root is in RAM: the agent only writes keys
+      # to RAM.
+      boot.tmp.useTmpfs = true;
       # The installer's own; the installed system has another.
       networking.hostId = lib.mkIf spec.zfs "c0ffee00";
     };
@@ -109,24 +129,35 @@ pkgs.testers.runNixOSTest {
     with subtest("install, recording the generated host key, then power off"):
         target.wait_for_file("/run/nix-pixie/code")
         code = target.succeed("cat /run/nix-pixie/code").strip()
+        ${writeAnswers}
         # In the background: after the install, it waits for the system to boot.
         controller.succeed(
             "systemd-run --unit=pixie-install --remain-after-exit --uid=alice"
             + " --working-directory=/home/alice/repo -E HOME=/home/alice"
-            + " -E PATH=/run/current-system/sw/bin"
-            + " -p StandardOutput=file:/tmp/install.json -p StandardError=journal"
-            + f" nix-pixie controller install --code {code} --machine web1"
-            + " ${diskArgs} --yes --then poweroff --boot-timeout 300"
+            + " -E PATH=/run/current-system/sw/bin${stdin}"
+            + " -p StandardOutput=file:/tmp/install.out -p StandardError=inherit"
+            + " " + "${command}".replace("CODE", code)
         )
-        # The target powers off once installed. If the install fails, it never
-        # does: stop at once instead of waiting for the test's timeout.
-        controller.wait_until_succeeds(
-            "journalctl -o cat -u pixie-install | grep -q 'is powered off'"
-            + " || test \"$(systemctl show -P Result pixie-install)\" != success",
-            timeout=600,
-        )
-        result = controller.succeed("systemctl show -P Result pixie-install").strip()
-        assert result == "success", f"the install failed ({result}); its output is above"
+
+        def install_output():
+            return controller.succeed("cat /tmp/install.out")
+
+        def wait_for_output(text):
+            # If the install fails, stop at once instead of waiting for the
+            # test's timeout.
+            controller.wait_until_succeeds(
+                f"grep -q '{text}' /tmp/install.out"
+                + " || test \"$(systemctl show -P Result pixie-install)\" != success",
+                timeout=600,
+            )
+            result = controller.succeed("systemctl show -P Result pixie-install").strip()
+            assert result == "success", f"the install failed ({result}):\n{install_output()}"
+
+        wait_for_output("Sending the system")
+        # disko is done: its keys must be gone.
+        target.fail("test -e /tmp/secret.key")
+        # The target powers off once installed.
+        wait_for_output("is powered off")
         target.wait_for_shutdown()
         recorded = controller.succeed("cat ~alice/repo/machines/web1/ssh_host_ed25519_key.pub")
         recorded_key = " ".join(recorded.split()[:2])
@@ -137,6 +168,7 @@ pkgs.testers.runNixOSTest {
     with subtest("the installed system boots from its disks"):
         installed.state_dir = target.state_dir
         installed.start()
+        ${unlockAtBoot}
         installed.wait_for_unit("multi-user.target", timeout=300)
         # The udev rule recreates the agnostic disks' paths, for grub-install.
     ${lib.concatMapStrings (
@@ -149,9 +181,11 @@ pkgs.testers.runNixOSTest {
             timeout=300,
         )
         result = controller.succeed("systemctl show -P Result pixie-install").strip()
-        report = json.loads(controller.succeed("cat /tmp/install.json"))
+        output = install_output()
+        assert result == "success", f"{result}:\n{output}"
+        # The result is the last JSON line (under `script`, stderr is mixed in).
+        report = json.loads(next(l for l in reversed(output.splitlines()) if l.lstrip().startswith("{")))
         print(json.dumps(report, indent=2))
-        assert result == "success", result
         host_key = report["hostKey"]
         assert host_key["verified"] and host_key["seen"] == recorded_key, host_key
         assert host_key["address"] == "192.168.1.3", host_key
