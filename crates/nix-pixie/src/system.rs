@@ -12,16 +12,20 @@ use tracing::info;
 /// What the controller needs to know before building: evaluated without
 /// building anything. Devices that aren't set evaluate to `null` instead of
 /// failing, so the controller can say what's missing.
-const FACTS: &str = r"config: {
+const FACTS: &str = r#"config: {
   system = config.nixpkgs.hostPlatform.system;
   disko =
     if config ? disko then {
       rootMountPoint = config.disko.rootMountPoint;
       disks = builtins.mapAttrs (_: disk: {
         device = let d = builtins.tryEval disk.device; in if d.success then d.value else null;
+        partLabels =
+          if (disk.content.type or null) == "gpt"
+          then map (p: p.label) (builtins.attrValues disk.content.partitions)
+          else [ ];
       }) config.disko.devices.disk;
     } else null;
-}";
+}"#;
 
 /// `nixosConfigurations.<name>` of a flake.
 #[derive(Debug, Clone)]
@@ -51,9 +55,13 @@ pub struct Disko {
 
 /// One of disko's disks.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DiskoDisk {
     /// The device path, `None` if the configuration doesn't set it.
     pub device: Option<String>,
+    /// GPT partition labels disko gives it. disko mounts by these, so no
+    /// other disk on the target may carry them.
+    pub part_labels: Vec<String>,
 }
 
 /// What gets pushed to the target.

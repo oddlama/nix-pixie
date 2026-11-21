@@ -1,7 +1,7 @@
 # `nix-pixie controller install` up to a formatted, mounted disk with the
 # system on it: disk choice in both modes, the agnostic link and its udev
 # rule, recording pinned disks in the repository, and the protections around
-# erasing data.
+# erasing data and against another disk carrying the same partition labels.
 #
 # The controller evaluates the user's flake inside its VM, like it would on
 # an operator's machine, but nothing may be built there (max-jobs = 0): the
@@ -208,6 +208,16 @@ pkgs.testers.runNixOSTest {
         target.succeed("rm /dev/disk/by-pixie/main")
         target.succeed("udevadm trigger --subsystem-match=block --action=change && udevadm settle")
         assert target.succeed("readlink -f /dev/disk/by-pixie/main").strip() == "/dev/vdb"
+
+    with subtest("an old disk with the same layout blocks the install"):
+        # vdb still holds the agnostic install, whose partitions carry the
+        # labels web1's layout creates: disko could mount those instead.
+        current, out = install("--machine web1 --disk main=vdc --yes", expect_success=False)
+        assert "vdb (disk-main-boot, disk-main-root)" in out, out
+        controller.fail("test -e ~alice/repo/machines/web1/disks.json")
+        next_code(current)
+        # What the operator would do: erase the old install.
+        target.succeed("umount -R /mnt && wipefs --all /dev/vdb2 /dev/vdb1 /dev/vdb && udevadm settle")
 
     with subtest("pinned: records the chosen disk in the repository"):
         report = install("--machine web1 --disk main=vdc --yes")

@@ -367,6 +367,59 @@ pub fn stable_id(disk: &Disk) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// Names disko creates and then finds its devices by: GPT partition labels
+/// (it mounts `/dev/disk/by-partlabel/<label>`).
+pub fn created_names(disko: &Disko) -> BTreeSet<String> {
+    disko
+        .disks
+        .values()
+        .flat_map(|d| d.part_labels.iter().cloned())
+        .collect()
+}
+
+/// Refuses if a disk that is not being formatted already carries one of
+/// `names`: disko could then mount or import the old partition or pool
+/// instead of the one it just created, and the system would land on the
+/// wrong disk. Typical cause: a disk from an earlier install with the same
+/// layout is still attached. `Err` is a reason for the operator.
+pub fn check_name_clashes(
+    names: &BTreeSet<String>,
+    formatting: &BTreeSet<&str>,
+    disks: &[Disk],
+) -> Result<(), String> {
+    let clashes: Vec<String> = disks
+        .iter()
+        .filter(|d| !formatting.contains(d.name.as_str()))
+        .filter_map(|disk| {
+            let found: BTreeSet<&str> = disk
+                .contents
+                .iter()
+                .flat_map(|c| {
+                    let pool = (c.fstype.as_deref() == Some("zfs_member"))
+                        .then_some(c.label.as_deref())
+                        .flatten();
+                    [c.partlabel.as_deref(), pool]
+                })
+                .flatten()
+                .filter(|name| names.contains(*name))
+                .collect();
+            (!found.is_empty()).then(|| {
+                let found: Vec<&str> = found.into_iter().collect();
+                format!("{} ({})", disk.name, found.join(", "))
+            })
+        })
+        .collect();
+    if clashes.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} already carry partition labels or pool names this configuration creates. disko \
+         finds its partitions and pools by name and could use the old ones, putting the system \
+         on the wrong disk. Erase them (e.g. `wipefs --all` on the target) or detach those disks",
+        clashes.join(", ")
+    ))
+}
+
 /// The pinned-mode file: `{ "<disko disk>": "/dev/disk/by-id/..." }`.
 pub fn pins_json(choices: &[Choice]) -> Result<Vec<u8>> {
     let pins: BTreeMap<&str, &str> = choices

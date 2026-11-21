@@ -56,6 +56,7 @@ fn disko(disks: &[(&str, Option<&str>)]) -> Disko {
                     (*name).to_string(),
                     DiskoDisk {
                         device: device.map(str::to_string),
+                        part_labels: vec!["disk-main-root".into()],
                     },
                 )
             })
@@ -311,4 +312,44 @@ fn build_results_come_in_installable_order() {
         }
     );
     assert!(parse_build_output(b"[]").is_err());
+}
+
+#[test]
+fn refuses_other_disks_carrying_names_disko_creates() {
+    let names = created_names(&agnostic());
+    assert_eq!(
+        names.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["disk-main-root"]
+    );
+
+    let old_install = Disk {
+        contents: vec![Content {
+            device: "vdc2".into(),
+            partlabel: Some("disk-main-root".into()),
+            fstype: Some("ext4".into()),
+            ..Content::default()
+        }],
+        ..disk("vdc", &["virtio-pixie-b"])
+    };
+    // An unrelated label, and a filesystem label that merely equals a name.
+    let unrelated = Disk {
+        contents: vec![Content {
+            device: "sdb1".into(),
+            partlabel: Some("data".into()),
+            fstype: Some("ext4".into()),
+            label: Some("disk-main-root".into()),
+            ..Content::default()
+        }],
+        ..disk("sdb", &[])
+    };
+    let disks = vec![disk("vdb", &[]), old_install, unrelated];
+
+    let formatting = ["vdb"].into_iter().collect();
+    let err = check_name_clashes(&names, &formatting, &disks).unwrap_err();
+    assert!(err.contains("vdc (disk-main-root) already"), "{err}");
+    assert!(!err.contains("sdb"), "{err}");
+
+    // Formatting the old disk too erases its names.
+    let formatting = ["vdb", "vdc"].into_iter().collect();
+    assert_eq!(check_name_clashes(&names, &formatting, &disks), Ok(()));
 }

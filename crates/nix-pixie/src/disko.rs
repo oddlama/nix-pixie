@@ -15,6 +15,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 
 use crate::child;
+use crate::plan;
 use nix_pixie_proto::ctrl::DiskAssignment;
 use nix_pixie_proto::inventory::Disk;
 use tracing::info;
@@ -57,12 +58,18 @@ pub fn is_plain_name(name: &str) -> bool {
 
 /// Checks `disks` against a fresh look at the machine and links the agnostic
 /// ones. `Err` is a reason for the operator.
-pub async fn prepare(disks: &[DiskAssignment], formatted: &BTreeSet<String>) -> Result<(), String> {
+pub async fn prepare(
+    disks: &[DiskAssignment],
+    labels: &[String],
+    formatted: &BTreeSet<String>,
+) -> Result<(), String> {
     check_assignments(disks)?;
     let present = inventory::disks(formatted)
         .await
         .map_err(|e| format!("can't list the disks: {e:#}"))?;
     check_present(disks, &present)?;
+    let formatting = disks.iter().map(|d| d.device.as_str()).collect();
+    plan::check_name_clashes(&labels.iter().cloned().collect(), &formatting, &present)?;
     for disk in disks.iter().filter(|d| d.link) {
         link(Path::new(BY_PIXIE), &disk.role, &disk.device)
             .map_err(|e| format!("linking {BY_PIXIE}/{}: {e:#}", disk.role))?;

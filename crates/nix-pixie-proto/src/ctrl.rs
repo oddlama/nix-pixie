@@ -7,7 +7,7 @@
 //!                           <-   Approve | Reject
 //!                           <-   RequestFacterReport        (after Approve)
 //! FacterReport | FacterFailed ->
-//!                           <-   PrepareDisks { disks }      (after Approve)
+//!                           <-   PrepareDisks { disks, labels } (after Approve)
 //! DisksReady | DisksRefused ->
 //!                           <-   GenerateHostKey             (after Approve)
 //! HostKey | HostKeyFailed   ->
@@ -106,10 +106,15 @@ pub enum ControllerMsg {
     /// Check that a Nix store under `root` (e.g. `/mnt`, the mounted target
     /// filesystems) can receive paths. Only after `Approve`.
     PrepareStore { root: String },
-    /// Check that these disks may be formatted, and link the ones disko
-    /// addresses by role. Only after `Approve`, once the operator confirmed
-    /// that their contents will be destroyed.
-    PrepareDisks { disks: Vec<DiskAssignment> },
+    /// Check that these disks may be formatted and that no other disk
+    /// carries any of `labels` (names disko will create and then find its
+    /// devices by), and link the disks disko addresses by role. Only after
+    /// `Approve`, once the operator confirmed that their contents will be
+    /// destroyed.
+    PrepareDisks {
+        disks: Vec<DiskAssignment>,
+        labels: Vec<String>,
+    },
     /// Run this disko script (destroy, format, mount), already pushed into
     /// the live store. Only after `DisksReady`.
     RunDisko { script: String },

@@ -145,6 +145,9 @@ async fn session(
         args.yes,
     )
     .await?;
+    let formatting = choices.iter().map(|c| c.disk.as_str()).collect();
+    plan::check_name_clashes(&plan::created_names(&disko), &formatting, &inventory.disks)
+        .map_err(|reason| anyhow!(reason))?;
     if let Some(file) = &machine.disks.file {
         record_pins(&configuration, &args.flake, file, &choices).await?;
     }
@@ -161,7 +164,8 @@ async fn session(
     )
     .await
     .context("pushing the disko script into the target's live store")?;
-    prepare_disks(stream, &choices).await?;
+    let labels = plan::created_names(&disko).into_iter().collect();
+    prepare_disks(stream, &choices, labels).await?;
     eprintln!("Formatting");
     run_disko(stream, &built.disko_script).await?;
 
@@ -341,7 +345,7 @@ async fn read_line(prompt: &str) -> Result<String> {
     Ok(line)
 }
 
-async fn prepare_disks(stream: &mut Stream, choices: &[Choice]) -> Result<()> {
+async fn prepare_disks(stream: &mut Stream, choices: &[Choice], labels: Vec<String>) -> Result<()> {
     let disks = choices
         .iter()
         .map(|c| DiskAssignment {
@@ -350,7 +354,7 @@ async fn prepare_disks(stream: &mut Stream, choices: &[Choice]) -> Result<()> {
             link: c.link,
         })
         .collect();
-    write_frame(stream, &ControllerMsg::PrepareDisks { disks }).await?;
+    write_frame(stream, &ControllerMsg::PrepareDisks { disks, labels }).await?;
     let reply = tokio::time::timeout(PREPARE_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
         .await
         .context("timed out waiting for the target to check its disks")??;

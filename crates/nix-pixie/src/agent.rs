@@ -359,9 +359,9 @@ async fn serve_controller(
             },
             ControllerMsg::RequestFacterReport => facter_report(state).await,
             ControllerMsg::PrepareStore { root } => prepare_store(&root),
-            ControllerMsg::PrepareDisks { disks } => {
+            ControllerMsg::PrepareDisks { disks, labels } => {
                 prepared = None;
-                match disko::prepare(&disks, &disko::formatted(state)).await {
+                match disko::prepare(&disks, &labels, &disko::formatted(state)).await {
                     Ok(()) => {
                         let names: Vec<String> = disks
                             .iter()
