@@ -181,14 +181,19 @@
                 lib.nameValuePair "vm-install-${layout}" (
                   import ./nix/tests/install.nix {
                     inherit pkgs layout;
-                    inherit (inputs) disko;
+                    inherit (inputs) nixpkgs disko;
                     package = config.packages.default;
                     agentModule = ./nix/nixos/agent.nix;
                   }
                 )
               ) (import ./nix/tests/layouts.nix);
 
-            devshells.default.packages = [ config.treefmt.build.wrapper ];
+            devshells.default.packages = [
+              config.treefmt.build.wrapper
+              # `checks [PATTERN]`: build checks in parallel without
+              # evaluating them all in one process.
+              (pkgs.callPackage ./nix/checks.nix { })
+            ];
 
             treefmt = {
               projectRootFile = "flake.nix";
