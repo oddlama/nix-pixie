@@ -71,6 +71,8 @@ pkgs.testers.runNixOSTest {
 
     start_all()
     target.wait_for_unit("nix-pixie-agent.service")
+    # The unit is active before the agent has bound its endpoint.
+    target.wait_for_file("/run/nix-pixie/endpoint-id")
     target_id = target.succeed("cat /run/nix-pixie/endpoint-id").strip()
     controller_id = controller.succeed(as_alice("nix-pixie controller id")).strip()
 
