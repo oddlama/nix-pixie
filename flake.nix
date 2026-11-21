@@ -169,6 +169,12 @@
                   package = config.packages.default;
                   agentModule = ./nix/nixos/agent.nix;
                 };
+                vm-install = import ./nix/tests/install.nix {
+                  inherit pkgs;
+                  inherit (inputs) disko;
+                  package = config.packages.default;
+                  agentModule = ./nix/nixos/agent.nix;
+                };
                 vm-link-local = import ./nix/tests/link-local.nix {
                   inherit pkgs;
                   package = config.packages.default;

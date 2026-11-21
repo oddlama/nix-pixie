@@ -3,11 +3,8 @@
 # rule, recording pinned disks in the repository, and the protections around
 # erasing data and against another disk carrying the same partition labels.
 #
-# The controller evaluates the user's flake inside its VM, like it would on
-# an operator's machine, but nothing may be built there (max-jobs = 0): the
-# test prebuilds the same configurations into the VM's store. If the two
-# evaluations ever diverge, `nix build` fails at once and lists what it would
-# have had to build.
+# The controller evaluates the user's flake inside its VM (see
+# `user-flake.nix`) and stays in the installer afterwards (`--then stay`).
 {
   pkgs,
   package,
@@ -15,117 +12,36 @@
   disko,
 }:
 let
-  inherit (pkgs) lib;
-  system = pkgs.stdenv.hostPlatform.system;
-  nixpkgsSource = "${pkgs.path}";
-
-  # What the flake below evaluates to, built outside the VM.
-  evalTarget =
-    device:
-    (import "${pkgs.path}/nixos/lib/eval-config.nix" {
-      system = null;
-      modules = [
-        "${disko}/module.nix"
-        ../nixos/system.nix
-        ./disko-target.nix
-        {
-          nixpkgs.hostPlatform = system;
-          disko.devices.disk.main.device = device;
-        }
-      ];
-    }).config;
-  fleet = evalTarget "/dev/disk/by-pixie/main";
-  # The disk the controller records for web1: QEMU names virtio disks by
-  # their serial.
-  web1 = evalTarget "/dev/disk/by-id/virtio-pixie-b";
-
-  flakeNix = pkgs.writeText "flake.nix" ''
-    {
-      inputs = {
-        nixpkgs.url = "path:${nixpkgsSource}";
-        disko = {
-          url = "path:${disko}";
-          flake = false;
-        };
+  flake = import ./user-flake.nix { inherit pkgs disko; } {
+    targetModule = ./disko-target.nix;
+    configurations = {
+      # Pinned: the controller records the disk in the repository. QEMU
+      # names virtio disks by their serial.
+      web1 = {
+        device = ''pixieLib.pinnedDisk ./machines/web1/disks.json "main"'';
+        built = "/dev/disk/by-id/virtio-pixie-b";
       };
-      outputs =
-        { self, nixpkgs, disko }:
-        let
-          pixieLib = import ./nix-pixie/lib.nix { inherit (nixpkgs) lib; };
-          target =
-            device:
-            import "''${nixpkgs}/nixos/lib/eval-config.nix" {
-              system = null;
-              modules = [
-                "''${disko}/module.nix"
-                ./nix-pixie/nixos/system.nix
-                ./target.nix
-                {
-                  nixpkgs.hostPlatform = "${system}";
-                  disko.devices.disk.main.device = device;
-                }
-              ];
-            };
-        in
-        {
-          nixosConfigurations = {
-            # Pinned: the controller records the disk in the repository.
-            web1 = target (pixieLib.pinnedDisk ./machines/web1/disks.json "main");
-            # Agnostic: any machine, the disk is chosen at install time.
-            fleet = target "/dev/disk/by-pixie/main";
-          };
-          pixie = pixieLib.mkPixie {
-            inherit (self) nixosConfigurations;
-            config.machines = {
-              web1.disks.file = "machines/web1/disks.json";
-              fleet = { };
-            };
-          };
-        };
-    }
-  '';
-
-  # The user's repository, with nix-pixie's lib vendored in: the test VM has
-  # no way to fetch nix-pixie as a flake input.
-  flakeDir = pkgs.runCommand "nix-pixie-test-flake" { } ''
-    mkdir -p $out/nix-pixie/nixos
-    cp ${flakeNix} $out/flake.nix
-    cp ${./disko-target.nix} $out/target.nix
-    cp ${../lib.nix} $out/nix-pixie/lib.nix
-    cp ${../options.nix} $out/nix-pixie/options.nix
-    cp ${../nixos/system.nix} $out/nix-pixie/nixos/system.nix
-    cp ${../nixos/disks.nix} $out/nix-pixie/nixos/disks.nix
-  '';
+      # Agnostic: any machine, the disk is chosen at install time.
+      fleet = {
+        device = ''"/dev/disk/by-pixie/main"'';
+        built = "/dev/disk/by-pixie/main";
+      };
+    };
+    machines = ''
+      {
+        web1.disks.file = "machines/web1/disks.json";
+        fleet = { };
+      }
+    '';
+  };
 in
 pkgs.testers.runNixOSTest {
   name = "nix-pixie-disko";
 
   nodes = {
     controller = {
-      virtualisation.memorySize = 3072;
-      environment.systemPackages = [
-        package
-        pkgs.git
-      ];
-      users.users.alice.isNormalUser = true;
-      nix.settings = {
-        experimental-features = [
-          "nix-command"
-          "flakes"
-        ];
-        flake-registry = "";
-        substituters = lib.mkForce [ ];
-        # Fail at once instead of building a whole system in the VM.
-        max-jobs = 0;
-      };
-      system.extraDependencies = [
-        nixpkgsSource
-        disko
-        fleet.system.build.diskoScript
-        fleet.system.build.toplevel
-        web1.system.build.diskoScript
-        web1.system.build.toplevel
-      ];
+      imports = [ flake.controllerModule ];
+      environment.systemPackages = [ package ];
     };
 
     target = {
@@ -147,7 +63,7 @@ pkgs.testers.runNixOSTest {
       ];
       # What an installed agnostic system has: the rule that recreates
       # /dev/disk/by-pixie/main from the partition labels.
-      services.udev.packages = [ fleet.system.build.nixPixieDiskRules ];
+      services.udev.packages = [ flake.prebuilt.fleet.system.build.nixPixieDiskRules ];
     };
   };
 
@@ -177,10 +93,7 @@ pkgs.testers.runNixOSTest {
 
     start_all()
     target.wait_for_unit("nix-pixie-agent.service")
-    controller.succeed(
-        "su - alice -c 'cp -r --no-preserve=mode ${flakeDir} repo && cd repo"
-        + " && git init -q && git add -A && nix flake lock && git add flake.lock'"
-    )
+    ${flake.setupScript}
 
     with subtest("a role that doesn't exist fails before pairing"):
         current, out = install("--machine fleet --disk nope=vdb --yes", expect_success=False)
