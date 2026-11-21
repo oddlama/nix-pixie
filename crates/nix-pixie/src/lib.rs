@@ -26,6 +26,7 @@ pub mod nixos;
 pub mod plan;
 pub mod probe;
 pub mod push;
+pub mod secrets;
 pub mod state;
 pub mod store;
 pub mod system;

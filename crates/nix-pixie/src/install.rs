@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, VarInt};
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::ctrl::{
-    ControllerMsg, DiskAssignment, MAX_TARGET_FRAME, Shutdown, StreamRequest, TargetMsg,
+    ControllerMsg, DiskAssignment, KeyFile, MAX_TARGET_FRAME, Shutdown, StreamRequest, TargetMsg,
 };
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use nix_pixie_proto::inventory::Disk;
@@ -29,6 +29,7 @@ use crate::metadata::{self, HostKeyMode, Machine, Metadata};
 use crate::net::{self, Stream, sanitise};
 use crate::plan::{self, Choice, Resolution};
 use crate::push;
+use crate::secrets;
 use crate::system::{Built, Configuration, Disko, Ssh};
 
 /// For the agent's checks before formatting (a fresh lsblk).
@@ -88,6 +89,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         refuse_push(name, machine)?;
         let disko = disko_of(&Configuration::new(&args.flake, &machine.configuration)?).await?;
         plan::check_requested(&disko, machine.disks.file.is_some(), &requested)?;
+        secrets::check_interactive(&secrets::needs(&disko.encryption)?)?;
         if machine.disks.file.is_some() {
             repo_root(&args.flake)?;
         }
@@ -139,6 +141,8 @@ struct Check {
     /// The installer's own key, which may still answer for a moment.
     live: Option<PublicKey>,
     machine: String,
+    /// The first boot may wait for a disk passphrase on the console.
+    encrypted: bool,
 }
 
 /// Waits for the installed system and compares its host key; records the
@@ -157,6 +161,12 @@ async fn verify(
         );
     } else {
         eprintln!("\nWaiting up to {wait} s for {} to boot.", check.machine);
+    }
+    if check.encrypted {
+        eprintln!(
+            "Its disks are encrypted: it may ask for the passphrase on its console while booting; \
+             type it there."
+        );
     }
     let result = hostkey::wait_for(
         &check.addrs,
@@ -228,6 +238,8 @@ struct Plan {
     ssh: Ssh,
     /// Pull mode: the generated key, and where the installed system wants it.
     host_key: Option<(PublicKey, String)>,
+    /// Passphrases disko reads from files while formatting.
+    key_files: Vec<KeyFile>,
 }
 
 /// Approval, the facter report and host key, the disk plan, the build.
@@ -290,6 +302,8 @@ async fn prepare(
     let disko = facts
         .disko
         .with_context(|| no_disko(&machine.configuration))?;
+    let needs = secrets::needs(&disko.encryption)?;
+    secrets::check_interactive(&needs)?;
     let choices = choose_disks(
         &disko,
         machine.disks.file.is_some(),
@@ -305,6 +319,9 @@ async fn prepare(
         record_pins(&configuration, &args.flake, file, &choices).await?;
     }
 
+    // Before the build, so it can run unattended.
+    let key_files = secrets::ask(needs).await?;
+
     eprintln!("\nBuilding nixosConfigurations.{}", machine.configuration);
     let built = configuration.build().await?;
     Ok(Plan {
@@ -317,6 +334,7 @@ async fn prepare(
         disko,
         ssh: facts.ssh,
         host_key,
+        key_files,
     })
 }
 
@@ -339,6 +357,7 @@ async fn apply(
         disko,
         ssh,
         host_key,
+        key_files,
     } = plan;
     confirm_erase(&disks, &choices, &name, args.yes, args.wipe).await?;
 
@@ -353,7 +372,7 @@ async fn apply(
     let labels = plan::created_names(&disko).into_iter().collect();
     prepare_disks(stream, &choices, labels).await?;
     eprintln!("Formatting");
-    run_disko(stream, &built.disko_script).await?;
+    run_disko(stream, &built.disko_script, key_files).await?;
 
     let root = disko.root_mount_point;
     let fstype = push::prepare_disk_store(stream, &root).await?;
@@ -405,6 +424,7 @@ async fn apply(
             expected,
             live,
             machine: name,
+            encrypted: !(disko.encryption.luks.is_empty() && disko.encryption.zfs.is_empty()),
         })
     } else {
         report.insert(
@@ -691,11 +711,12 @@ async fn prepare_disks(stream: &mut Stream, choices: &[Choice], labels: Vec<Stri
 }
 
 /// Runs disko on the target. Its output is kept, and shown if it fails.
-async fn run_disko(stream: &mut Stream, script: &str) -> Result<()> {
+async fn run_disko(stream: &mut Stream, script: &str, key_files: Vec<KeyFile>) -> Result<()> {
     write_frame(
         stream,
         &ControllerMsg::RunDisko {
             script: script.into(),
+            key_files,
         },
     )
     .await?;

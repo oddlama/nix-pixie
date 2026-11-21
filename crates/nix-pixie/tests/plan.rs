@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use nix_pixie::plan::*;
-use nix_pixie::system::{Built, Disko, DiskoDisk, parse_build_output};
+use nix_pixie::system::{Built, Disko, DiskoDisk, Encryption, parse_build_output};
 use nix_pixie_proto::inventory::{Content, Disk};
 
 fn disk(name: &str, by_id: &[&str]) -> Disk {
@@ -50,6 +50,7 @@ fn disko(disks: &[(&str, Option<&str>)]) -> Disko {
     Disko {
         root_mount_point: "/mnt".into(),
         zpools: Vec::new(),
+        encryption: Encryption::default(),
         disks: disks
             .iter()
             .map(|(name, device)| {

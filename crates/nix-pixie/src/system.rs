@@ -25,6 +25,38 @@ const FACTS: &str = r#"config: {
           else [ ];
       }) config.disko.devices.disk;
       zpools = builtins.attrNames (config.disko.devices.zpool or { });
+      encryption =
+        let
+          devices = config.disko.devices;
+          # Only downwards: disko's nodes also point back at their parents.
+          children = node:
+            let partitions = node.partitions or { }; in
+            [ (node.content or null) ]
+            ++ (if builtins.isList partitions then partitions else builtins.attrValues partitions)
+            ++ builtins.attrValues (node.lvs or { });
+          luks = node:
+            if !(builtins.isAttrs node) then [ ]
+            else
+              (if (node.type or null) == "luks" then [ {
+                inherit (node) name askPassword passwordFile additionalKeyFiles;
+                keyFile = node.settings.keyFile or node.keyFile;
+              } ] else [ ])
+              ++ builtins.concatMap luks (children node);
+          tops = builtins.concatMap (kind: builtins.attrValues (devices.${kind} or { }))
+            [ "disk" "mdadm" "lvm_vg" "nodev" ];
+          datasets = pool:
+            [ { inherit (pool) name; options = pool.rootFsOptions or { }; } ]
+            ++ map (d: { name = "${pool.name}/${d.name}"; options = d.options or { }; })
+              (builtins.attrValues (pool.datasets or { }));
+          zfs = builtins.filter (d: d.keylocation != "none") (map (d: {
+            inherit (d) name;
+            keylocation = d.options.keylocation or "none";
+            keyformat = d.options.keyformat or "none";
+          }) (builtins.concatMap datasets (builtins.attrValues (devices.zpool or { }))));
+        in {
+          luks = builtins.concatMap luks tops;
+          inherit zfs;
+        };
     } else null;
   ssh = {
     inherit (config.services.openssh) enable ports;
@@ -74,6 +106,44 @@ pub struct Disko {
     pub disks: BTreeMap<String, DiskoDisk>,
     /// `disko.devices.zpool` names, exported before the first boot.
     pub zpools: Vec<String>,
+    /// What is encrypted, and where disko expects its keys.
+    pub encryption: Encryption,
+}
+
+/// The encrypted parts of a disko layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Encryption {
+    pub luks: Vec<Luks>,
+    /// ZFS datasets (and pools' root datasets) with a key location.
+    pub zfs: Vec<ZfsKey>,
+}
+
+/// A LUKS device in the layout.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Luks {
+    /// The mapper name.
+    pub name: String,
+    /// disko asks on its terminal when creating it.
+    pub ask_password: bool,
+    /// File on the target holding the passphrase for formatting.
+    pub password_file: Option<String>,
+    /// `settings.keyFile` (or the deprecated `keyFile`): a key file on the
+    /// target, also used for unlocking at boot.
+    pub key_file: Option<String>,
+    /// More key files disko adds to the device.
+    pub additional_key_files: Vec<String>,
+}
+
+/// A ZFS dataset's key, as disko creates it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ZfsKey {
+    /// `pool/dataset`, or `pool` for the root dataset.
+    pub name: String,
+    /// `prompt`, `file:///...` or `https://...`.
+    pub keylocation: String,
+    /// `passphrase`, `raw` or `hex`.
+    pub keyformat: String,
 }
 
 /// One of disko's disks.

@@ -83,7 +83,7 @@ pub fn check_root_in(root: &str, mountinfo: &str) -> Result<String, String> {
 }
 
 /// (mount point, filesystem type) for every line of a mountinfo file.
-fn mounts(mountinfo: &str) -> impl Iterator<Item = (PathBuf, String)> + '_ {
+pub fn mounts(mountinfo: &str) -> impl Iterator<Item = (PathBuf, String)> + '_ {
     mountinfo.lines().filter_map(|line| {
         let (left, right) = line.split_once(" - ")?;
         let point = left.split(' ').nth(4)?;

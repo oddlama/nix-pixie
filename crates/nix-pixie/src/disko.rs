@@ -8,22 +8,22 @@
 //! must still not wipe the installer's own boot medium.
 
 use std::collections::BTreeSet;
-use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, symlink};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
 
 use crate::child;
 use crate::plan;
-use nix_pixie_proto::ctrl::DiskAssignment;
+use nix_pixie_proto::ctrl::{DiskAssignment, KeyFile};
 use nix_pixie_proto::inventory::Disk;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::inventory;
 use crate::net::Stream;
 use crate::state::StateDir;
-use crate::store::is_store_path;
+use crate::store::{self, is_store_path};
 
 /// Where agnostic disko configs find their disks.
 pub const BY_PIXIE: &str = "/dev/disk/by-pixie";
@@ -136,6 +136,7 @@ pub async fn run(
     stream: &mut Stream,
     script: &str,
     disks: &[DiskAssignment],
+    key_files: &[KeyFile],
 ) -> Result<Result<(), String>> {
     if !is_store_path(script) {
         return Ok(Err("not a store path".into()));
@@ -155,6 +156,94 @@ pub async fn run(
         return Ok(Err(format!("{e:#}")));
     }
 
-    info!(%script, "running disko");
-    child::run("disko", tokio::process::Command::new(script), stream).await
+    let written = match write_key_files(key_files) {
+        Ok(written) => written,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    info!(%script, key_files = written.len(), "running disko");
+    let result = child::run("disko", tokio::process::Command::new(script), stream).await;
+    // Whatever happened: the keys are of no use afterwards.
+    for path in &written {
+        if let Err(e) = std::fs::remove_file(path) {
+            warn!(path = %path.display(), "removing a key file: {e}");
+        }
+    }
+    result
+}
+
+/// Directories key files may go into. The installer's `/tmp` and `/run`
+/// are in RAM; `check_key_path` makes sure.
+const KEY_DIRS: [&str; 2] = ["/tmp", "/run"];
+
+/// Where a key file may be written: a plain path under `/tmp` or `/run`,
+/// on a filesystem in RAM according to `mountinfo`, so the key never
+/// touches a disk. `Err` is a reason for the operator.
+pub fn check_key_path(path: &str, mountinfo: &str) -> Result<(), String> {
+    let candidate = Path::new(path);
+    let plain = candidate
+        .components()
+        .skip(1)
+        .all(|c| matches!(c, Component::Normal(_)));
+    let under = KEY_DIRS
+        .iter()
+        .any(|dir| candidate.starts_with(dir) && candidate != Path::new(dir));
+    if !candidate.is_absolute() || !plain || !under {
+        return Err(format!(
+            "{path}: key files must be plain paths under {}",
+            KEY_DIRS.join(" or ")
+        ));
+    }
+    let fstype = store::mounts(mountinfo)
+        .filter(|(point, _)| candidate.starts_with(point))
+        .max_by_key(|(point, _)| point.components().count())
+        .map(|(_, fstype)| fstype);
+    match fstype.as_deref() {
+        Some("tmpfs" | "ramfs") => Ok(()),
+        Some(other) => Err(format!(
+            "{path} would be on {other}, and keys must never touch a disk"
+        )),
+        None => Err(format!("{path}: can't tell which filesystem it is on")),
+    }
+}
+
+/// Writes the key files (0400, in 0700 directories it creates) and returns
+/// their paths. On failure, removes the ones already written.
+fn write_key_files(files: &[KeyFile]) -> Result<Vec<PathBuf>, String> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("reading /proc/self/mountinfo: {e}"))?;
+    let mut written = Vec::new();
+    for file in files {
+        let result = check_key_path(&file.path, &mountinfo).and_then(|()| {
+            write_key_file(Path::new(&file.path), &file.contents)
+                .map_err(|e| format!("writing {}: {e:#}", file.path))
+        });
+        if let Err(reason) = result {
+            for path in &written {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(reason);
+        }
+        written.push(PathBuf::from(&file.path));
+    }
+    Ok(written)
+}
+
+fn write_key_file(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    let _ = std::fs::remove_file(path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(path)?;
+    std::io::Write::write_all(&mut file, contents)?;
+    Ok(())
 }

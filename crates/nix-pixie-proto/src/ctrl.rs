@@ -37,7 +37,10 @@
 //! arrives, the controller knows the target finished pairing and can close the
 //! connection without cutting it off mid-handshake.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::inventory::Inventory;
 
@@ -118,8 +121,12 @@ pub enum ControllerMsg {
         labels: Vec<String>,
     },
     /// Run this disko script (destroy, format, mount), already pushed into
-    /// the live store. Only after `DisksReady`.
-    RunDisko { script: String },
+    /// the live store, with `key_files` in place for it. Only after
+    /// `DisksReady`.
+    RunDisko {
+        script: String,
+        key_files: Vec<KeyFile>,
+    },
     /// Generate an ed25519 SSH host key for the installed system (pull
     /// mode). It stays on the installer's tmpfs until `Install`.
     GenerateHostKey,
@@ -139,6 +146,26 @@ pub enum ControllerMsg {
         zpools: Vec<String>,
         then: Shutdown,
     },
+}
+
+/// A key disko reads from a file on the target while formatting encrypted
+/// devices (e.g. a LUKS `passwordFile`). The agent keeps it in RAM only for
+/// the disko run. The contents are wiped from memory when dropped and never
+/// shown by `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyFile {
+    /// Absolute path on the target, under `/tmp` or `/run`.
+    pub path: String,
+    pub contents: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for KeyFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyFile")
+            .field("path", &self.path)
+            .field("contents", &format_args!("<{} bytes>", self.contents.len()))
+            .finish()
+    }
 }
 
 /// How the target goes down after the install.

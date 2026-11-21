@@ -14,7 +14,7 @@ use mdns_sd::ServiceEvent;
 use nix_pixie_proto::announce::{Announcement, Pairing};
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::ctrl::{
-    ControllerMsg, DiskAssignment, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, Shutdown,
+    ControllerMsg, DiskAssignment, KeyFile, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, Shutdown,
     StreamRequest, TargetMsg,
 };
 use nix_pixie_proto::frame::{read_frame, write_frame};
@@ -378,8 +378,8 @@ async fn serve_controller(
                     }
                 }
             }
-            ControllerMsg::RunDisko { script } => {
-                run_disko(state, stream, &script, prepared.take()).await?
+            ControllerMsg::RunDisko { script, key_files } => {
+                run_disko(state, stream, &script, &key_files, prepared.take()).await?
             }
             ControllerMsg::GenerateHostKey => generate_host_key(state).await,
             ControllerMsg::Install {
@@ -510,6 +510,7 @@ async fn run_disko(
     state: &StateDir,
     stream: &mut Stream,
     script: &str,
+    key_files: &[KeyFile],
     prepared: Option<Vec<DiskAssignment>>,
 ) -> Result<TargetMsg> {
     let Some(disks) = prepared else {
@@ -518,15 +519,17 @@ async fn run_disko(
         });
     };
     println!("\n    Formatting...\n");
-    Ok(match disko::run(state, stream, script, &disks).await? {
-        Ok(()) => {
-            println!("\n    Formatted and mounted.\n");
-            TargetMsg::DiskoDone
-        }
-        Err(error) => {
-            warn!(%error, "disko");
-            println!("\n    Formatting failed: {error}\n");
-            TargetMsg::DiskoFailed { error }
-        }
-    })
+    Ok(
+        match disko::run(state, stream, script, &disks, key_files).await? {
+            Ok(()) => {
+                println!("\n    Formatted and mounted.\n");
+                TargetMsg::DiskoDone
+            }
+            Err(error) => {
+                warn!(%error, "disko");
+                println!("\n    Formatting failed: {error}\n");
+                TargetMsg::DiskoFailed { error }
+            }
+        },
+    )
 }
