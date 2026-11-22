@@ -182,7 +182,8 @@ pkgs.testers.runNixOSTest {
         )
         result = controller.succeed("systemctl show -P Result pixie-install").strip()
         output = install_output()
-        assert result == "success", f"{result}:\n{output}"
+        print(output)
+        assert result == "success", result
         # The result is the last JSON line (under `script`, stderr is mixed in).
         report = json.loads(next(l for l in reversed(output.splitlines()) if l.lstrip().startswith("{")))
         print(json.dumps(report, indent=2))
