@@ -16,7 +16,9 @@ we build on them.
 | NetworkManager on the operator's machine (direct cable) | behaviour pinned down, mitigation documented | `checks.vm-link-local` |
 | Agent service (target-shown code, rotation) | done | `checks.vm-pairing` |
 | Controller `id` / `pair` / `serve` (scriptable, no TUI yet) | done | `checks.vm-pairing` |
-| Installer ISO (`packages.installer-iso`) | builds and boots; code on tty1 | booted in QEMU by hand; no automated ISO boot test yet |
+| Installer ISO (`packages.installer-iso`) | builds, boots with UEFI, installs | `checks.vm-iso-uefi` (the image plus the test backdoor, link-local only); BIOS boot of the ISO only by hand |
+| UEFI with systemd-boot (EFI system partition, boot entry in the firmware's variables) | done | `checks.vm-iso-uefi` |
+| Preflight: boot loader vs the firmware the installer booted with | done | unit tests |
 | Inventory, matching against the flake's `pixie` hints, approval/rejection, facter report into the repo (`git add`) | done (scriptable `controller pair`; TUI later) | `checks.vm-inventory` |
 | Store push into the target's disk (`--push`, stock Nix worker protocol, never into RAM) | done | `checks.vm-push` (512 MiB under a 192 MiB memory cap; a whole system) |
 | Disk selection (pinned, agnostic, fixed), disko, system pushed into the mounted root (`controller install`) | done | `checks.vm-disko`, `checks.eval-disks`, unit tests of the disk plan |
@@ -350,7 +352,9 @@ target boots ─► network (DHCP | IPv4LL | IPv6LL) ─► DNS-SD ─► pair �
   - no other disk carries partition labels or pool names the layout creates
     (implemented, see Disks)
   - bootloader vs firmware (systemd-boot/lanzaboote config on a BIOS machine
-    can't boot)
+    can't boot). Implemented: systemd-boot, lanzaboote, EFI-only GRUB and
+    `canTouchEfiVariables` are refused when the installer booted with BIOS;
+    BIOS-only GRUB is refused when it booted with UEFI (it would need CSM).
   - lanzaboote with Secure Boot not in setup mode → plan a wait step
   - number of disks the disko config needs vs selected
   - fixed partition sizes vs disk size
@@ -739,7 +743,10 @@ NixOS VM tests are the backbone. They cover:
 - pinned and agnostic disks (done: `checks.vm-disko`)
 - each disk layout installed and booted from its own disks, with the host
   key check (done: `checks.vm-install-<layout>`, layouts in
-  `nix/tests/layouts.nix`); BIOS GRUB only, UEFI and Secure Boot still to do
+  `nix/tests/layouts.nix`, BIOS GRUB)
+- the shipped installer ISO booted with UEFI, installing systemd-boot, the
+  firmware then booting the disk (done: `checks.vm-iso-uefi`); Secure Boot
+  still to do
 - pull-mode rekey (agenix-rekey fixture)
 - interrupted push + resume
 
@@ -747,8 +754,8 @@ Running them: `checks [PATTERN]` in the devshell builds the matching checks
 `JOBS` at a time (default 2). Evaluating a VM test takes about 1.4 GiB, and
 `nix flake check` evaluates all of them in one process, which needs more
 memory than a busy machine has; `checks` evaluates each on its own first.
-A layout test takes about 3 minutes and about 3 GiB while it runs; all
-twenty checks take about 25 minutes with `JOBS=2`. The install tests fail
+A layout test takes 2 to 4 minutes and about 3 GiB while it runs; all
+twenty-one checks take about 30 minutes with `JOBS=2`. The install tests fail
 as soon as the install fails instead of waiting out their timeouts.
 
 ## Future ideas
