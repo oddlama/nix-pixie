@@ -24,6 +24,7 @@ pub mod metadata;
 pub mod net;
 pub mod nixos;
 pub mod plan;
+pub mod preflight;
 pub mod probe;
 pub mod push;
 pub mod secrets;

@@ -28,6 +28,7 @@ use crate::identity;
 use crate::metadata::{self, HostKeyMode, Machine, Metadata};
 use crate::net::{self, Stream, sanitise};
 use crate::plan::{self, Choice, Resolution};
+use crate::preflight;
 use crate::push;
 use crate::secrets;
 use crate::system::{Built, Configuration, Disko, Ssh};
@@ -290,6 +291,7 @@ async fn prepare(
             sanitise(&inventory.system, 32)
         );
     }
+    preflight::check_boot(&facts.boot, &inventory.firmware, &machine.configuration)?;
     let host_key = match (pulled, &facts.ssh.host_key_path) {
         (None, _) => None,
         (Some(key), Some(path)) => Some((key, path.clone())),

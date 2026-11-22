@@ -58,6 +58,18 @@ const FACTS: &str = r#"config: {
           inherit zfs;
         };
     } else null;
+  boot =
+    let
+      loader = config.boot.loader;
+      grubDevices = builtins.concatMap (m: m.devices) loader.grub.mirroredBoots;
+    in {
+      systemdBoot = loader.systemd-boot.enable;
+      lanzaboote = config.boot.lanzaboote.enable or false;
+      grub = loader.grub.enable;
+      grubEfi = loader.grub.efiSupport;
+      grubBios = builtins.any (d: d != "nodev") grubDevices;
+      efiVariables = loader.efi.canTouchEfiVariables;
+    };
   ssh = {
     inherit (config.services.openssh) enable ports;
     hostKeyPath =
@@ -80,7 +92,29 @@ pub struct Facts {
     pub system: String,
     /// `None` when the configuration doesn't import disko.
     pub disko: Option<Disko>,
+    pub boot: Boot,
     pub ssh: Ssh,
+}
+
+/// The configuration's boot loaders, as far as the firmware matters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent options of the configuration"
+)]
+pub struct Boot {
+    pub systemd_boot: bool,
+    /// lanzaboote (Secure Boot), if its module is imported.
+    pub lanzaboote: bool,
+    pub grub: bool,
+    /// GRUB installs an EFI binary.
+    pub grub_efi: bool,
+    /// GRUB installs to at least one disk's boot sector (BIOS).
+    pub grub_bios: bool,
+    /// `boot.loader.efi.canTouchEfiVariables`: writes boot entries into the
+    /// firmware's variables.
+    pub efi_variables: bool,
 }
 
 /// The configuration's SSH server.
