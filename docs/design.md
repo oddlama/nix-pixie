@@ -146,8 +146,11 @@ flake evaluation, hooks and secret decryption running as root.
     copies the workspace `[lints]` into the crates, because dream2nix can't
     vendor git crates that inherit them. The branch name has no `/`: dream2nix
     copies the URL-encoded branch from `Cargo.lock` into cargo's source
-    replacement, which then doesn't match. Drop the fork once upstream releases
-    a fix. Our discovery knows the scope id (probe replies and mDNS records
+    replacement, which then doesn't match. The analysis is posted on
+    iroh#4584. Once it has `ready-for-pr`, propose the first two commits
+    upstream (`git push origin nix-pixie-link-local~1:refs/heads/link-local-scope-id`
+    in the fork); the lints commit is only for us. Drop the fork once upstream
+    releases a fix. Our discovery knows the scope id (probe replies and mDNS records
     carry the interface they arrived on), so iroh needs nothing else.
   - **NetworkManager's default wired profile** fails the activation every 45 s
     when no DHCP lease arrives, and each time *deletes the link-local address*,

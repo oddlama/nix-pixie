@@ -197,8 +197,6 @@
 
             treefmt = {
               projectRootFile = "flake.nix";
-              # Local-only patched dependencies; never reformat them.
-              settings.global.excludes = [ "vendor/**" ];
               programs = {
                 deadnix.enable = true;
                 nixfmt.enable = true;
