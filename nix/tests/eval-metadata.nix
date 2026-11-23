@@ -161,6 +161,29 @@ let
     };
   };
 
+  # agenixRekey.hostPubkey, against an option like agenix-rekey's
+  # `age.rekey.hostPubkey` (modules/agenix-rekey.nix): a path is read, the
+  # default is a dummy key.
+  dummyPubkey = "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq";
+  hostPubkey =
+    definition:
+    (lib.evalModules {
+      modules = [
+        {
+          options.hostPubkey = lib.mkOption {
+            type = with lib.types; coercedTo path (x: if builtins.isPath x then builtins.readFile x else x) str;
+            default = dummyPubkey;
+          };
+          config.hostPubkey = definition;
+        }
+      ];
+    }).config.hostPubkey;
+  pubkeys = {
+    # A pulled key, as the controller records it.
+    recorded = hostPubkey (pixieLib.agenixRekey.hostPubkey ./host.pub);
+    notYet = hostPubkey (pixieLib.agenixRekey.hostPubkey ./does-not-exist.pub);
+  };
+
   # pinnedDisk: the recorded disk, else the role path; also before the file exists.
   disksFile = builtins.toFile "disks.json" (json {
     main = "/dev/disk/by-id/nvme-Example_SSD_1234";
@@ -189,4 +212,10 @@ assert lib.assertMsg (
   unexpectedSuccesses == [ ]
 ) "these invalid configurations evaluated: ${lib.concatStringsSep ", " unexpectedSuccesses}";
 assert lib.assertMsg (pinned == expectedPinned) "pinnedDisk returned ${json pinned}";
+assert lib.assertMsg (
+  pubkeys == {
+    recorded = builtins.readFile ./host.pub;
+    notYet = dummyPubkey;
+  }
+) "agenixRekey.hostPubkey gave ${json pubkeys}";
 pkgs.writeText "eval-metadata.json" (json viaLib)

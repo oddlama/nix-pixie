@@ -147,7 +147,8 @@ let
             description = ''
               Pull mode: where the controller records the public key, relative
               to the flake root, before building, so the configuration (or a
-              rekeying hook) can use it.
+              rekeying hook) can use it. With agenix-rekey, read it with
+              `age.rekey.hostPubkey = nix-pixie.lib.agenixRekey.hostPubkey ./<this path>;`.
             '';
           };
         };

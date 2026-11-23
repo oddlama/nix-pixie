@@ -646,9 +646,14 @@ the repository, at points of the install.
   touches the target's `/nix/store`. Placed files are zeroized in memory
   and redacted from `Debug` output.
 - **Presets:** `lib.hooks.agenixRekey { command ? "agenix-rekey"; }` runs
-  `agenix rekey --add-to-git` after `host-key` and before `build`. The
-  configuration's `age.rekey.hostPubkey` should read the file at
-  `hostKey.publicKeyPath`.
+  `agenix rekey --add-to-git` after `host-key` and before `build`; the
+  command is a package in the user's flake, e.g. `config.agenix-rekey.package`
+  from agenix-rekey's flake-parts module. The configuration reads the
+  pulled key with `age.rekey.hostPubkey = nix-pixie.lib.agenixRekey.hostPubkey
+  ./<hostKey.publicKeyPath>;`. Until the first install recorded it, that
+  leaves agenix-rekey's own default (a dummy key it warns about), so the
+  configuration evaluates and builds before, like `lib.pinnedDisk` for
+  disks.
 - **Not yet:**
   - helpers on the hooks' PATH: `nix-pixie target exec [--chroot] -- …` (run
     a command on the target, e.g. `systemd-cryptenroll`, `sbctl

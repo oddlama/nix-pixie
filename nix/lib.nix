@@ -48,11 +48,24 @@ in
 {
   inherit metadataVersion optionsModule mkMetadata;
 
+  # For configurations that use agenix-rekey (https://github.com/oddlama/agenix-rekey).
+  agenixRekey = {
+    # Pull mode: the host's public key as the controller recorded it at the
+    # machine's `hostKey.publicKeyPath` (pass that same file). Until the first
+    # install recorded it, agenix-rekey's own default, a dummy key it warns
+    # about, so the configuration evaluates and builds before. A definition
+    # for the option, not a plain value:
+    #
+    #   age.rekey.hostPubkey =
+    #     nix-pixie.lib.agenixRekey.hostPubkey ./machines/web1/ssh_host_ed25519_key.pub;
+    hostPubkey = file: lib.mkIf (builtins.pathExists file) file;
+  };
+
   # Hooks to use as `hooks.<name> = ...`.
   hooks = {
-    # agenix-rekey (https://github.com/oddlama/agenix-rekey): rekey the
-    # secrets after the target's host key is pulled (and recorded where the
-    # configuration's `age.rekey.hostPubkey` reads it), before the build.
+    # agenix-rekey: rekey the secrets after the target's host key is pulled
+    # and recorded, before the build. The configuration reads the key with
+    # `agenixRekey.hostPubkey` above.
     # `command` runs the agenix-rekey CLI from your flake, e.g. a package
     # `agenix-rekey = config.agenix-rekey.package` with its flake-parts module.
     agenixRekey =
