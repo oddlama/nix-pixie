@@ -31,7 +31,8 @@ we build on them.
 | Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
 | Host keys: push mode (from a hook, stored on the target, checked after boot) | done | `checks.vm-install-luks-scripted` |
 | Long sessions across link-local flaps | not verified | needs the store push |
-| Targets on other networks (`--target HOST`, unicast probes) running the agent package on a stock NixOS live system (`nix run …#agent`) | done; the target must be reachable on UDP 47011/47012 (no NAT traversal) | `checks.vm-remote` (target behind a router with its default firewall; plain NixOS, none of our modules) |
+| Targets on other networks (`--target HOST`, unicast probes) running the agent package on a stock NixOS live system (`nix run …#agent`) | done; this way the target must be reachable on UDP 47011/47012 | `checks.vm-remote` (target behind a router with its default firewall; plain NixOS, none of our modules) |
+| Targets nobody can connect to (NAT, closed firewall): found at a relay with only the code, then a direct path where one can be punched. n0's public relays by default, `--relay URL` for others, `--no-relay` for none | done for target-shown codes | `checks.vm-relay` (no open ports; first a whole install through the relay with no route at all, then one over a punched path, with the host key checked after boot); by hand through n0's relay between two NATed network namespaces |
 | Online guessing: rotation after 3 spent guesses, backing off 2 s doubling to 60 s | done | unit tests of the delay, `checks.vm-pairing` |
 
 ## Goal
@@ -62,10 +63,11 @@ or opinions.
 | Facter | Supported (opt-in) |
 | Building | Controller only coordinates; building uses whatever the host has (binfmt, remote builders, trebuchet…). Clear errors on arch mismatch |
 | Physical steps | Controller enters wait mode and notifies until the user finishes the step |
-| Network | mDNS/DNS-SD + probes + iroh; optional DHCP server for direct-cable setups; fully airgapped must work |
+| Network | mDNS/DNS-SD + probes + iroh, and a relay for targets on other networks; optional DHCP server for direct-cable setups; fully airgapped must work |
 | Operator's firewall | Needs no open ports. The controller only dials out (see §1) |
 | License | MIT |
-| Scope v1 | LAN and airgapped, plus targets the controller can reach by address (`--target`, e.g. a server on the internet). Pairing through NAT is recorded under [Future ideas](#future-ideas) |
+| Scope v1 | LAN and airgapped; targets the controller can reach by address (`--target`, e.g. a server on the internet); and targets it can't reach at all, through a relay both connect to (§1) |
+| Relays | n0's public iroh relays unless told otherwise; any `iroh-relay` can be used instead, or none |
 | Default pairing | Mode 3 (target shows code, operator types it on the controller). Mode 2 (controller shows code) also available |
 | Auto-approve | Not in v1. Match hints only pre-select a configuration; a human always approves |
 | Name | nix-pixie (binary `nix-pixie`) |
@@ -94,9 +96,11 @@ flake evaluation, hooks and secret decryption running as root.
   controller always dials. Pairing roles are about who *owns the code*, not
   who opened the connection (§2). So the operator's machine needs no open
   ports, which matters because we can't change its firewall.
-- **Discovery, two ways, merged** (`crates/nix-pixie/src/{discovery,mdns,probe}.rs`).
-  Both carry the same `Announcement` (endpoint id, iroh port, pairing state,
-  label; `nix-pixie-proto/src/announce.rs`):
+- **Discovery on the local network, two ways, merged**
+  (`crates/nix-pixie/src/{discovery,mdns,probe}.rs`). Both carry the same
+  `Announcement` (endpoint id, iroh port, pairing state, label;
+  `nix-pixie-proto/src/announce.rs`), and so does the third way, for other
+  networks ([Relays](#relays-targets-nobody-can-connect-to)):
   - **DNS-SD** `_nix-pixie._udp.local` via `mdns-sd`. On the controller this
     only works if its firewall lets mDNS replies in. A stateful firewall drops
     them: replies to a multicast query come from the responder's unicast
@@ -135,8 +139,24 @@ flake evaluation, hooks and secret decryption running as root.
   - A pairing attempt that broke before any guess was spent (lost connection,
     timeout) is retried when new addresses show up. Wrong codes, wrong roles
     and wrong versions are final.
-- **Airgapped:** relays and n0 address lookup disabled (`presets::Minimal`),
-  so iroh never contacts anything outside the LAN.
+- **Airgapped:** nothing here needs anything outside the LAN. The relays
+  (next section) are tried and, when out of reach, ignored: `checks.vm-pairing`
+  and every install test run that way, since test VMs have no internet. With
+  `--no-relay` on both sides iroh contacts nothing but the peer. n0's address
+  lookup (which would publish endpoints in DNS) is never used
+  (`presets::Minimal`).
+- **Names of relays are looked up by the system's resolver** (`getaddrinfo`,
+  so `/etc/nsswitch.conf` counts), not by iroh's own (`dns.rs`). iroh's asks
+  Cloudflare, Google and Quad9 when the system's name servers don't answer,
+  and opens a socket per datagram: where no name server answers at all, an
+  agent with the default relays held about 600 sockets at a time (870 seen),
+  every half minute. With the usual limit of 1024 open files, pairings and
+  approvals that fell into such a burst failed with "Too many open files".
+  Now each name is looked up by one thread at a time, however often iroh
+  asks, and the same agent stays at about 20 open files
+  (`checks.vm-pairing`). Addresses that were found are handed out again for
+  30 s, because the system's resolver may need longer to succeed than the 3 s
+  iroh waits before it asks again.
 - **Direct cable (laptop ↔ switch ↔ server) needs no DHCP for pairing.** The
   installer brings up IPv4 and IPv6 link-local on all wired links (networkd
   `LinkLocalAddressing=yes`). Findings, all in `checks.vm-link-local`:
@@ -182,14 +202,95 @@ flake evaluation, hooks and secret decryption running as root.
   still only dials out. The target must be reachable on UDP 47011 and 47012:
   a server with a public address, or one behind a VPN or port forwarding.
   The probe reply is shorter than the (padded) probe, so an agent on the
-  internet is no amplifier. Targets behind NAT that can't be reached are
-  [Future ideas](#future-ideas).
+  internet is no amplifier. `--target` turns the relays off: the address is
+  all it needs.
 
-### Why not piggyback on magic-wormhole
+### Relays: targets nobody can connect to
+
+A target behind NAT, or behind a firewall nobody opened, can't be probed.
+What both sides can do is connect *out*, to a relay: an iroh relay forwards
+packets between the endpoints connected to it (over HTTPS), addressed by
+endpoint id, without being able to read them. So the controller could dial
+the target through a relay, if it knew the target's endpoint id. All it has
+is the code. (`crates/nix-pixie/src/rendezvous.rs`,
+`nix-pixie-proto/src/rendezvous.rs`)
+
+- **The rendezvous.** While a target shows a code, it runs a second iroh
+  endpoint whose *secret* key is `SHA-256("nix-pixie rendezvous 1\0" ||
+  nameplate)`. The controller derives the same key from the nameplate the
+  operator typed, so it knows that endpoint's id, dials it through the
+  relays, and reads one short stream: the target's announcement, the same
+  one DNS-SD and probes carry. From there on nothing is new: `Discovery`
+  merges it as a third source, the controller dials the announced endpoint
+  (through the relays, and at any addresses the LAN methods found), and
+  SPAKE2 decides whether it is the right machine.
+- **Nothing but a relay is needed.** No mailbox server, no DNS or pkarr
+  records, no DHT. So one self-hosted `iroh-relay` replaces n0's entirely.
+- **Unauthenticated on purpose.** The rendezvous key is derived from the
+  public half of the code, so anyone can sit at a rendezvous and answer.
+  That is a forged announcement, as on a LAN: the controller dials the
+  wrong machine, pairing fails, and after 3 such machines it stops and says
+  that someone may be impersonating targets. The secret words take no part,
+  so neither the relay nor an impostor learns anything that helps guessing
+  them.
+- **Six-digit nameplates.** On a LAN a target sees which nameplates are
+  taken; at a relay nobody can list them, so a random one has to be unlikely
+  to collide: 100000 to 999999. A relay hands an endpoint id to whoever
+  connected under it last, so two targets with the same nameplate would
+  displace each other (the controller keeps asking and tries everyone who
+  answers). A target without relays keeps the short ones (1–99), and the
+  number of digits tells the controller where to look: for a short
+  nameplate it contacts no relay at all.
+- **Which relays.** n0's public ones unless told otherwise. `--relay URL`
+  (repeatable) on `agent` and on `controller pair|install`, or
+  `services.nix-pixie-agent.relay.urls`, names others; `--no-relay` or
+  `relay.enable = false` uses none. Both sides need the same setting,
+  because the controller asks at every relay of *its* setting. A target
+  with other relays than the default prints them with its code:
+  `nix-pixie controller pair --code … --relay https://…`.
+- **What a relay learns:** who talks to whom (endpoint ids, IP addresses,
+  volume, timing), and that it is nix-pixie (the protocol name is in the
+  QUIC handshake, which is only protected against observers who don't see
+  its first packet). Not the code's words, the inventory, keys or the
+  system: all of that is inside the end-to-end encrypted connection. It can
+  also see which nameplates are waiting, and so can anyone willing to try
+  all 900,000; what they get is a machine to guess codes at, three per code
+  with growing pauses (§2).
+- **No relay in reach** (airgapped, or a captive network): the code shows
+  right away, the agent logs after 15 s that only controllers on its network
+  will find it, and keeps trying. The controller's error lists the relays
+  next to DNS-SD and probes: `relay: this machine reached none of n0's
+  public relays`, or `no target waiting at …`.
+- **Direct paths.** Through the relay the two exchange their addresses and
+  send to each other at the same time, which opens NAT mappings and stateful
+  firewalls for the answers; the connection then moves to that path. The
+  approval shows which it is (`Paired with web1 (relayed through
+  https://…)`, or the address), the JSON result has `route` (`direct` or
+  `relay`), and before the system is sent the controller warns if it would
+  still go through the relay. n0's relays throttle (seen from behind NAT:
+  "the relay is rate-limiting this endpoint"), so an install through one is
+  slow. With an own relay that is your bandwidth to spend.
+- **After the install** the controller looks for the installed system's
+  SSH server where it found the installer (§3). A target found only at a
+  relay has no such address. The one a direct path leads to may be a NAT's,
+  and whatever answers SSH there is another machine: a false "host key
+  mismatch" at best. So the controller asks the target for its interfaces'
+  addresses (`RequestAddresses`) and checks the host key at the path's
+  address only if the target has it itself, as a server with a public
+  address does. Otherwise it doesn't wait, says why, and prints the key to
+  expect (`hostKey.skipped` and `hostKey.expected` in the result); hooks
+  after `boot` don't run then.
+- **Controller codes** (mode 2) have no nameplate, so `controller serve` and
+  `agent --controller-code` use no relay ([Future ideas](#future-ideas)).
+
+### Why not magic-wormhole itself
+
+The relay rendezvous is the wormhole idea (a public nameplate to meet at,
+secret words for the PAKE) on infrastructure we need anyway. The protocol
+itself didn't fit:
 
 - It needs its mailbox server, which by default is on the internet. That
-  breaks airgapped installs. Embedding a mailbox server on the LAN just
-  re-implements what we already have with DNS-SD.
+  breaks airgapped installs; on a LAN, DNS-SD and probes need no server.
 - Wormhole codes are single-use per pair. The controller code is reused by
   many targets.
 - We would still need iroh for data and a channel binding between the two
@@ -222,9 +323,10 @@ id, then the operator approves on the controller.
    announces "I typed a controller code". The controller finds such targets
    and dials them, and runs SPAKE2 as the code owner.
 3. **Target code (default when the target has a screen).** The target
-   shows `42-river-candle-moss`. `42` is a public nameplate in the target's
-   DNS-SD TXT record; the words are secret. The operator types it into the
-   controller TUI. Benefits:
+   shows `482913-river-candle-moss`. `482913` is a public nameplate, in the
+   target's announcement and the name of its rendezvous at the relay; the
+   words are secret. The operator types it into the controller TUI.
+   Benefits:
    - The target needs no keyboard.
    - The code is single-use and tied to exactly one machine.
    - The operator types on their own keyboard layout (see below).
@@ -269,14 +371,16 @@ Implemented in `crates/nix-pixie-proto/src/pair.rs`.
   locking out avoids a permanent DoS. Timeouts and protocol errors don't count,
   since they reveal nothing.
 - **Backing off between codes.** On a LAN, guessing needs a machine on that
-  network. An agent on the internet (`--target`) can be dialled by anyone, and
+  network. An agent on the internet (`--target`) or at a relay can be
+  dialled by anyone, and
   rotation alone only bounds guesses by how fast pairing round trips go. So
   the owner waits before showing the next code: 2 s, doubling up to 60 s.
   That leaves 3 guesses a minute, about 1 in 500,000 per day of the agent
   running. An operator who mistyped three times waits 2 s.
-- **Nameplates** are 1–99. A target surveys DNS-SD for 2 s and picks an
-  unused one. Collisions are still possible, so the controller tries every
-  target with that nameplate.
+- **Nameplates** are 1–99 for a target without relays, which surveys DNS-SD
+  for 2 s and picks an unused one, and six digits for a target that also
+  waits at a relay (§1). Collisions are still possible, so the controller
+  tries every target with that nameplate.
 - **No emoji SAS.** The Linux VT (fbcon) can't render emoji. With PAKE plus
   approval a SAS adds nothing, and mode 3 already covers screen-without-
   keyboard machines.
@@ -405,7 +509,8 @@ target boots ─► network (DHCP | IPv4LL | IPv6LL) ─► DNS-SD ─► pair �
     expected one fails at once with HOST KEY MISMATCH. In mode `none` the
     new key is reported, unverified. Skipped if the configuration doesn't
     enable sshd. The result is `hostKey` in the JSON; exit status 1 if the
-    check fails.
+    check fails. For targets found only at a relay, see
+    [Relays](#relays-targets-nobody-can-connect-to).
 - **Persistence:** a session journal (no secrets) in
   `$XDG_STATE_HOME/nix-pixie/sessions/`. A controller restart resumes. The
   agent reconnects using the pinned keys, and store pushes are idempotent per
@@ -705,6 +810,9 @@ UDP 47011/47012/5353). Boots to tty1 with the pairing code, about 10 s after
 the boot menu in QEMU. The code is printed by the agent's service onto the
 console, next to the autologin prompt, until the tty1 UI exists.
 `nixosModules.installer` works in any custom live image.
+`services.nix-pixie-agent.relay.{enable,urls}` chooses the relays (§1); with
+`openFirewall = false` and a relay in reach, the image opens no ports at
+all.
 
 **Stock live systems** (`packages.<system>.agent`): where only the
 provider's NixOS ISO boots (Hetzner Cloud, say), the operator runs
@@ -726,6 +834,11 @@ github:oddlama/nix-pixie#agent` on its console. That's the agent as
 
 The system must bring Nix and, for the respective layouts, ZFS and mdadm's
 udev rules; the stock NixOS ISO has all of them.
+
+The agent's flags pass through (`… run github:oddlama/nix-pixie#agent --
+--relay URL`). It waits at the relays like the installer, so the code alone
+finds it; the open ports then are what gives a controller behind NAT a
+direct path to a server with a public address, without any hole punching.
 
 - Extends `installation-cd-minimal` and `netboot-minimal` and adds:
   - the agent service, plus agent UI on tty1 (pairing code, status, logs)
@@ -828,6 +941,9 @@ NixOS VM tests are the backbone. They cover:
 - controller + target over a private VLAN without internet (airgapped)
 - RAM-limited target with a closure bigger than its RAM
 - each pairing mode, including a MITM relay attempt that must fail
+- a target with no open ports on another network, found at a relay and
+  installed through it, then again over a direct path with the host key
+  check (done: `checks.vm-relay`, with nixpkgs' `iroh-relay` in a VM)
 - pinned and agnostic disks (done: `checks.vm-disko`)
 - each disk layout installed and booted from its own disks, with the host
   key check (done: `checks.vm-install-<layout>`, layouts in
@@ -843,7 +959,7 @@ Running them: `checks [PATTERN]` in the devshell builds the matching checks
 `nix flake check` evaluates all of them in one process, which needs more
 memory than a busy machine has; `checks` evaluates each on its own first.
 A layout test takes 2 to 4 minutes and about 3 GiB while it runs; all
-twenty-three checks take about 25 minutes with `JOBS=2`. The install tests fail
+twenty-five checks take about 25 minutes with `JOBS=2`. The install tests fail
 as soon as the install fails instead of waiting out their timeouts.
 
 ## Future ideas
@@ -855,15 +971,19 @@ Not in v1. Recorded so the v1 design doesn't block them.
   refuses today (keys come from files: hooks or the controller's
   terminal).
 
-- **Pairing through NAT.** `--target` covers targets the controller can
-  reach. For the rest: the controller publishes its endpoint id via pkarr on the
-  mainline DHT (`iroh-mainline-address-lookup`) under a key derived from the
-  code with an expensive KDF. Relays enabled. An attacker who brute-forces
-  the lookup key only learns an address: they still have to beat the PAKE,
-  and the operator still approves. Caveat: whoever knows the code can also
-  *publish* under that key, so a lookup can be redirected. That costs
-  availability, not security (PAKE + channel binding still fail). Alternative:
-  a self-hosted rendezvous (e.g. iroh-lighthouse).
+- **More of the relays.**
+  - Controller codes through a relay: they would need a nameplate of their
+    own, with the controller waiting at the rendezvous instead of the
+    target.
+  - The relays as an option of the `pixie` output, so a flake with its own
+    relay doesn't need `--relay` on every command.
+  - A relay of our own, as a NixOS module (nixpkgs has the `iroh-relay`
+    package but no module), with an access token so it only serves its
+    owner (`RelayMap::with_auth_token`).
+  - Whether a displaced rendezvous (another endpoint connecting under the
+    same id) comes back by itself is untested.
+  - Checking the host key of a target behind NAT: only something on its
+    network could, or the installed system dialing out.
 - **Auto-approve.** Only for baked/PXE images (controller authenticated) and
   only for machines matching a pre-tag. Even then it stays per-machine opt-in,
   because a MAC/DMI match does not authenticate the hardware. Possibly gated
