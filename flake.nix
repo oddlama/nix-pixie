@@ -186,6 +186,12 @@
                   package = config.packages.default;
                   inherit (config.packages) agent;
                 };
+                vm-relay = import ./nix/tests/relay.nix {
+                  inherit pkgs;
+                  inherit (inputs) nixpkgs disko;
+                  package = config.packages.default;
+                  agentModule = ./nix/nixos/agent.nix;
+                };
                 vm-link-local = import ./nix/tests/link-local.nix {
                   inherit pkgs;
                   package = config.packages.default;
