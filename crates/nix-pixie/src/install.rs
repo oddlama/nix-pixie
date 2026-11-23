@@ -93,10 +93,20 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     let programs = if let Some(name) = &args.machine {
         let machine = machine(&metadata, &args.flake, name)?;
         check_push(name, machine)?;
-        let disko = disko_of(&Configuration::new(&args.flake, &machine.configuration)?).await?;
-        plan::check_requested(&disko, machine.disks.file.is_some(), &requested)?;
-        let has_hooks = !machine.hooks.is_empty();
-        secrets::check_available(&secrets::needs(&disko.encryption)?, has_hooks)?;
+        if let Some(report) = missing_facter_report(&args.flake, machine) {
+            // A configuration that reads its facter report can't evaluate
+            // before the first one arrives (after approval); check it then.
+            eprintln!(
+                "Not evaluating nixosConfigurations.{} before pairing: its facter report \
+                 ({report}) isn't there yet.",
+                machine.configuration
+            );
+        } else {
+            let disko = disko_of(&Configuration::new(&args.flake, &machine.configuration)?).await?;
+            plan::check_requested(&disko, machine.disks.file.is_some(), &requested)?;
+            let has_hooks = !machine.hooks.is_empty();
+            secrets::check_available(&secrets::needs(&disko.encryption)?, has_hooks)?;
+        }
         if machine.disks.file.is_some() {
             repo_root(&args.flake)?;
         }
@@ -235,6 +245,14 @@ async fn verify(
     };
     report.insert("hostKey".into(), entry);
     result.map(|_| ())
+}
+
+/// The machine's facter report path, if it wants one and the repository
+/// doesn't have it yet (a first install).
+fn missing_facter_report<'a>(flake: &str, machine: &'a Machine) -> Option<&'a str> {
+    let report = machine.facter.report_path.as_deref()?;
+    let root = metadata::local_flake_dir(flake)?;
+    (!root.join(report).exists()).then_some(report)
 }
 
 /// Push mode needs a hook to provide the key.
