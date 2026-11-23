@@ -122,6 +122,12 @@
                 license = lib.licenses.mit;
               } config.nci.outputs.nix-pixie.packages.release;
 
+              # The agent for live systems that aren't our installer, e.g. a
+              # cloud provider's NixOS ISO: `sudo nix run github:oddlama/nix-pixie#agent`.
+              agent = pkgs.callPackage ./nix/agent-package.nix {
+                nix-pixie = config.packages.default;
+              };
+
               # Boot this on the machine to install; it shows a pairing code.
               installer-iso =
                 (inputs.nixpkgs.lib.nixosSystem {
