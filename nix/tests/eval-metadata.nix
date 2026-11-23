@@ -18,6 +18,13 @@ let
   };
 
   pixieConfig = {
+    hooks = {
+      rekey = pixieLib.hooks.agenixRekey { };
+      notify = {
+        command = "notify";
+        after = [ "boot" ];
+      };
+    };
     machines = {
       web1 = {
         match.mac = [ "AA:BB:CC:DD:EE:FF" ];
@@ -26,13 +33,32 @@ let
           publicKeyPath = "machines/web1/ssh_host_ed25519_key.pub";
         };
         facter.reportPath = "machines/web1/facter.json";
+        # Overrides one option of a hook for every machine.
+        hooks.rekey.args = [ "rekey" ];
       };
       rack-a.configuration = "generic";
       db1 = {
         configuration = "web1";
         disks.file = "machines/db1/disks.json";
+        hooks.notify.enable = false;
       };
     };
+  };
+
+  rekey = {
+    command = "agenix-rekey";
+    args = [
+      "rekey"
+      "--add-to-git"
+    ];
+    after = [ "host-key" ];
+    before = [ "build" ];
+  };
+  notify = {
+    command = "notify";
+    args = [ ];
+    after = [ "boot" ];
+    before = [ ];
   };
 
   viaLib = pixieLib.mkPixie {
@@ -63,6 +89,12 @@ let
           publicKeyPath = "machines/web1/ssh_host_ed25519_key.pub";
         };
         facter.reportPath = "machines/web1/facter.json";
+        hooks = {
+          rekey = rekey // {
+            args = [ "rekey" ];
+          };
+          inherit notify;
+        };
       };
       rack-a = {
         configuration = "generic";
@@ -76,6 +108,7 @@ let
           publicKeyPath = null;
         };
         facter.reportPath = null;
+        hooks = { inherit rekey notify; };
       };
       db1 = {
         configuration = "web1";
@@ -89,6 +122,7 @@ let
           publicKeyPath = null;
         };
         facter.reportPath = null;
+        hooks = { inherit rekey; };
       };
     };
   };
@@ -115,6 +149,11 @@ let
     escaping-public-key-path = pixieLib.mkPixie {
       inherit nixosConfigurations;
       config.machines.web1.hostKey.publicKeyPath = "../web1.pub";
+    };
+    hook-without-command = pixieLib.mkPixie {
+      inherit nixosConfigurations;
+      config.hooks.broken.after = [ "build" ];
+      config.machines.web1 = { };
     };
     absolute-disks-file = pixieLib.mkPixie {
       inherit nixosConfigurations;

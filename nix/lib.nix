@@ -34,6 +34,10 @@ let
           match = machine.match // {
             mac = map lib.toLower machine.match.mac;
           };
+          # Only the enabled ones, without the switch.
+          hooks = lib.mapAttrs (_: hook: removeAttrs hook [ "enable" ]) (
+            lib.filterAttrs (_: hook: hook.enable) machine.hooks
+          );
         };
     in
     {
@@ -43,6 +47,29 @@ let
 in
 {
   inherit metadataVersion optionsModule mkMetadata;
+
+  # Hooks to use as `hooks.<name> = ...`.
+  hooks = {
+    # agenix-rekey (https://github.com/oddlama/agenix-rekey): rekey the
+    # secrets after the target's host key is pulled (and recorded where the
+    # configuration's `age.rekey.hostPubkey` reads it), before the build.
+    # `command` runs the agenix-rekey CLI from your flake, e.g. a package
+    # `agenix-rekey = config.agenix-rekey.package` with its flake-parts module.
+    agenixRekey =
+      {
+        command ? "agenix-rekey",
+      }:
+      {
+        inherit command;
+        args = [
+          "rekey"
+          # Rekeyed secrets in local storage mode must be in git for the build.
+          "--add-to-git"
+        ];
+        after = [ "host-key" ];
+        before = [ "build" ];
+      };
+  };
 
   # Pinned mode: the device for disko disk `name`, as the controller recorded
   # it in `file` (the machine's `disks.file`). Until it has, the disk's

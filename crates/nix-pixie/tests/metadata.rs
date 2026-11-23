@@ -20,6 +20,7 @@ const METADATA: &str = r#"{
             "match": { "mac": ["52:54:00:12:01:02"], "dmiSerial": [] },
             "disks": { "file": "machines/web1/disks.json" },
             "hostKey": { "mode": "none", "publicKeyPath": null },
+            "hooks": {},
             "facter": { "reportPath": "machines/web1/facter.json" }
         },
         "db1": {
@@ -27,6 +28,9 @@ const METADATA: &str = r#"{
             "match": { "mac": [], "dmiSerial": ["SN-42"] },
             "disks": { "file": null },
             "hostKey": { "mode": "pull", "publicKeyPath": "machines/db1/host.pub" },
+            "hooks": {
+                "rekey": { "command": "agenix-rekey", "args": ["rekey"], "after": ["host-key"], "before": ["build"] }
+            },
             "facter": { "reportPath": null }
         }
     }

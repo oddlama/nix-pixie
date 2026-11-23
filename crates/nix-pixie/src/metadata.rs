@@ -29,6 +29,20 @@ pub struct Machine {
     pub disks: Disks,
     pub host_key: HostKey,
     pub facter: Facter,
+    /// Enabled hooks, by name (see `crate::hooks`).
+    pub hooks: BTreeMap<String, Hook>,
+}
+
+/// A program the controller runs at some point of the install.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Hook {
+    /// An app or package of the flake, or an installable with `#`.
+    pub command: String,
+    pub args: Vec<String>,
+    /// Steps or hooks that must be done first.
+    pub after: Vec<String>,
+    /// Steps or hooks that must wait for it.
+    pub before: Vec<String>,
 }
 
 /// Identifiers that suggest a target is this machine. Not authentication:

@@ -4,9 +4,67 @@
 # Everything here ends up in the JSON-serialisable `pixie` flake output that
 # the controller evaluates. Keep it cheap to evaluate: the controller reads it
 # without evaluating any nixosConfiguration.
-{ lib, ... }:
+{ config, lib, ... }:
 let
   inherit (lib) mkOption types;
+  topLevel = config;
+
+  # The install's own steps, in order. Hooks are ordered against them (and
+  # each other); the controller checks the names (`crates/nix-pixie/src/hooks.rs`).
+  steps = "`approve`, `facter`, `host-key`, `disks`, `build`, `format`, `copy`, `install`, `finish`, `boot`";
+
+  hookModule = {
+    options = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Whether the hook runs. `false` drops a hook every machine has for one machine.";
+      };
+      command = mkOption {
+        type = types.str;
+        example = "agenix-rekey";
+        description = ''
+          What the controller runs, with `nix run`: an app or package of the
+          flake with the `pixie` output (a name or attribute path, e.g.
+          `rekey`), or any installable with a `#`. Built before pairing, so a
+          broken hook doesn't cost the pairing code. It runs in the
+          repository, with the operator's terminal; `$PIXIE_CONTEXT` names a
+          JSON file describing the install so far, and files it writes into
+          `$PIXIE_OUT/files/<absolute path>` are put into the installed
+          system (with their modes, owned by root). Hooks that change the
+          repository must `git add` what the build needs.
+        '';
+      };
+      args = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Arguments for the command.";
+      };
+      after = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "host-key" ];
+        description = ''
+          Steps of the install, or other hooks, that must be done before
+          this hook runs. Steps: ${steps}. Hooks always run after `approve`,
+          and as early as their constraints allow.
+        '';
+      };
+      before = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "build" ];
+        description = "Steps or hooks that must wait for this hook. Steps: ${steps}.";
+      };
+    };
+  };
+  hooksOption =
+    description:
+    mkOption {
+      type = types.attrsOf (types.submodule hookModule);
+      default = { };
+      inherit description;
+    };
 
   macAddress = types.strMatching "([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}";
 
@@ -102,13 +160,36 @@ let
             the flake root. `null` disables facter for this machine.
           '';
         };
+
+        hooks = hooksOption ''
+          This machine's hooks, on top of `hooks`. Settings here win over the
+          ones from `hooks`, option by option.
+        '';
       };
+
+      # Every machine gets the hooks for every machine, as defaults.
+      config.hooks = lib.mapAttrs (
+        _: hook:
+        lib.mapAttrs (_: lib.mkDefault) {
+          inherit (hook)
+            enable
+            command
+            args
+            after
+            before
+            ;
+        }
+      ) topLevel.hooks;
     };
 in
 {
-  options.machines = mkOption {
-    type = types.attrsOf (types.submodule machineModule);
-    default = { };
-    description = "Machines nix-pixie can install.";
+  options = {
+    machines = mkOption {
+      type = types.attrsOf (types.submodule machineModule);
+      default = { };
+      description = "Machines nix-pixie can install.";
+    };
+
+    hooks = hooksOption "Hooks for every machine, by name.";
   };
 }
