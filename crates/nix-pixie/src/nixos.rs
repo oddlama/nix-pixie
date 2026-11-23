@@ -48,6 +48,46 @@ pub async fn generate_host_key(state: &StateDir, comment: &str) -> Result<String
     Ok(public.trim().to_string())
 }
 
+/// Push mode: keeps `private` where a generated key would be, for
+/// `install`, and returns its public half. Refuses anything `ssh-keygen`
+/// can't read without a passphrase.
+pub async fn store_host_key(state: &StateDir, private: &[u8]) -> Result<String> {
+    let dir = state.path().join(HOST_KEY_DIR);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let key = dir.join(HOST_KEY);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&key)
+        .context("writing the host key")?;
+    std::io::Write::write_all(&mut file, private)?;
+    drop(file);
+    let output = Command::new("ssh-keygen")
+        .args(["-y", "-f"])
+        .arg(&key)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("running ssh-keygen (is OpenSSH installed?)")?;
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        bail!(
+            "not an OpenSSH private key without a passphrase: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let public = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    std::fs::write(key.with_extension("pub"), format!("{public}\n"))
+        .context("writing the public host key")?;
+    info!("stored the pushed host key");
+    Ok(public)
+}
+
 /// `path` (absolute, as the installed system sees it) below `root`. Refuses
 /// anything that could leave `root`.
 pub fn below_root(root: &str, path: &str) -> Result<PathBuf> {

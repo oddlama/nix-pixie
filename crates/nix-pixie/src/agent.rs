@@ -382,6 +382,17 @@ async fn serve_controller(
                 run_disko(state, stream, &script, &key_files, prepared.take()).await?
             }
             ControllerMsg::GenerateHostKey => generate_host_key(state).await,
+            ControllerMsg::ProvideHostKey { private } => {
+                match nixos::store_host_key(state, &private.0).await {
+                    Ok(public) => TargetMsg::HostKey { public },
+                    Err(e) => {
+                        warn!("pushed host key: {e:#}");
+                        TargetMsg::HostKeyFailed {
+                            error: format!("{e:#}"),
+                        }
+                    }
+                }
+            }
             ControllerMsg::Install {
                 root,
                 system,
@@ -428,7 +439,9 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::PrepareStore { .. } => Some(TargetMsg::StoreRefused { reason }),
         ControllerMsg::PrepareDisks { .. } => Some(TargetMsg::DisksRefused { reason }),
         ControllerMsg::RunDisko { .. } => Some(TargetMsg::DiskoFailed { error: reason }),
-        ControllerMsg::GenerateHostKey => Some(TargetMsg::HostKeyFailed { error: reason }),
+        ControllerMsg::GenerateHostKey | ControllerMsg::ProvideHostKey { .. } => {
+            Some(TargetMsg::HostKeyFailed { error: reason })
+        }
         ControllerMsg::Install { .. } => Some(TargetMsg::InstallFailed { error: reason }),
         ControllerMsg::Finish { .. } => Some(TargetMsg::FinishFailed { error: reason }),
         ControllerMsg::PlaceFiles { .. } => Some(TargetMsg::FilesRefused { reason }),

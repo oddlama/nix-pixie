@@ -153,3 +153,36 @@ fn collects_regular_files_with_their_modes() {
     assert!(err.contains("only regular files"), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn outputs_are_files_disk_keys_and_a_host_key() {
+    use nix_pixie::hooks::collect_outputs;
+
+    let out = std::env::temp_dir().join(format!("nix-pixie-test-outputs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(out.join("files/etc")).unwrap();
+    std::fs::create_dir_all(out.join("disk-keys/tmp")).unwrap();
+    std::fs::write(out.join("files/etc/motd"), b"hi").unwrap();
+    std::fs::write(out.join("disk-keys/tmp/secret.key"), b"secretsecret").unwrap();
+    std::fs::write(out.join("host-key"), b"PRIVATE").unwrap();
+
+    let outputs = collect_outputs(&out).unwrap();
+    assert_eq!(outputs.files.len(), 1);
+    assert_eq!(outputs.files[0].path, "/etc/motd");
+    let keys: Vec<(&str, &[u8])> = outputs
+        .disk_keys
+        .iter()
+        .map(|(p, k)| (p.as_str(), k.as_slice()))
+        .collect();
+    assert_eq!(keys, [("/tmp/secret.key", &b"secretsecret"[..])]);
+    assert_eq!(
+        outputs.host_key.as_deref().map(Vec::as_slice),
+        Some(&b"PRIVATE"[..])
+    );
+
+    // A typo is an error, not silently ignored.
+    std::fs::create_dir(out.join("file")).unwrap();
+    let err = format!("{:#}", collect_outputs(&out).unwrap_err());
+    assert!(err.contains("files/, disk-keys/ and host-key"), "{err}");
+    std::fs::remove_dir_all(&out).unwrap();
+}

@@ -8,6 +8,8 @@
 )]
 
 use nix_pixie::disko::check_key_path;
+use std::collections::BTreeMap;
+
 use nix_pixie::secrets::*;
 use nix_pixie::system::{Encryption, Luks, ZfsKey};
 use nix_pixie_proto::ctrl::{ControllerMsg, KeyFile};
@@ -35,12 +37,17 @@ fn err(encryption: &Encryption) -> String {
     format!("{:#}", needs(encryption).unwrap_err())
 }
 
+fn passphrase(min: usize, max: Option<usize>) -> Kind {
+    Kind::Passphrase { min, max }
+}
+
 #[test]
 fn files_disko_reads_are_needed_once_each() {
     let encryption = Encryption {
         luks: vec![
             Luks {
                 password_file: Some("/tmp/secret.key".into()),
+                additional_key_files: vec!["/run/keys/extra".into()],
                 ..luks("cryptroot")
             },
             Luks {
@@ -49,34 +56,45 @@ fn files_disko_reads_are_needed_once_each() {
             },
         ],
         zfs: vec![
-            zfs("zroot/root", "file:///run/keys/zfs", "passphrase"),
+            zfs("zroot/root", "file:///tmp/secret.key", "passphrase"),
+            zfs("zroot/raw", "file:///run/keys/raw", "raw"),
             // Fetched by zfs itself.
             zfs("zroot/remote", "https://keys.example/zroot", "passphrase"),
         ],
     };
     let found = needs(&encryption).unwrap();
+    let summary: Vec<(&str, Vec<&str>, Kind)> = found
+        .iter()
+        .map(|n| {
+            (
+                n.path.as_str(),
+                n.users.iter().map(String::as_str).collect(),
+                n.kind,
+            )
+        })
+        .collect();
     assert_eq!(
-        found,
+        summary,
         [
-            Need {
-                path: "/run/keys/zfs".into(),
-                users: vec!["ZFS zroot/root".into()],
-                min_len: 8,
-                max_len: Some(512),
-            },
-            Need {
-                path: "/tmp/secret.key".into(),
-                users: vec!["LUKS cryptroot".into(), "LUKS cryptdata".into()],
-                min_len: 1,
-                max_len: None,
-            },
+            (
+                "/run/keys/extra",
+                vec!["LUKS cryptroot"],
+                passphrase(1, None)
+            ),
+            ("/run/keys/raw", vec!["ZFS zroot/raw"], Kind::Raw),
+            (
+                "/tmp/secret.key",
+                vec!["LUKS cryptroot", "LUKS cryptdata", "ZFS zroot/root"],
+                // The strictest of everything that reads it.
+                passphrase(8, Some(512)),
+            ),
         ]
     );
     assert_eq!(needs(&Encryption::default()).unwrap(), []);
 }
 
 #[test]
-fn refuses_what_needs_disko_s_terminal_or_real_key_files() {
+fn refuses_what_needs_disko_s_terminal_and_conflicting_uses() {
     let ask = err(&Encryption {
         luks: vec![Luks {
             ask_password: true,
@@ -95,21 +113,20 @@ fn refuses_what_needs_disko_s_terminal_or_real_key_files() {
     });
     assert!(prompt.contains("postCreateHook"), "{prompt}");
 
-    let raw = err(&Encryption {
-        luks: vec![],
-        zfs: vec![zfs("zroot/root", "file:///tmp/key", "raw")],
-    });
-    assert!(raw.contains("keyformat"), "{raw}");
-
-    let additional = err(&Encryption {
+    let conflict = err(&Encryption {
         luks: vec![Luks {
-            password_file: Some("/tmp/secret.key".into()),
-            additional_key_files: vec!["/tmp/more.key".into()],
+            password_file: Some("/tmp/key".into()),
             ..luks("cryptroot")
         }],
-        zfs: vec![],
+        zfs: vec![zfs("zroot/root", "file:///tmp/key", "raw")],
     });
-    assert!(additional.contains("additionalKeyFiles"), "{additional}");
+    assert!(conflict.contains("/tmp/key is read as"), "{conflict}");
+
+    let unknown = err(&Encryption {
+        luks: vec![],
+        zfs: vec![zfs("zroot/root", "file:///tmp/key", "base64")],
+    });
+    assert!(unknown.contains("base64"), "{unknown}");
 
     let on_disk = err(&Encryption {
         luks: vec![Luks {
@@ -122,23 +139,87 @@ fn refuses_what_needs_disko_s_terminal_or_real_key_files() {
 }
 
 #[test]
-fn passphrase_limits() {
-    let zfs = Need {
-        path: "/tmp/zfs".into(),
+fn keys_must_fit_what_reads_them() {
+    let need = |kind| Need {
+        path: "/tmp/key".into(),
         users: vec![],
-        min_len: 8,
-        max_len: Some(512),
+        kind,
     };
-    assert!(acceptable(&zfs, "short").is_err());
-    assert!(acceptable(&zfs, "long enough").is_ok());
-    assert!(acceptable(&zfs, &"x".repeat(513)).is_err());
-    let luks = Need {
-        min_len: 1,
-        max_len: None,
-        ..zfs
+    let zfs = need(passphrase(8, Some(512)));
+    assert!(check(&zfs, b"short").is_err());
+    assert!(check(&zfs, b"long enough").is_ok());
+    assert!(check(&zfs, &[b'x'; 513]).is_err());
+    let luks = need(passphrase(1, None));
+    assert!(check(&luks, b"").is_err());
+    assert!(check(&luks, &[0, 255, 7]).is_ok(), "any bytes from a hook");
+
+    let raw = need(Kind::Raw);
+    assert!(check(&raw, &[0; 32]).is_ok());
+    assert!(check(&raw, &[0; 33]).is_err());
+    let hex = need(Kind::Hex);
+    let digits = [b'a'; 64];
+    assert!(check(&hex, &digits).is_ok());
+    assert!(check(&hex, &[&digits[..], b"\n"].concat()).is_ok());
+    assert!(check(&hex, &[b'g'; 64]).is_err());
+    assert!(check(&hex, &digits[1..]).is_err());
+
+    assert!(passphrase(1, None).typeable());
+    assert!(!Kind::Raw.typeable() && !Kind::Hex.typeable());
+}
+
+#[tokio::test]
+async fn keys_from_hooks_come_first() {
+    let need = |path: &str, kind| Need {
+        path: path.into(),
+        users: vec!["LUKS cryptroot".into()],
+        kind,
     };
-    assert!(acceptable(&luks, "").is_err());
-    assert!(acceptable(&luks, "x").is_ok());
+    let provided = |list: &[(&str, &[u8])]| {
+        list.iter()
+            .map(|(p, k)| ((*p).to_string(), Zeroizing::new(k.to_vec())))
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    // Everything provided: nothing to ask, and unused keys are dropped.
+    let files = gather(
+        vec![
+            need("/tmp/a", passphrase(1, None)),
+            need("/run/raw", Kind::Raw),
+        ],
+        provided(&[
+            ("/tmp/a", b"secret"),
+            ("/run/raw", &[1; 32]),
+            ("/tmp/unused", b"x"),
+        ]),
+    )
+    .await
+    .unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["/tmp/a", "/run/raw"]);
+
+    let wrong = gather(
+        vec![need("/run/raw", Kind::Raw)],
+        provided(&[("/run/raw", b"short")]),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{wrong:#}").contains("32 bytes"), "{wrong:#}");
+
+    let missing = gather(vec![need("/run/raw", Kind::Raw)], BTreeMap::new())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{missing:#}").contains("$PIXIE_OUT/disk-keys/run/raw"),
+        "{missing:#}"
+    );
+
+    // Without hooks, keys that can't be typed can't come from anywhere.
+    let unavailable = check_available(&[need("/run/raw", Kind::Raw)], false).unwrap_err();
+    assert!(
+        unavailable.to_string().contains("can't be typed"),
+        "{unavailable}"
+    );
+    assert!(check_available(&[need("/run/raw", Kind::Raw)], true).is_ok());
 }
 
 const MOUNTINFO: &str = "\
@@ -185,4 +266,17 @@ fn keys_never_show_in_debug_output() {
         !shown.contains("hunter22") && !shown.contains("104"),
         "{shown}"
     );
+}
+
+#[test]
+fn pushed_host_keys_never_show_in_debug_output() {
+    use nix_pixie_proto::ctrl::Secret;
+    let message = ControllerMsg::ProvideHostKey {
+        private: Secret(Zeroizing::new(
+            b"-----BEGIN OPENSSH PRIVATE KEY-----".to_vec(),
+        )),
+    };
+    let shown = format!("{message:?}");
+    assert!(shown.contains("<35 secret bytes>"), "{shown}");
+    assert!(!shown.contains("OPENSSH"), "{shown}");
 }

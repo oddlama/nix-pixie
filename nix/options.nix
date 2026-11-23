@@ -34,6 +34,13 @@ let
           `$PIXIE_OUT/files/<absolute path>` are put into the installed
           system (with their modes, owned by root). Hooks that change the
           repository must `git add` what the build needs.
+
+          Hooks also provide secrets: `$PIXIE_OUT/disk-keys/<path>` is the
+          key disko reads at `<path>` on the target (e.g. a LUKS
+          `passwordFile`), from hooks that run before `build`; whatever no
+          hook provides is asked for on the terminal. `$PIXIE_OUT/host-key`
+          is the host's private key in push mode, from a hook that runs
+          before `host-key`.
         '';
       };
       args = mkOption {
@@ -132,8 +139,10 @@ let
             description = ''
               `none`: the installed system generates its host key on first
               boot; the controller can only report the key it sees.
-              `push`: the controller provides the host key (not implemented
-              yet; the controller refuses it).
+              `push`: a hook that runs before `host-key` provides the private
+              key (`$PIXIE_OUT/host-key`, OpenSSH format, no passphrase); the
+              installed system gets it like a pulled one, and the controller
+              checks it over SSH after the first boot.
               `pull`: the target generates an ed25519 key right after
               approval, before anything is built, and the installed system
               gets it at the path its `services.openssh.hostKeys` names. The

@@ -1,19 +1,21 @@
-//! Passphrases for encrypted layouts: which key files the disko
-//! configuration reads on the target while formatting, and asking the
-//! operator for them on the terminal.
+//! Encryption keys for the layout: which key files disko reads on the target
+//! while formatting, and where they come from.
 //!
-//! disko can read a passphrase from a file (`passwordFile` and
-//! `settings.keyFile` for LUKS, `keylocation = "file://..."` for ZFS), or ask
-//! on its own terminal (`askPassword`, `keylocation = "prompt"`). The agent
-//! runs disko without a terminal, so only files work: the controller asks
-//! for each, and the agent puts them into RAM for the disko run. Taking them
-//! from scripts instead of a terminal is for later.
+//! disko can read a key from a file (`passwordFile`, `settings.keyFile` and
+//! `additionalKeyFiles` for LUKS, `keylocation = "file://..."` for ZFS), or
+//! ask on its own terminal (`askPassword`, `keylocation = "prompt"`). The
+//! agent runs disko without a terminal, so only files work. Their contents
+//! come from hooks (`$PIXIE_OUT/disk-keys/<path>`), and whatever no hook
+//! provided is asked for on the operator's terminal. The agent puts them
+//! into RAM for the disko run.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io::IsTerminal;
 
 use anyhow::{Context, Result, bail};
 use nix_pixie_proto::ctrl::KeyFile;
+use tracing::warn;
 use zeroize::Zeroizing;
 
 use crate::system::Encryption;
@@ -26,6 +28,34 @@ const ZFS_MAX_PASSPHRASE: usize = 512;
 const KEY_DIRS: [&str; 2] = ["/tmp/", "/run/"];
 const ATTEMPTS: usize = 3;
 
+/// What a key file has to contain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A passphrase or key file: typed in, or any bytes from a hook.
+    Passphrase { min: usize, max: Option<usize> },
+    /// ZFS `keyformat = "raw"`: exactly 32 bytes. Only from a hook.
+    Raw,
+    /// ZFS `keyformat = "hex"`: 64 hex digits. Only from a hook.
+    Hex,
+}
+
+impl Kind {
+    /// Whether the operator can type it in.
+    pub fn typeable(self) -> bool {
+        matches!(self, Self::Passphrase { .. })
+    }
+}
+
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Passphrase { .. } => "passphrase",
+            Self::Raw => "raw (32 bytes)",
+            Self::Hex => "hex (64 digits)",
+        })
+    }
+}
+
 /// A key file the layout needs, and what reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Need {
@@ -33,39 +63,52 @@ pub struct Need {
     pub path: String,
     /// E.g. `LUKS cryptroot`, `ZFS zroot/root`.
     pub users: Vec<String>,
-    /// Shortest acceptable passphrase.
-    pub min_len: usize,
-    /// Longest acceptable passphrase, if there is a limit.
-    pub max_len: Option<usize>,
+    pub kind: Kind,
 }
 
 /// The key files the layout reads while formatting. Refuses setups that
 /// would need disko's own terminal, with what to configure instead.
 pub fn needs(encryption: &Encryption) -> Result<Vec<Need>> {
     let mut needs: BTreeMap<String, Need> = BTreeMap::new();
-    let mut need =
-        |path: &str, user: String, min_len: usize, max_len: Option<usize>| -> Result<()> {
-            if !KEY_DIRS.iter().any(|dir| path.starts_with(dir)) {
-                bail!(
-                    "{user} reads its key from {path}; nix-pixie only puts keys under {} on the \
+    let mut need = |path: &str, user: String, kind: Kind| -> Result<()> {
+        if !KEY_DIRS.iter().any(|dir| path.starts_with(dir)) {
+            bail!(
+                "{user} reads its key from {path}; nix-pixie only puts keys under {} on the \
                  installer, which is in RAM",
-                    KEY_DIRS.join(" or ")
-                );
-            }
-            let entry = needs.entry(path.to_string()).or_insert_with(|| Need {
-                path: path.to_string(),
-                users: Vec::new(),
-                min_len: 1,
-                max_len: None,
-            });
-            entry.users.push(user);
-            entry.min_len = entry.min_len.max(min_len);
-            entry.max_len = match (entry.max_len, max_len) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-            Ok(())
+                KEY_DIRS.join(" or ")
+            );
+        }
+        let Some(entry) = needs.get_mut(path) else {
+            needs.insert(
+                path.to_string(),
+                Need {
+                    path: path.to_string(),
+                    users: vec![user],
+                    kind,
+                },
+            );
+            return Ok(());
         };
+        entry.kind = match (entry.kind, kind) {
+            (Kind::Passphrase { min: a, max: x }, Kind::Passphrase { min: b, max: y }) => {
+                Kind::Passphrase {
+                    min: a.max(b),
+                    max: match (x, y) {
+                        (Some(x), Some(y)) => Some(x.min(y)),
+                        (x, y) => x.or(y),
+                    },
+                }
+            }
+            (a, b) if a == b => a,
+            (a, b) => bail!(
+                "{path} is read as a {a} key by {} and as a {b} key by {user}",
+                entry.users.join(", ")
+            ),
+        };
+        entry.users.push(user);
+        Ok(())
+    };
+    let any = Kind::Passphrase { min: 1, max: None };
 
     for luks in &encryption.luks {
         let user = format!("LUKS {}", luks.name);
@@ -73,19 +116,17 @@ pub fn needs(encryption: &Encryption) -> Result<Vec<Need>> {
             bail!(
                 "{user} has askPassword (disko's default when neither passwordFile nor \
                  settings.keyFile is set), so disko would ask on a terminal the installer \
-                 doesn't give it. Set passwordFile = \"/tmp/secret.key\": nix-pixie asks you for \
-                 the passphrase and puts it there for disko. The installed system still asks for \
-                 it at boot"
+                 doesn't give it. Set passwordFile = \"/tmp/secret.key\": nix-pixie puts the \
+                 passphrase there for disko, from a hook or asked of you. The installed system \
+                 still asks for it at boot"
             );
         }
-        if !luks.additional_key_files.is_empty() {
-            bail!(
-                "{user} has additionalKeyFiles; key files can't be typed in, and nix-pixie can't \
-                 take them from elsewhere yet"
-            );
-        }
-        for path in [&luks.password_file, &luks.key_file].into_iter().flatten() {
-            need(path, user.clone(), 1, None)?;
+        for path in [&luks.password_file, &luks.key_file]
+            .into_iter()
+            .flatten()
+            .chain(&luks.additional_key_files)
+        {
+            need(path, user.clone(), any)?;
         }
     }
     for zfs in &encryption.zfs {
@@ -95,8 +136,8 @@ pub fn needs(encryption: &Encryption) -> Result<Vec<Need>> {
                 "{user} has keylocation = \"prompt\", so zfs would ask on a terminal the installer \
                  doesn't give it. Create it with keylocation = \"file:///tmp/secret.key\" and \
                  switch to prompting afterwards with postCreateHook = \"zfs set \
-                 keylocation=prompt {}\": nix-pixie asks you for the passphrase and puts it there \
-                 for disko",
+                 keylocation=prompt {}\": nix-pixie puts the passphrase there for disko, from a \
+                 hook or asked of you",
                 zfs.name
             );
         }
@@ -104,36 +145,87 @@ pub fn needs(encryption: &Encryption) -> Result<Vec<Need>> {
             // https:// and friends: zfs fetches the key itself.
             continue;
         };
-        if zfs.keyformat != "passphrase" {
-            bail!(
-                "{user} has keyformat = \"{}\"; only passphrases can be typed in, and nix-pixie \
-                 can't take key files from elsewhere yet",
-                zfs.keyformat
-            );
-        }
-        need(path, user, ZFS_MIN_PASSPHRASE, Some(ZFS_MAX_PASSPHRASE))?;
+        let kind = match zfs.keyformat.as_str() {
+            "passphrase" => Kind::Passphrase {
+                min: ZFS_MIN_PASSPHRASE,
+                max: Some(ZFS_MAX_PASSPHRASE),
+            },
+            "raw" => Kind::Raw,
+            "hex" => Kind::Hex,
+            other => bail!("{user} has keyformat = \"{other}\", which nix-pixie doesn't know"),
+        };
+        need(path, user, kind)?;
     }
     Ok(needs.into_values().collect())
 }
 
-/// Whether the passphrases can be asked for: only on a terminal for now.
-pub fn check_interactive(needs: &[Need]) -> Result<()> {
+/// Whether the keys can come from somewhere, as far as can be told before
+/// any hook ran: with hooks, they may provide them; without, only typeable
+/// ones on a terminal can be had.
+pub fn check_available(needs: &[Need], has_hooks: bool) -> Result<()> {
+    if has_hooks {
+        return Ok(());
+    }
+    if let Some(need) = needs.iter().find(|n| !n.kind.typeable()) {
+        bail!(
+            "{} needs a {} key at {}, which can't be typed in: provide it from a hook \
+             ($PIXIE_OUT/disk-keys{})",
+            need.users.join(", "),
+            need.kind,
+            need.path,
+            need.path
+        );
+    }
+    check_terminal(needs)
+}
+
+fn check_terminal(needs: &[Need]) -> Result<()> {
     if needs.is_empty() || std::io::stdin().is_terminal() {
         return Ok(());
     }
     let paths: Vec<&str> = needs.iter().map(|n| n.path.as_str()).collect();
     bail!(
-        "the layout is encrypted, and its passphrases ({}) are typed in on a terminal; run \
-         this on one",
+        "the layout is encrypted, and no hook provided the keys for {}: run this on a \
+         terminal to type them in, or provide them from a hook ($PIXIE_OUT/disk-keys/...)",
         paths.join(", ")
     )
 }
 
-/// Asks the operator for every key file's passphrase, twice, without echo.
-pub async fn ask(needs: Vec<Need>) -> Result<Vec<KeyFile>> {
+/// Keys for every need: what hooks `provided` (by path on the target), and
+/// the rest asked for on the terminal. Keys nothing reads are dropped.
+pub async fn gather(
+    needs: Vec<Need>,
+    mut provided: BTreeMap<String, Zeroizing<Vec<u8>>>,
+) -> Result<Vec<KeyFile>> {
     let mut files = Vec::new();
+    let mut missing = Vec::new();
     for need in needs {
-        let file = tokio::task::spawn_blocking(move || ask_one(&need))
+        if let Some(contents) = provided.remove(&need.path) {
+            check(&need, &contents).map_err(|reason| {
+                anyhow::anyhow!("the key a hook provided for {}: {reason}", need.path)
+            })?;
+            files.push(KeyFile {
+                path: need.path,
+                contents,
+            });
+        } else if need.kind.typeable() {
+            missing.push(need);
+        } else {
+            bail!(
+                "{} needs a {} key at {}, and no hook provided it ($PIXIE_OUT/disk-keys{})",
+                need.users.join(", "),
+                need.kind,
+                need.path,
+                need.path
+            );
+        }
+    }
+    for path in provided.keys() {
+        warn!(%path, "a hook provided a key the layout doesn't read; not sending it");
+    }
+    check_terminal(&missing)?;
+    for need in missing {
+        let file = tokio::task::spawn_blocking(move || ask(&need))
             .await
             .context("asking for a passphrase")??;
         files.push(file);
@@ -141,14 +233,14 @@ pub async fn ask(needs: Vec<Need>) -> Result<Vec<KeyFile>> {
     Ok(files)
 }
 
-fn ask_one(need: &Need) -> Result<KeyFile> {
+fn ask(need: &Need) -> Result<KeyFile> {
     let what = need.users.join(", ");
     for _ in 0..ATTEMPTS {
         let first = Zeroizing::new(
             rpassword::prompt_password(format!("Passphrase for {what} ({}): ", need.path))
                 .context("reading the passphrase from the terminal")?,
         );
-        if let Err(reason) = acceptable(need, &first) {
+        if let Err(reason) = check(need, first.as_bytes()) {
             eprintln!("{reason}");
             continue;
         }
@@ -167,16 +259,31 @@ fn ask_one(need: &Need) -> Result<KeyFile> {
     bail!("no passphrase for {}", need.path)
 }
 
-/// Whether `passphrase` fits what reads it.
-pub fn acceptable(need: &Need, passphrase: &str) -> Result<(), String> {
-    let len = passphrase.len();
-    if len < need.min_len {
-        return Err(format!("At least {} characters.", need.min_len));
-    }
-    if let Some(max) = need.max_len
-        && len > max
-    {
-        return Err(format!("At most {max} characters."));
+/// Whether `key` fits what reads it. Written as is: mind trailing newlines,
+/// which are part of a key file (one is allowed after a hex key).
+pub fn check(need: &Need, key: &[u8]) -> Result<(), String> {
+    match need.kind {
+        Kind::Passphrase { min, max } => {
+            let len = key.len();
+            if len < min.max(1) {
+                return Err(format!("At least {} characters.", min.max(1)));
+            }
+            if let Some(max) = max
+                && len > max
+            {
+                return Err(format!("At most {max} characters."));
+            }
+        }
+        Kind::Raw if key.len() != 32 => {
+            return Err(format!("A raw key has 32 bytes, not {}.", key.len()));
+        }
+        Kind::Hex => {
+            let digits = key.strip_suffix(b"\n").unwrap_or(key);
+            if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
+                return Err("A hex key has 64 hex digits.".into());
+            }
+        }
+        Kind::Raw => {}
     }
     Ok(())
 }

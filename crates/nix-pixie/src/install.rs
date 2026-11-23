@@ -15,11 +15,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, VarInt};
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::ctrl::{
-    ControllerMsg, DiskAssignment, KeyFile, MAX_TARGET_FRAME, Shutdown, StreamRequest, TargetMsg,
+    ControllerMsg, DiskAssignment, KeyFile, MAX_TARGET_FRAME, Secret, Shutdown, StreamRequest,
+    TargetMsg,
 };
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use nix_pixie_proto::inventory::Disk;
 use tracing::{info, trace};
+use zeroize::Zeroizing;
 
 use crate::controller::{self, Approved, confirm, describe_disk};
 use crate::discovery::{Discovery, Method, Peer};
@@ -88,10 +90,11 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     // Check what we can before pairing: a mistake shouldn't cost the code.
     let programs = if let Some(name) = &args.machine {
         let machine = machine(&metadata, &args.flake, name)?;
-        refuse_push(name, machine)?;
+        check_push(name, machine)?;
         let disko = disko_of(&Configuration::new(&args.flake, &machine.configuration)?).await?;
         plan::check_requested(&disko, machine.disks.file.is_some(), &requested)?;
-        secrets::check_interactive(&secrets::needs(&disko.encryption)?)?;
+        let has_hooks = !machine.hooks.is_empty();
+        secrets::check_available(&secrets::needs(&disko.encryption)?, has_hooks)?;
         if machine.disks.file.is_some() {
             repo_root(&args.flake)?;
         }
@@ -231,11 +234,12 @@ async fn verify(
     result.map(|_| ())
 }
 
-fn refuse_push(name: &str, machine: &Machine) -> Result<()> {
-    if machine.host_key.mode == HostKeyMode::Push {
+/// Push mode needs a hook to provide the key.
+fn check_push(name: &str, machine: &Machine) -> Result<()> {
+    if machine.host_key.mode == HostKeyMode::Push && machine.hooks.is_empty() {
         bail!(
-            "{name} has hostKey.mode = \"push\", which nix-pixie doesn't implement yet; \
-             use \"pull\" or \"none\""
+            "{name} has hostKey.mode = \"push\" but no hooks; a hook that runs before \
+             `host-key` provides the key in $PIXIE_OUT/host-key"
         );
     }
     Ok(())
@@ -300,7 +304,7 @@ async fn prepare(
     .await?;
     let name = name.context("approved without a machine")?;
     let machine = machine(metadata, &args.flake, &name)?;
-    refuse_push(&name, machine)?;
+    check_push(&name, machine)?;
     let target = serde_json::json!({
         "id": conn.remote_id().to_string(),
         "label": label,
@@ -315,10 +319,7 @@ async fn prepare(
     }
     hooks.after(Step::Facter).await?;
     // Before building: the configuration (or a rekeying hook) may use it.
-    let pulled = match machine.host_key.mode {
-        HostKeyMode::Pull => Some(pull_host_key(stream, &args.flake, &name, machine).await?),
-        HostKeyMode::None | HostKeyMode::Push => None,
-    };
+    let pulled = machine_host_key(stream, &args.flake, &name, machine, &mut hooks).await?;
     hooks.context.host_key = pulled.as_ref().map(ToString::to_string);
     hooks.after(Step::HostKey).await?;
 
@@ -338,7 +339,7 @@ async fn prepare(
         .disko
         .with_context(|| no_disko(&machine.configuration))?;
     let needs = secrets::needs(&disko.encryption)?;
-    secrets::check_interactive(&needs)?;
+    secrets::check_available(&needs, !machine.hooks.is_empty())?;
     let choices = choose_disks(
         &disko,
         machine.disks.file.is_some(),
@@ -357,7 +358,7 @@ async fn prepare(
     hooks.after(Step::Disks).await?;
 
     // Before the build, so it can run unattended.
-    let key_files = secrets::ask(needs).await?;
+    let key_files = secrets::gather(needs, hooks.take_disk_keys()).await?;
 
     eprintln!("\nBuilding nixosConfigurations.{}", machine.configuration);
     let built = configuration.build().await?;
@@ -595,13 +596,50 @@ async fn place_files(stream: &mut Stream, root: &str, hooks: &mut hooks::Runner)
 }
 
 /// Has the target generate the host key and records its public half.
-async fn pull_host_key(
+/// The machine's host key, by its `hostKey.mode`: none, generated on the
+/// target (pull), or from a hook (push).
+async fn machine_host_key(
     stream: &mut Stream,
     flake: &str,
     name: &str,
     machine: &Machine,
+    hooks: &mut hooks::Runner,
+) -> Result<Option<PublicKey>> {
+    let pushed = hooks.take_host_key();
+    Ok(match (machine.host_key.mode, pushed) {
+        (HostKeyMode::None, None) => None,
+        (HostKeyMode::Pull, None) => Some(host_key(stream, flake, name, machine, None).await?),
+        (HostKeyMode::Push, Some(private)) => {
+            Some(host_key(stream, flake, name, machine, Some(private)).await?)
+        }
+        (HostKeyMode::Push, None) => bail!(
+            "hostKey.mode = \"push\", but no hook wrote $PIXIE_OUT/host-key before `host-key`"
+        ),
+        (mode, Some(_)) => bail!(
+            "a hook wrote $PIXIE_OUT/host-key, but hostKey.mode is \"{}\", not \"push\"",
+            format!("{mode:?}").to_ascii_lowercase()
+        ),
+    })
+}
+
+/// The host key: generated on the target (pull mode), or `pushed` there from
+/// a hook. Records its public half in the repository if the machine says
+/// where.
+async fn host_key(
+    stream: &mut Stream,
+    flake: &str,
+    name: &str,
+    machine: &Machine,
+    pushed: Option<Zeroizing<Vec<u8>>>,
 ) -> Result<PublicKey> {
-    write_frame(stream, &ControllerMsg::GenerateHostKey).await?;
+    let how = if pushed.is_some() { "pushed" } else { "pulled" };
+    let request = match pushed {
+        Some(private) => ControllerMsg::ProvideHostKey {
+            private: Secret(private),
+        },
+        None => ControllerMsg::GenerateHostKey,
+    };
+    write_frame(stream, &request).await?;
     let reply = tokio::time::timeout(PREPARE_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
         .await
         .context("timed out waiting for the target's host key")??;
@@ -610,12 +648,12 @@ async fn pull_host_key(
             PublicKey::parse(&public).context("the target's host key")?
         }
         TargetMsg::HostKeyFailed { error } => bail!(
-            "the target could not generate a host key: {}",
+            "the target has no host key ({how}): {}",
             sanitise(&error, 300)
         ),
         _ => bail!("unexpected reply to the host key request"),
     };
-    info!(%key, "pulled the host key");
+    info!(%key, how, "host key");
     if let Some(path) = &machine.host_key.public_key_path {
         let root = repo_root(flake)?;
         let file = metadata::repo_path(&root, path)?;

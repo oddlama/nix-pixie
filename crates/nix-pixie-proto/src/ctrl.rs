@@ -9,7 +9,7 @@
 //! FacterReport | FacterFailed ->
 //!                           <-   PrepareDisks { disks, labels } (after Approve)
 //! DisksReady | DisksRefused ->
-//!                           <-   GenerateHostKey             (after Approve)
+//!                           <-   GenerateHostKey | ProvideHostKey (after Approve)
 //! HostKey | HostKeyFailed   ->
 //!                           <-   RunDisko { script }         (after DisksReady)
 //! Output*                   ->
@@ -160,6 +160,21 @@ pub enum ControllerMsg {
         root: String,
         files: Vec<PlacedFile>,
     },
+    /// Push mode: keep this private host key (OpenSSH format, without a
+    /// passphrase) for `Install`, as if it had been generated. Answered
+    /// like `GenerateHostKey`. Only after `Approve`.
+    ProvideHostKey { private: Secret },
+}
+
+/// Secret bytes: wiped from memory when dropped, never shown by `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(pub Zeroizing<Vec<u8>>);
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} secret bytes>", self.0.len())
+    }
 }
 
 /// A file for the installed system, e.g. a secret a hook produced. Its

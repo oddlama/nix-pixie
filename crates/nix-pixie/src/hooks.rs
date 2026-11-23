@@ -326,6 +326,10 @@ pub struct Runner {
     pub context: Context,
     /// Files waiting for the installed system's root to be mounted.
     pending: Vec<PlacedFile>,
+    /// Keys for disko, by path on the target, until the disks are formatted.
+    disk_keys: BTreeMap<String, Zeroizing<Vec<u8>>>,
+    /// Push mode: the host's private key, until the `host-key` step.
+    host_key: Option<Zeroizing<Vec<u8>>>,
     /// The last step whose hooks ran.
     reached: Option<Step>,
 }
@@ -344,6 +348,8 @@ impl Runner {
             dir,
             context,
             pending: Vec::new(),
+            disk_keys: BTreeMap::new(),
+            host_key: None,
             reached: None,
         })
     }
@@ -358,8 +364,8 @@ impl Runner {
                 bail!("hook {name} was not resolved");
             };
             eprintln!("Running hook {name} (after {step})");
-            let files = run(&name, program, hook, step, &self.dir, &self.context).await?;
-            self.pending.extend(files);
+            let outputs = run(&name, program, hook, step, &self.dir, &self.context).await?;
+            self.take_outputs(&name, step, outputs)?;
             let total: usize = self.pending.iter().map(|f| f.contents.len()).sum();
             if total > MAX_FILES_BYTES {
                 bail!(
@@ -369,6 +375,44 @@ impl Runner {
             }
         }
         Ok(())
+    }
+
+    /// Keeps what a hook produced, if it's not too late for it.
+    fn take_outputs(&mut self, name: &str, step: Step, outputs: Outputs) -> Result<()> {
+        if let Some(key) = outputs.host_key {
+            if step >= Step::HostKey {
+                bail!(
+                    "hook {name} wrote a host key after `{step}`, too late for the `host-key` \
+                     step; order it before `host-key`"
+                );
+            }
+            if self.host_key.replace(key).is_some() {
+                bail!("hook {name} wrote a host key, but another hook already did");
+            }
+        }
+        if !outputs.disk_keys.is_empty() && step > Step::Disks {
+            bail!(
+                "hook {name} wrote disk keys after `{step}`, but they are gathered once the \
+                 disks are chosen; order it before `build`"
+            );
+        }
+        for (path, key) in outputs.disk_keys {
+            if self.disk_keys.insert(path.clone(), key).is_some() {
+                bail!("hook {name} wrote a disk key for {path}, but another hook already did");
+            }
+        }
+        self.pending.extend(outputs.files);
+        Ok(())
+    }
+
+    /// Push mode: the host key a hook wrote, once.
+    pub fn take_host_key(&mut self) -> Option<Zeroizing<Vec<u8>>> {
+        self.host_key.take()
+    }
+
+    /// The disk keys hooks wrote, by path on the target.
+    pub fn take_disk_keys(&mut self) -> BTreeMap<String, Zeroizing<Vec<u8>>> {
+        std::mem::take(&mut self.disk_keys)
     }
 
     /// The files hooks wrote that aren't in the installed system yet.
@@ -391,9 +435,46 @@ impl Runner {
     }
 }
 
+/// What a hook wrote into `$PIXIE_OUT`.
+#[derive(Debug, Default)]
+pub struct Outputs {
+    /// `files/<path>`: for the installed system.
+    pub files: Vec<PlacedFile>,
+    /// `disk-keys/<path>`: for disko, at `<path>` on the target.
+    pub disk_keys: BTreeMap<String, Zeroizing<Vec<u8>>>,
+    /// `host-key`: the host's private key (push mode).
+    pub host_key: Option<Zeroizing<Vec<u8>>>,
+}
+
+/// Reads a hook's output directory. Anything but `files/`, `disk-keys/`
+/// and `host-key` is a mistake and refused.
+pub fn collect_outputs(out: &Path) -> Result<Outputs> {
+    let mut outputs = Outputs::default();
+    for entry in std::fs::read_dir(out).with_context(|| format!("reading {}", out.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        match name.to_str() {
+            Some("files") => outputs.files = collect_files(&entry.path())?,
+            Some("disk-keys") => {
+                outputs.disk_keys = collect_files(&entry.path())?
+                    .into_iter()
+                    .map(|f| (f.path, f.contents))
+                    .collect();
+            }
+            Some("host-key") if entry.file_type()?.is_file() => {
+                outputs.host_key = Some(Zeroizing::new(std::fs::read(entry.path())?));
+            }
+            _ => bail!(
+                "{}: a hook's outputs are files/, disk-keys/ and host-key",
+                name.to_string_lossy()
+            ),
+        }
+    }
+    Ok(outputs)
+}
+
 /// Runs one hook's program, in `dir`, on the operator's terminal (its stdout
-/// goes to our stderr: our stdout is the result). Returns the files it wrote
-/// for the installed system.
+/// goes to our stderr: our stdout is the result). Returns what it wrote.
 async fn run(
     name: &str,
     program: &Path,
@@ -401,7 +482,7 @@ async fn run(
     step: Step,
     dir: &Path,
     context: &Context,
-) -> Result<Vec<PlacedFile>> {
+) -> Result<Outputs> {
     let scratch = private_dir()?;
     let result = async {
         let mut json = serde_json::to_value(context)?;
@@ -429,7 +510,7 @@ async fn run(
         if !status.success() {
             bail!("hook {name} failed ({status})");
         }
-        collect_files(&out.join("files")).with_context(|| format!("the files hook {name} wrote"))
+        collect_outputs(&out).with_context(|| format!("what hook {name} wrote"))
     }
     .await;
     // Its outputs may be secrets.
