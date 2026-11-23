@@ -21,7 +21,7 @@ use nix_pixie_proto::pair::{PairError, Side};
 use tracing::{info, warn};
 
 use crate::agent::MAX_FAILURES;
-use crate::discovery::{Discovery, Method, Peer};
+use crate::discovery::{self, Discovery, Method, Peer};
 use crate::identity;
 use crate::metadata::{self, Metadata, Suggestion};
 use crate::net::{self, DialError, Stream, sanitise};
@@ -56,6 +56,8 @@ pub struct PairArgs {
     pub push: Vec<String>,
     /// Where the target's filesystems are mounted.
     pub store_root: String,
+    /// Probe these hosts instead of searching the local network.
+    pub targets: Vec<String>,
 }
 
 /// Pairs with the target showing a code (default mode), shows what it is,
@@ -83,8 +85,9 @@ pub async fn pair(args: PairArgs) -> Result<()> {
         _ => {}
     }
 
+    let targets = discovery::resolve_targets(&args.targets).await?;
     let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
-    let mut discovery = Discovery::start(args.method).await?;
+    let mut discovery = Discovery::start(args.method, targets).await?;
     let result = tokio::select! {
         r = async {
             let (conn, mut stream, peer) =
@@ -585,13 +588,16 @@ pub struct ServeArgs {
     pub code_file: Option<PathBuf>,
     pub max_targets: Option<usize>,
     pub method: Method,
+    /// Probe these hosts instead of searching the local network.
+    pub targets: Vec<String>,
 }
 
 /// Alternative mode: show a controller code that operators type on targets,
 /// and pair with every target that did. Prints one JSON object per target.
 pub async fn serve(args: ServeArgs) -> Result<()> {
+    let targets = discovery::resolve_targets(&args.targets).await?;
     let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
-    let mut discovery = Discovery::start(args.method).await?;
+    let mut discovery = Discovery::start(args.method, targets).await?;
     info!(id = %endpoint.id(), "controller ready");
 
     let mut paired = Vec::new();

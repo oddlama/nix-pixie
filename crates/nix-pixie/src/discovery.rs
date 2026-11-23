@@ -5,10 +5,10 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use iroh::EndpointId;
 use mdns_sd::ServiceEvent;
-use nix_pixie_proto::announce::{Announcement, MAX_LABEL, Pairing};
+use nix_pixie_proto::announce::{Announcement, MAX_LABEL, PROBE_PORT, Pairing};
 use tokio::sync::watch;
 use tracing::{debug, info};
 
@@ -59,33 +59,42 @@ pub struct Discovery {
     peers: HashMap<EndpointId, Peer>,
     /// News that arrived while [`Self::settle`] waited for another peer.
     pending: VecDeque<Peer>,
+    /// Probing only these, not the local network.
+    targets: Vec<SocketAddr>,
     pub stats: Stats,
 }
 
 impl Discovery {
-    pub async fn start(method: Method) -> Result<Self> {
+    /// Searches the local network with `method`, or with `targets`, probes
+    /// only those addresses instead (see [`resolve_targets`]).
+    pub async fn start(method: Method, targets: Vec<SocketAddr>) -> Result<Self> {
+        let local = targets.is_empty();
         let mdns = match method {
-            Method::Both | Method::Mdns => {
+            Method::Both | Method::Mdns if local => {
                 let mdns = Mdns::new()?;
                 let events = mdns.browse()?;
                 Some((mdns, events))
             }
-            Method::Probe => None,
+            _ => None,
         };
-        let prober = match method {
-            Method::Both | Method::Probe => {
-                let prober = Prober::new().await?;
-                let (tx, rx) = watch::channel(RoundReport::default());
-                let task = prober.spawn_rounds(PROBE_INTERVAL, tx);
-                Some((prober, task, rx))
-            }
-            Method::Mdns => None,
+        let prober = if !local || matches!(method, Method::Both | Method::Probe) {
+            let prober = Prober::new().await?;
+            let (tx, rx) = watch::channel(RoundReport::default());
+            let task = if local {
+                prober.spawn_rounds(PROBE_INTERVAL, tx)
+            } else {
+                prober.spawn_targeted(targets.clone(), PROBE_INTERVAL, &tx)
+            };
+            Some((prober, task, rx))
+        } else {
+            None
         };
         Ok(Self {
             mdns,
             prober,
             peers: HashMap::new(),
             pending: VecDeque::new(),
+            targets,
             stats: Stats::default(),
         })
     }
@@ -171,6 +180,16 @@ impl Discovery {
 
     /// Where we looked, for "nothing found" errors.
     pub fn describe(&self) -> String {
+        if !self.targets.is_empty() {
+            let targets: Vec<String> = self.targets.iter().map(ToString::to_string).collect();
+            return format!(
+                "probed {}: {} reply(s). Is the agent running there, and does its firewall (and \
+                 any in between) let UDP {} and {PROBE_PORT} in",
+                targets.join(", "),
+                self.stats.probe_replies,
+                nix_pixie_proto::DEFAULT_PORT,
+            );
+        }
         let mut parts = Vec::new();
         if self.mdns.is_some() {
             parts.push(format!("DNS-SD: {} record(s)", self.stats.mdns_records));
@@ -238,6 +257,30 @@ async fn recv_probe(
         Some((prober, _, _)) => prober.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// The probe addresses of `hosts` (`--target`): IP addresses, or names to
+/// look up.
+pub async fn resolve_targets(hosts: &[String]) -> Result<Vec<SocketAddr>> {
+    let mut targets = Vec::new();
+    for host in hosts {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            targets.push(SocketAddr::new(ip, PROBE_PORT));
+            continue;
+        }
+        let found: Vec<SocketAddr> = tokio::net::lookup_host((bare, PROBE_PORT))
+            .await
+            .with_context(|| format!("looking up {host}"))?
+            .collect();
+        if found.is_empty() {
+            bail!("{host} has no addresses");
+        }
+        targets.extend(found);
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    Ok(targets)
 }
 
 /// Addresses worth dialing or probing.

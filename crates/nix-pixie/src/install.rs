@@ -24,7 +24,7 @@ use tracing::{info, trace};
 use zeroize::Zeroizing;
 
 use crate::controller::{self, Approved, confirm, describe_disk};
-use crate::discovery::{Discovery, Method, Peer};
+use crate::discovery::{self, Discovery, Method, Peer};
 use crate::hooks::{self, Step};
 use crate::hostkey::{self, PublicKey};
 use crate::identity;
@@ -65,6 +65,8 @@ pub struct InstallArgs {
     pub then: Then,
     /// How long to wait for the installed system's SSH server.
     pub boot_timeout: Duration,
+    /// Probe these hosts instead of searching the local network.
+    pub targets: Vec<String>,
 }
 
 /// What the target does once the system is installed.
@@ -104,8 +106,9 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         None
     };
 
+    let targets = discovery::resolve_targets(&args.targets).await?;
     let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
-    let mut discovery = Discovery::start(args.method).await?;
+    let mut discovery = Discovery::start(args.method, targets).await?;
     let result = tokio::select! {
         r = async {
             let (conn, mut stream, peer) = controller::pair_with_target(

@@ -182,6 +182,35 @@ impl Prober {
         })
     }
 
+    /// Probes only `targets`, by unicast, every `interval`: for targets on
+    /// other networks (e.g. a server on the internet), where broadcasts and
+    /// the neighbour table can't reach.
+    pub fn spawn_targeted(
+        &self,
+        targets: Vec<SocketAddr>,
+        interval: Duration,
+        report: &watch::Sender<RoundReport>,
+    ) -> tokio::task::JoinHandle<()> {
+        report.send_replace(RoundReport {
+            interfaces: targets.iter().map(ToString::to_string).collect(),
+            neighbours_ok: true,
+        });
+        let (v4, v6, probe) = (self.v4.clone(), self.v6.clone(), encode_probe(&self.nonce));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                for &to in &targets {
+                    match (to, &v6) {
+                        (SocketAddr::V6(_), Some(v6)) => send(v6, to, &probe).await,
+                        (SocketAddr::V6(_), None) => {}
+                        (SocketAddr::V4(_), _) => send(&v4, to, &probe).await,
+                    }
+                }
+            }
+        })
+    }
+
     /// Next valid reply: the announcement and the address it came from (with
     /// the iroh port from the announcement).
     pub async fn recv(&self) -> (Announcement, SocketAddr) {

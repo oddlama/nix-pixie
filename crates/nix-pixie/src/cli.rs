@@ -61,6 +61,12 @@ pub enum ControllerCommand {
         /// How to find targets.
         #[arg(long, value_enum, default_value_t = discovery::Method::Both)]
         discovery: discovery::Method,
+        /// Instead of searching the local network, probe this host (an IP
+        /// address or a name; repeatable), e.g. a server on the internet
+        /// running `nix run github:oddlama/nix-pixie#agent`. Needs UDP 47011
+        /// and 47012 to it.
+        #[arg(long = "target", value_name = "HOST")]
+        targets: Vec<String>,
         /// Flake whose `pixie` output describes your machines. Used to match
         /// the target to a machine and to write its facter report.
         #[arg(long)]
@@ -117,6 +123,12 @@ pub enum ControllerCommand {
         /// How to find targets.
         #[arg(long, value_enum, default_value_t = discovery::Method::Both)]
         discovery: discovery::Method,
+        /// Instead of searching the local network, probe this host (an IP
+        /// address or a name; repeatable), e.g. a server on the internet
+        /// running `nix run github:oddlama/nix-pixie#agent`. Needs UDP 47011
+        /// and 47012 to it.
+        #[arg(long = "target", value_name = "HOST")]
+        targets: Vec<String>,
     },
     /// Show a controller code for targets to type in; prints one JSON line
     /// per paired target.
@@ -130,6 +142,12 @@ pub enum ControllerCommand {
         /// How to find targets.
         #[arg(long, value_enum, default_value_t = discovery::Method::Both)]
         discovery: discovery::Method,
+        /// Instead of searching the local network, probe this host (an IP
+        /// address or a name; repeatable), e.g. a server on the internet
+        /// running `nix run github:oddlama/nix-pixie#agent`. Needs UDP 47011
+        /// and 47012 to it.
+        #[arg(long = "target", value_name = "HOST")]
+        targets: Vec<String>,
     },
 }
 
@@ -156,6 +174,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     yes,
                     push,
                     store_root,
+                    targets,
                 } => {
                     controller::pair(controller::PairArgs {
                         identity,
@@ -167,6 +186,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         yes,
                         push,
                         store_root,
+                        targets,
                     })
                     .await
                 }
@@ -181,6 +201,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     boot_timeout,
                     timeout,
                     discovery,
+                    targets,
                 } => {
                     install::install(install::InstallArgs {
                         identity,
@@ -194,6 +215,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         wipe,
                         then,
                         boot_timeout: Duration::from_secs(boot_timeout),
+                        targets,
                     })
                     .await
                 }
@@ -201,12 +223,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                     code_file,
                     max_targets,
                     discovery,
+                    targets,
                 } => {
                     controller::serve(controller::ServeArgs {
                         identity,
                         code_file,
                         max_targets,
                         method: discovery,
+                        targets,
                     })
                     .await
                 }
