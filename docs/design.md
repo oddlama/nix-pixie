@@ -962,6 +962,16 @@ A layout test takes 2 to 4 minutes and about 3 GiB while it runs; all
 twenty-five checks take about 25 minutes with `JOBS=2`. The install tests fail
 as soon as the install fails instead of waiting out their timeouts.
 
+On a machine that is busy with other things, use `JOBS=1`. NixOS test VMs run
+with `clocksource=acpi_pm`, a counter that wraps every 4.7 s. A VM that gets
+no CPU for about that long (seen at a load of 28 on 16 cores) has a clock
+that jumps backwards from then on: journald logs `Time jumped backwards`
+every few seconds, noq warns `received a timestamp early than a previous
+recorded time` thousands of times a second, and the transfer under way ends
+with `connection lost: timed out`. That is the VM, not the install:
+`vm-push` and `vm-install-ext4` failed like this once and passed unchanged
+on a quiet machine.
+
 ## Future ideas
 
 Not in v1. Recorded so the v1 design doesn't block them.
