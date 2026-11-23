@@ -180,6 +180,12 @@
                   inherit (inputs) nixpkgs disko;
                   package = config.packages.default;
                 };
+                vm-remote = import ./nix/tests/remote.nix {
+                  inherit pkgs;
+                  inherit (inputs) nixpkgs disko;
+                  package = config.packages.default;
+                  inherit (config.packages) agent;
+                };
                 vm-link-local = import ./nix/tests/link-local.nix {
                   inherit pkgs;
                   package = config.packages.default;
