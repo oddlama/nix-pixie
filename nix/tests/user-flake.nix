@@ -21,8 +21,15 @@
   # name -> { disks.<disko disk> = {
   #             device = <Nix source for the device, with `pixieLib` in scope>;
   #             built = <the device it evaluates to when the test prebuilds>;
-  #           }; }
+  #           };
+  #           # For the prebuild only: what hooks will have changed in the
+  #           # repository by the time the controller builds.
+  #           builtModules = [ ];
+  #         }
   configurations,
+  # A file in `targets/` with `{ pkgs }: { <name> = <package>; }`: the
+  # flake's packages, e.g. hooks. Prebuilt as well.
+  packages ? null,
   # Nix source for mkPixie's `config.machines`.
   machines,
 }:
@@ -65,7 +72,7 @@ let
   );
 
   evalTarget =
-    devices:
+    devices: extraModules:
     (import "${pkgs.path}/nixos/lib/eval-config.nix" {
       system = null;
       modules = [
@@ -76,10 +83,16 @@ let
           nixpkgs.hostPlatform = system;
           disko.devices.disk = lib.mapAttrs (_: device: { inherit device; }) devices;
         }
-      ];
+      ]
+      ++ extraModules;
     }).config;
 
-  prebuilt = lib.mapAttrs (_: c: evalTarget (lib.mapAttrs (_: d: d.built) c.disks)) configurations;
+  prebuilt = lib.mapAttrs (
+    _: c: evalTarget (lib.mapAttrs (_: d: d.built) c.disks) (c.builtModules or [ ])
+  ) configurations;
+  prebuiltPackages = lib.optionalAttrs (packages != null) (
+    import (./targets + "/${packages}") { inherit pkgs; }
+  );
 
   flakeNix = pkgs.writeText "flake.nix" ''
     {
@@ -119,6 +132,11 @@ let
               '') configurations
             )}
           };
+          ${lib.optionalString (packages != null) ''
+            packages.${system} = import ./targets/${packages} {
+              pkgs = nixpkgs.legacyPackages.${system};
+            };
+          ''}
           pixie = pixieLib.mkPixie {
             inherit (self) nixosConfigurations;
             config.machines = ${machines};
@@ -167,7 +185,8 @@ in
     ++ lib.concatMap (c: [
       c.system.build.diskoScript
       c.system.build.toplevel
-    ]) (lib.attrValues prebuilt);
+    ]) (lib.attrValues prebuilt)
+    ++ lib.attrValues prebuiltPackages;
   };
 
   # Python: puts the flake into ~alice/repo as a git checkout.

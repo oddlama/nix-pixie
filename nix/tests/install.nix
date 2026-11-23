@@ -26,16 +26,21 @@ let
 
   flake = import ./user-flake.nix { inherit pkgs nixpkgs disko; } {
     target = "${layout}.nix";
-    configurations.web1.disks = lib.genAttrs spec.disks (disk: {
-      device = ''"${byPixie disk}"'';
-      built = byPixie disk;
-    });
+    configurations.web1 = {
+      disks = lib.genAttrs spec.disks (disk: {
+        device = ''"${byPixie disk}"'';
+        built = byPixie disk;
+      });
+      builtModules = spec.builtModules or [ ];
+    };
+    packages = spec.packages or null;
     machines = ''
       {
         web1.hostKey = {
           mode = "pull";
           publicKeyPath = "machines/web1/ssh_host_ed25519_key.pub";
         };
+        web1.hooks = ${spec.hooks or "{ }"};
       }
     '';
   };
