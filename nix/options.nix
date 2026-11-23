@@ -28,8 +28,10 @@ let
           output (a name or attribute path, e.g. `rekey`), or any installable
           with a `#`. Its main program runs, as with `nix run`. It is
           evaluated and built once, before pairing, so a broken hook doesn't
-          cost the pairing code and a hook can't change what others run. It runs in the
-          repository, with the operator's terminal; `$PIXIE_CONTEXT` names a
+          cost the pairing code and a hook can't change what others run.
+
+          It runs in the repository, with the operator's terminal;
+          `$PIXIE_CONTEXT` names a
           JSON file describing the install so far, and files it writes into
           `$PIXIE_OUT/files/<absolute path>` are put into the installed
           system (with their modes, owned by root). Hooks that change the

@@ -169,8 +169,8 @@ pub async fn wait_for(
                     });
                 }
                 Verdict::Mismatch(other) => bail!(
-                    "HOST KEY MISMATCH: {} answered with {other}, not with the key generated \
-                     during the install. It is another machine, or someone is impersonating \
+                    "HOST KEY MISMATCH: {} answered with {other}, not with the key the \
+                     install put there. It is another machine, or someone is impersonating \
                      this one",
                     host_arg(addr)
                 ),

@@ -34,4 +34,14 @@ in
   '';
   # After the installed system answered.
   booted = hook "booted" "";
+
+  # Push mode: the host key. A throwaway key, committed for the tests only.
+  push-key = hook "push-key" ''
+    cp ${./pushed-host-key} "$PIXIE_OUT/host-key"
+  '';
+  # The LUKS passphrase disko reads at /tmp/secret.key (targets/luks.nix).
+  luks-key = hook "luks-key" ''
+    mkdir -p "$PIXIE_OUT/disk-keys/tmp"
+    printf secretsecret > "$PIXIE_OUT/disk-keys/tmp/secret.key"
+  '';
 }

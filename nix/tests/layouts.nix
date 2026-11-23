@@ -6,7 +6,10 @@
 # - hooks, packages, builtModules: the machine's hooks (Nix source), the file
 #   in `targets/` with the packages they run, and what they change in the
 #   repository before the build (see `user-flake.nix`).
-# - passphrase: typed in on the controller for each key file, and at boot.
+# - target: the file in `targets/` (default: `<name>.nix`).
+# - hostKeyMode: the machine's `hostKey.mode` (default: pull).
+# - passphrase: typed in on the controller for each key file (unless
+#   `typed = false`: then hooks provide them), and at boot.
 # - bootPrompt: how the installed system asks for it on its console.
 # - checks: Python run against the booted `installed` machine.
 {
@@ -75,6 +78,32 @@
       source = installed.succeed("findmnt -n -o SOURCE /").strip()
       assert source == "/dev/mapper/cryptroot", source
       installed.succeed("cryptsetup isLuks /dev/vda3")
+    '';
+  };
+
+  # LUKS without anyone at the controller: the passphrase and the host key
+  # (push mode) come from hooks, and nothing gives the controller a terminal.
+  luks-scripted = {
+    target = "luks.nix";
+    disks = [ "main" ];
+    hostKeyMode = "push";
+    packages = "hook-packages.nix";
+    hooks = ''
+      {
+        push-key = { command = "push-key"; before = [ "host-key" ]; };
+        luks-key = { command = "luks-key"; after = [ "disks" ]; };
+      }
+    '';
+    typed = false;
+    passphrase = "secretsecret";
+    bootPrompt = "[Pp]assphrase for";
+    checks = ''
+      # The pushed key, not one the target generated.
+      pushed = ${builtins.toJSON (builtins.readFile ./targets/pushed-host-key.pub)}.split()[:2]
+      installed_key = installed.succeed("cat /etc/ssh/ssh_host_ed25519_key.pub").split()[:2]
+      assert installed_key == pushed, installed_key
+      source = installed.succeed("findmnt -n -o SOURCE /").strip()
+      assert source == "/dev/mapper/cryptroot", source
     '';
   };
 

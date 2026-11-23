@@ -168,7 +168,7 @@ struct Installed {
 struct Check {
     addrs: Vec<std::net::SocketAddr>,
     port: u16,
-    /// Pull mode: the key generated during the install.
+    /// Pull or push mode: the key the install put there.
     expected: Option<PublicKey>,
     /// The installer's own key, which may still answer for a moment.
     live: Option<PublicKey>,
@@ -213,7 +213,7 @@ async fn verify(
             let verified = check.expected.is_some();
             if verified {
                 eprintln!(
-                    "{} is up, with the host key generated during the install.",
+                    "{} is up, with the host key the install put there.",
                     check.machine
                 );
             } else {

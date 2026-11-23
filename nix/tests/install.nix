@@ -25,7 +25,7 @@ let
   byPixie = disk: "/dev/disk/by-pixie/${disk}";
 
   flake = import ./user-flake.nix { inherit pkgs nixpkgs disko; } {
-    target = "${layout}.nix";
+    target = spec.target or "${layout}.nix";
     configurations.web1 = {
       disks = lib.genAttrs spec.disks (disk: {
         device = ''"${byPixie disk}"'';
@@ -37,7 +37,7 @@ let
     machines = ''
       {
         web1.hostKey = {
-          mode = "pull";
+          mode = "${spec.hostKeyMode or "pull"}";
           publicKeyPath = "machines/web1/ssh_host_ed25519_key.pub";
         };
         web1.hooks = ${spec.hooks or "{ }"};
@@ -57,11 +57,13 @@ let
   install = "nix-pixie controller install --code CODE --machine web1 ${diskArgs} --yes --then poweroff --boot-timeout 300";
   encrypted = spec.passphrase != null;
   # Passphrases are typed in on a terminal: give it one (`script`), fed from
-  # a file with the passphrase twice (it is asked again to confirm).
+  # a file with the passphrase twice (it is asked again to confirm). Unless
+  # hooks provide them: then there is no terminal at all.
+  typed = spec.typed or encrypted;
   command =
-    if encrypted then "script --quiet --return --flush --command '${install}' /dev/null" else install;
-  stdin = lib.optionalString encrypted " -p StandardInput=file:/tmp/answers";
-  writeAnswers = lib.optionalString encrypted ''
+    if typed then "script --quiet --return --flush --command '${install}' /dev/null" else install;
+  stdin = lib.optionalString typed " -p StandardInput=file:/tmp/answers";
+  writeAnswers = lib.optionalString typed ''
     controller.succeed("printf '%s\\n' ${spec.passphrase} ${spec.passphrase} > /tmp/answers")
   '';
   # Python, at the indentation of a subtest's body.
@@ -131,7 +133,7 @@ pkgs.testers.runNixOSTest {
     target.succeed("ip -4 addr show eth1 | grep -q 'inet 192.168.1.3/24'")
     ${flake.setupScript}
 
-    with subtest("install, recording the generated host key, then power off"):
+    with subtest("install, recording the host key, then power off"):
         target.wait_for_file("/run/nix-pixie/code")
         code = target.succeed("cat /run/nix-pixie/code").strip()
         ${writeAnswers}
@@ -180,7 +182,7 @@ pkgs.testers.runNixOSTest {
       d: "    assert installed.succeed(\"readlink -f ${byPixie d.name}\").strip() == \"${d.installed}\"\n"
     ) disks}
 
-    with subtest("the controller checks the host key it pulled"):
+    with subtest("the controller checks the host key"):
         controller.wait_until_succeeds(
             "systemctl show -P SubState pixie-install | grep -qx -e exited -e failed",
             timeout=300,
