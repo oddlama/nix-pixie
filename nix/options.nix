@@ -24,10 +24,11 @@ let
         type = types.str;
         example = "agenix-rekey";
         description = ''
-          What the controller runs, with `nix run`: an app or package of the
-          flake with the `pixie` output (a name or attribute path, e.g.
-          `rekey`), or any installable with a `#`. Built before pairing, so a
-          broken hook doesn't cost the pairing code. It runs in the
+          What the controller runs, with `nix run`: a package of the flake
+          with the `pixie` output (a name or attribute path, e.g. `rekey`), or
+          any installable with a `#`. It must be a package with a main program
+          (not an app): it is built before pairing, so a broken hook doesn't
+          cost the pairing code. It runs in the
           repository, with the operator's terminal; `$PIXIE_CONTEXT` names a
           JSON file describing the install so far, and files it writes into
           `$PIXIE_OUT/files/<absolute path>` are put into the installed

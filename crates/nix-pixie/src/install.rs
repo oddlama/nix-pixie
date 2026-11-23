@@ -23,6 +23,7 @@ use tracing::{info, trace};
 
 use crate::controller::{self, Approved, confirm, describe_disk};
 use crate::discovery::{Discovery, Method, Peer};
+use crate::hooks::{self, Step};
 use crate::hostkey::{self, PublicKey};
 use crate::identity;
 use crate::metadata::{self, HostKeyMode, Machine, Metadata};
@@ -31,7 +32,7 @@ use crate::plan::{self, Choice, Resolution};
 use crate::preflight;
 use crate::push;
 use crate::secrets;
-use crate::system::{Built, Configuration, Disko, Ssh};
+use crate::system::{Built, Configuration, Disko, Facts, Ssh};
 
 /// For the agent's checks before formatting (a fresh lsblk).
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -94,6 +95,8 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         if machine.disks.file.is_some() {
             repo_root(&args.flake)?;
         }
+        hooks::schedule(&machine.hooks)?;
+        hooks::build(&args.flake, &machine.hooks).await?;
     }
 
     let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
@@ -114,16 +117,34 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     };
     discovery.shutdown();
     endpoint.close().await;
-    let Installed { mut report, check } = result?;
-    let verified = match check {
+    let Installed {
+        mut report,
+        check,
+        mut hooks,
+    } = result?;
+    let done = match check {
         Some(check) => tokio::select! {
-            r = verify(check, &args, &mut report) => r,
+            r = async {
+                verify(check, &args, &mut report).await?;
+                hooks.after(Step::Boot).await?;
+                no_files_left(&mut hooks, Step::Boot)
+            } => r,
             () = crate::shutdown_signal() => Err(anyhow!("interrupted")),
         },
         None => Ok(()),
     };
+    report.insert("hooks".into(), hooks.report());
     println!("{}", serde_json::Value::Object(report));
-    verified
+    done
+}
+
+/// Files that hooks after `step` wrote can't go anywhere: the target is gone.
+fn no_files_left(hooks: &mut hooks::Runner, step: Step) -> Result<()> {
+    if hooks.take_files().is_empty() {
+        Ok(())
+    } else {
+        bail!("hooks after `{step}` can't put files into the installed system any more")
+    }
 }
 
 /// What the session leaves for after the connection is closed.
@@ -131,6 +152,8 @@ struct Installed {
     report: serde_json::Map<String, serde_json::Value>,
     /// How to check the installed system's host key, if it can be.
     check: Option<Check>,
+    /// For the hooks after `boot`.
+    hooks: hooks::Runner,
 }
 
 /// Where and what to ask the installed system's SSH server.
@@ -241,6 +264,7 @@ struct Plan {
     host_key: Option<(PublicKey, String)>,
     /// Passphrases disko reads from files while formatting.
     key_files: Vec<KeyFile>,
+    hooks: hooks::Runner,
 }
 
 /// Approval, the facter report and host key, the disk plan, the build.
@@ -270,16 +294,26 @@ async fn prepare(
     let name = name.context("approved without a machine")?;
     let machine = machine(metadata, &args.flake, &name)?;
     refuse_push(&name, machine)?;
+    let target = serde_json::json!({
+        "id": conn.remote_id().to_string(),
+        "label": label,
+        "inventory": inventory,
+    });
+    let mut hooks = start_hooks(args, &name, machine, target).await?;
+    hooks.after(Step::Approve).await?;
     if let Some(path) = &machine.facter.report_path {
         controller::fetch_facter_report(stream, &args.flake, path)
             .await
             .context("getting the facter report")?;
     }
+    hooks.after(Step::Facter).await?;
     // Before building: the configuration (or a rekeying hook) may use it.
     let pulled = match machine.host_key.mode {
         HostKeyMode::Pull => Some(pull_host_key(stream, &args.flake, &name, machine).await?),
         HostKeyMode::None | HostKeyMode::Push => None,
     };
+    hooks.context.host_key = pulled.as_ref().map(ToString::to_string);
+    hooks.after(Step::HostKey).await?;
 
     let configuration = Configuration::new(&args.flake, &machine.configuration)?;
     let facts = configuration.facts().await?;
@@ -292,15 +326,7 @@ async fn prepare(
         );
     }
     preflight::check_boot(&facts.boot, &inventory.firmware, &machine.configuration)?;
-    let host_key = match (pulled, &facts.ssh.host_key_path) {
-        (None, _) => None,
-        (Some(key), Some(path)) => Some((key, path.clone())),
-        (Some(_), None) => bail!(
-            "hostKey.mode = \"pull\" needs an ed25519 key in nixosConfigurations.{}'s \
-             services.openssh.hostKeys",
-            machine.configuration
-        ),
-    };
+    let host_key = host_key_path(pulled, &facts, &machine.configuration)?;
     let disko = facts
         .disko
         .with_context(|| no_disko(&machine.configuration))?;
@@ -320,12 +346,16 @@ async fn prepare(
     if let Some(file) = &machine.disks.file {
         record_pins(&configuration, &args.flake, file, &choices).await?;
     }
+    hooks.context.disks = Some(serde_json::to_value(&choices)?);
+    hooks.after(Step::Disks).await?;
 
     // Before the build, so it can run unattended.
     let key_files = secrets::ask(needs).await?;
 
     eprintln!("\nBuilding nixosConfigurations.{}", machine.configuration);
     let built = configuration.build().await?;
+    hooks.context.system = Some(built.toplevel.clone());
+    hooks.after(Step::Build).await?;
     Ok(Plan {
         label,
         name,
@@ -337,7 +367,48 @@ async fn prepare(
         ssh: facts.ssh,
         host_key,
         key_files,
+        hooks,
     })
+}
+
+/// The hooks of the approved machine, ready to run. They were built before
+/// pairing if the machine was known then.
+async fn start_hooks(
+    args: &InstallArgs,
+    name: &str,
+    machine: &Machine,
+    target: serde_json::Value,
+) -> Result<hooks::Runner> {
+    if args.machine.is_none() {
+        hooks::build(&args.flake, &machine.hooks).await?;
+    }
+    hooks::Runner::new(
+        machine.hooks.clone(),
+        metadata::local_flake_dir(&args.flake).map_or_else(std::env::current_dir, Ok)?,
+        hooks::Context {
+            machine: name.to_string(),
+            configuration: machine.configuration.clone(),
+            flake: args.flake.clone(),
+            target,
+            ..hooks::Context::default()
+        },
+    )
+}
+
+/// Pull mode: the pulled key, and where the configuration wants it.
+fn host_key_path(
+    pulled: Option<PublicKey>,
+    facts: &Facts,
+    configuration: &str,
+) -> Result<Option<(PublicKey, String)>> {
+    match (pulled, &facts.ssh.host_key_path) {
+        (None, _) => Ok(None),
+        (Some(key), Some(path)) => Ok(Some((key, path.clone()))),
+        (Some(_), None) => bail!(
+            "hostKey.mode = \"pull\" needs an ed25519 key in nixosConfigurations.{configuration}'s \
+             services.openssh.hostKeys"
+        ),
+    }
 }
 
 /// From the confirmation to erase on: format, send the system, install,
@@ -360,6 +431,7 @@ async fn apply(
         ssh,
         host_key,
         key_files,
+        mut hooks,
     } = plan;
     confirm_erase(&disks, &choices, &name, args.yes, args.wipe).await?;
 
@@ -375,8 +447,11 @@ async fn apply(
     prepare_disks(stream, &choices, labels).await?;
     eprintln!("Formatting");
     run_disko(stream, &built.disko_script, key_files).await?;
-
     let root = disko.root_mount_point;
+    hooks.context.root = Some(root.clone());
+    hooks.after(Step::Format).await?;
+    place_files(stream, &root, &mut hooks).await?;
+
     let fstype = push::prepare_disk_store(stream, &root).await?;
     eprintln!("Sending the system into {root} ({fstype})");
     let seconds = push::copy(
@@ -385,40 +460,42 @@ async fn apply(
         std::slice::from_ref(&built.toplevel),
     )
     .await?;
+    hooks.after(Step::Copy).await?;
+    place_files(stream, &root, &mut hooks).await?;
     eprintln!("Installing the boot loader");
     let (expected, key_path) = host_key.unzip();
     install_system(stream, &root, &built.toplevel, key_path).await?;
+    hooks.after(Step::Install).await?;
+    place_files(stream, &root, &mut hooks).await?;
 
-    let mut report = serde_json::Map::new();
-    for (key, value) in [
-        ("target", conn.remote_id().to_string().into()),
-        ("label", label.into()),
-        ("machine", name.clone().into()),
-        ("configuration", configuration.into()),
-        ("disks", serde_json::to_value(&choices)?),
-        ("system", built.toplevel.clone().into()),
-        ("root", root.clone().into()),
-        ("fstype", fstype.into()),
-        ("pushSeconds", seconds.into()),
-        (
-            "then",
-            format!("{:?}", args.then).to_ascii_lowercase().into(),
-        ),
-    ] {
-        report.insert(key.into(), value);
-    }
+    let mut report = report(
+        conn,
+        label,
+        &name,
+        configuration,
+        &choices,
+        &built.toplevel,
+        &root,
+        fstype,
+        seconds,
+        args.then,
+    )?;
     let shutdown = match args.then {
         Then::Stay => {
             eprintln!("Installed; {root} stays mounted on the target.");
             return Ok(Installed {
                 report,
                 check: None,
+                hooks,
             });
         }
         Then::Reboot => Shutdown::Reboot,
         Then::Poweroff => Shutdown::PowerOff,
     };
     let live = finish(stream, &root, &disko.zpools, shutdown).await?;
+    hooks.context.root = None;
+    hooks.after(Step::Finish).await?;
+    no_files_left(&mut hooks, Step::Finish)?;
     let check = if ssh.enable {
         Some(Check {
             addrs: peer.addrs.iter().copied().collect(),
@@ -435,7 +512,76 @@ async fn apply(
         );
         None
     };
-    Ok(Installed { report, check })
+    Ok(Installed {
+        report,
+        check,
+        hooks,
+    })
+}
+
+/// The result so far, as printed at the end.
+#[allow(clippy::too_many_arguments, reason = "the result's fields, named")]
+fn report(
+    conn: &Connection,
+    label: String,
+    name: &str,
+    configuration: String,
+    choices: &[Choice],
+    system: &str,
+    root: &str,
+    fstype: String,
+    seconds: f64,
+    then: Then,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut report = serde_json::Map::new();
+    for (key, value) in [
+        ("target", conn.remote_id().to_string().into()),
+        ("label", label.into()),
+        ("machine", name.into()),
+        ("configuration", configuration.into()),
+        ("disks", serde_json::to_value(choices)?),
+        ("system", system.into()),
+        ("root", root.into()),
+        ("fstype", fstype.into()),
+        ("pushSeconds", seconds.into()),
+        ("then", format!("{then:?}").to_ascii_lowercase().into()),
+    ] {
+        report.insert(key.into(), value);
+    }
+    Ok(report)
+}
+
+/// Puts the files hooks wrote so far into the installed system.
+async fn place_files(stream: &mut Stream, root: &str, hooks: &mut hooks::Runner) -> Result<()> {
+    let files = hooks.take_files();
+    if files.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "Putting {} file(s) from hooks into the installed system",
+        files.len()
+    );
+    write_frame(
+        stream,
+        &ControllerMsg::PlaceFiles {
+            root: root.into(),
+            files,
+        },
+    )
+    .await?;
+    let reply = tokio::time::timeout(PREPARE_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
+        .await
+        .context("timed out waiting for the target to place the files")??;
+    match reply {
+        TargetMsg::FilesPlaced => Ok(()),
+        TargetMsg::FilesRefused { reason } => {
+            bail!(
+                "the target refused the hooks' files: {}",
+                sanitise(&reason, 300)
+            )
+        }
+        _ => bail!("unexpected reply to placing files"),
+    }
 }
 
 /// Has the target generate the host key and records its public half.

@@ -2,11 +2,12 @@
 //! SSH host key (pull mode), `nixos-install`, and leaving the disks ready for
 //! the first boot.
 
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use nix_pixie_proto::ctrl::PlacedFile;
 use tokio::process::Command;
 use tracing::info;
 
@@ -146,6 +147,50 @@ pub async fn install(
         "--no-channel-copy",
     ]);
     child::run("nixos-install", command, stream).await
+}
+
+/// Puts hook-written files into the installed system below `root`: root-owned,
+/// with their permission bits minus setuid, setgid and sticky. Refuses paths
+/// that leave `root`, also through symlinked directories inside it (NixOS's
+/// `/etc/static` points outside, for one). `Err` is a reason for the operator.
+pub fn place_files(root: &str, files: &[PlacedFile]) -> Result<(), String> {
+    check_root(root)?;
+    let real_root = std::fs::canonicalize(root).map_err(|e| format!("{root}: {e}"))?;
+    for file in files {
+        place_file(&real_root, root, file).map_err(|e| format!("{}: {e:#}", file.path))?;
+    }
+    info!(%root, files = files.len(), "placed files");
+    Ok(())
+}
+
+/// One file of [`place_files`], below `root` (whose canonical path is
+/// `real_root`); the mount check is the caller's.
+pub fn place_file(real_root: &Path, root: &str, file: &PlacedFile) -> Result<()> {
+    let target = below_root(root, &file.path)?;
+    let dir = target.parent().context("no parent directory")?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    if !std::fs::canonicalize(dir)?.starts_with(real_root) {
+        bail!("leads outside the installed system (through a symlink)");
+    }
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_dir() => bail!("is a directory"),
+        Ok(_) => std::fs::remove_file(&target)?,
+        Err(_) => {}
+    }
+    let mode = file.mode & 0o777;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&target)?;
+    std::io::Write::write_all(&mut out, &file.contents)?;
+    // Exactly these bits, whatever the umask.
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
 }
 
 /// Unmounts everything under `root` and exports `zpools`, so the first boot

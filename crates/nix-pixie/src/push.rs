@@ -7,8 +7,6 @@
 //! target filesystems (`crates/nix-pixie/src/store.rs`). Nothing is staged in
 //! between, and the target never gets to read the controller's store.
 
-use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +18,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::net::{Stream, sanitise};
+use crate::state::private_dir;
 
 /// What a finished push reports.
 pub struct PushReport {
@@ -84,6 +83,7 @@ pub async fn prepare_disk_store(ctrl: &mut Stream, root: &str) -> Result<String>
 /// Runs `nix copy` for `paths` into the target store `request` names.
 /// Returns how long it took, in seconds.
 pub async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) -> Result<f64> {
+    // Private: the target's daemon runs as root and trusts whoever connects.
     let dir = private_dir()?;
     let socket = dir.join("store.sock");
     let listener = UnixListener::bind(&socket)
@@ -141,20 +141,4 @@ async fn forward(listener: UnixListener, conn: Connection, request: StreamReques
         });
         while tasks.try_join_next().is_some() {}
     }
-}
-
-/// A fresh 0700 directory for the socket. The target's daemon runs as root
-/// and trusts whoever connects, so no other local user may reach it.
-fn private_dir() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute() && p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    let suffix: u64 = rand::random();
-    let dir = base.join(format!("nix-pixie-{}-{suffix:016x}", std::process::id()));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
 }

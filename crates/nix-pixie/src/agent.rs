@@ -387,6 +387,13 @@ async fn serve_controller(
                 system,
                 host_key_path,
             } => install(state, stream, &root, &system, host_key_path.as_deref()).await?,
+            ControllerMsg::PlaceFiles { root, files } => match nixos::place_files(&root, &files) {
+                Ok(()) => TargetMsg::FilesPlaced,
+                Err(reason) => {
+                    warn!(%reason, "refusing to place files");
+                    TargetMsg::FilesRefused { reason }
+                }
+            },
             ControllerMsg::Finish { root, zpools, then } => {
                 let reply = finish(&root, &zpools).await;
                 if matches!(reply, TargetMsg::Finished { .. }) {
@@ -424,6 +431,7 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::GenerateHostKey => Some(TargetMsg::HostKeyFailed { error: reason }),
         ControllerMsg::Install { .. } => Some(TargetMsg::InstallFailed { error: reason }),
         ControllerMsg::Finish { .. } => Some(TargetMsg::FinishFailed { error: reason }),
+        ControllerMsg::PlaceFiles { .. } => Some(TargetMsg::FilesRefused { reason }),
     }
 }
 

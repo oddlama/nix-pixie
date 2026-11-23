@@ -102,3 +102,53 @@ fn refuses_cycles_and_unknown_names() {
     let too_early = refusal(&[("a", hook(&[], &["approve"]))]);
     assert!(too_early.contains("before `approve`"), "{too_early}");
 }
+
+#[test]
+fn commands_are_flake_outputs_unless_they_name_a_flake() {
+    use nix_pixie::hooks::installable;
+    assert_eq!(installable("/repo", "rekey"), "/repo#rekey");
+    assert_eq!(installable("/repo", "hooks.notify"), "/repo#hooks.notify");
+    assert_eq!(
+        installable("/repo", "github:owner/repo#app"),
+        "github:owner/repo#app"
+    );
+}
+
+#[test]
+fn collects_regular_files_with_their_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use nix_pixie::hooks::collect_files;
+
+    let dir = std::env::temp_dir().join(format!("nix-pixie-test-hook-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let files = dir.join("files");
+    let write = |path: &str, contents: &[u8], mode: u32| {
+        let path = files.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    assert_eq!(collect_files(&files).unwrap(), []);
+    write("etc/hook.conf", b"x", 0o644);
+    write("var/lib/secrets/key", b"secret", 0o4600);
+
+    let collected = collect_files(&files).unwrap();
+    let summary: Vec<(&str, u32, &[u8])> = collected
+        .iter()
+        .map(|f| (f.path.as_str(), f.mode, f.contents.as_slice()))
+        .collect();
+    // setuid is gone already here; the agent drops it as well.
+    assert_eq!(
+        summary,
+        [
+            ("/etc/hook.conf", 0o644, &b"x"[..]),
+            ("/var/lib/secrets/key", 0o600, &b"secret"[..]),
+        ]
+    );
+
+    std::os::unix::fs::symlink("/etc/shadow", files.join("etc/link")).unwrap();
+    let err = format!("{:#}", collect_files(&files).unwrap_err());
+    assert!(err.contains("only regular files"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

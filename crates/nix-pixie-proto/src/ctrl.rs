@@ -19,6 +19,8 @@
 //!                           <-   Install { root, system, .. } (after Approve)
 //! Output*                   ->
 //! InstallDone | InstallFailed ->
+//!                           <-   PlaceFiles { root, files }  (root mounted)
+//! FilesPlaced | FilesRefused ->
 //!                           <-   Finish { root, zpools, then }
 //! Finished | FinishFailed   ->
 //! ```
@@ -49,8 +51,10 @@ use crate::inventory::Inventory;
 pub const MAX_TARGET_FRAME: usize = 1024 * 1024;
 /// Upper bound for a facter report frame. Real reports are a few hundred KiB.
 pub const MAX_FACTER_FRAME: usize = 16 * 1024 * 1024;
-/// Upper bound for control frames from the controller.
-pub const MAX_CONTROLLER_FRAME: usize = 64 * 1024;
+/// Upper bound for control frames from the controller. Large enough for the
+/// files hooks put into the installed system (`PlaceFiles`); the controller
+/// is paired, so this guards against bugs rather than attacks.
+pub const MAX_CONTROLLER_FRAME: usize = 16 * 1024 * 1024;
 
 /// Messages the target sends to the controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +100,10 @@ pub enum TargetMsg {
     Finished { live_host_key: Option<String> },
     /// Why the disks could not be left ready to boot.
     FinishFailed { error: String },
+    /// The files are in place.
+    FilesPlaced,
+    /// Why the files could not be placed.
+    FilesRefused { reason: String },
 }
 
 /// Messages the controller sends to the target.
@@ -146,6 +154,33 @@ pub enum ControllerMsg {
         zpools: Vec<String>,
         then: Shutdown,
     },
+    /// Put these files into the installed system, below `root` (mounted).
+    /// Written by hooks; possibly secrets.
+    PlaceFiles {
+        root: String,
+        files: Vec<PlacedFile>,
+    },
+}
+
+/// A file for the installed system, e.g. a secret a hook produced. Its
+/// contents are wiped from memory when dropped and never shown by `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacedFile {
+    /// Absolute path as the installed system sees it.
+    pub path: String,
+    /// Permission bits; the agent drops setuid, setgid and sticky.
+    pub mode: u32,
+    pub contents: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for PlacedFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlacedFile")
+            .field("path", &self.path)
+            .field("mode", &format_args!("{:o}", self.mode))
+            .field("contents", &format_args!("<{} bytes>", self.contents.len()))
+            .finish()
+    }
 }
 
 /// A key disko reads from a file on the target while formatting encrypted

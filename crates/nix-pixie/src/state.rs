@@ -44,6 +44,23 @@ impl StateDir {
     }
 }
 
+/// A fresh 0700 directory under `$XDG_RUNTIME_DIR` (else the temporary
+/// directory), for things no other local user may reach: the store socket,
+/// hooks' context and outputs. The caller removes it.
+pub fn private_dir() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let suffix: u64 = rand::random();
+    let dir = base.join(format!("nix-pixie-{}-{suffix:016x}", std::process::id()));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
 /// Atomically replaces `path` with `contents` plus a newline, mode 0600.
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
     let name = path.file_name().context("path has no file name")?;

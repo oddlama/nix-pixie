@@ -10,10 +10,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
+use nix_pixie_proto::ctrl::PlacedFile;
+use serde::Serialize;
+use zeroize::Zeroizing;
 
 use crate::metadata::Hook;
+use crate::state::private_dir;
 
 /// The install's own steps, in the order they happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -208,4 +215,221 @@ pub fn schedule(hooks: &BTreeMap<String, Hook>) -> Result<Schedule> {
         );
     }
     Ok(schedule)
+}
+
+/// Most a hook may put into the installed system, in total. Larger things
+/// belong in the configuration.
+const MAX_FILES_BYTES: usize = 15 * 1024 * 1024;
+
+/// The `nix run` installable for a hook's command: a name in `flake`, or an
+/// installable of its own if it has a `#`.
+pub fn installable(flake: &str, command: &str) -> String {
+    if command.contains('#') {
+        command.to_string()
+    } else {
+        format!("{flake}#{command}")
+    }
+}
+
+/// Builds the hooks, so a broken one fails before anything happens.
+pub async fn build(flake: &str, hooks: &BTreeMap<String, Hook>) -> Result<()> {
+    if hooks.is_empty() {
+        return Ok(());
+    }
+    let installables: Vec<String> = hooks
+        .values()
+        .map(|h| installable(flake, &h.command))
+        .collect();
+    let status = tokio::process::Command::new("nix")
+        .args(["build", "--no-link"])
+        .args(&installables)
+        .stdout(Stdio::null())
+        .status()
+        .await
+        .context("running `nix build` for the hooks")?;
+    if !status.success() {
+        let names: Vec<&str> = hooks.keys().map(String::as_str).collect();
+        bail!(
+            "building the hooks ({}) failed; they must be packages with a main program",
+            names.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// What a hook learns about the install so far, in `$PIXIE_CONTEXT`.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Context {
+    pub machine: String,
+    pub configuration: String,
+    pub flake: String,
+    /// `{ id, label, inventory }`.
+    pub target: serde_json::Value,
+    /// The pulled public host key (pull mode, from `host-key` on).
+    pub host_key: Option<String>,
+    /// The disk plan (from `disks` on).
+    pub disks: Option<serde_json::Value>,
+    /// The system's store path (from `build` on).
+    pub system: Option<String>,
+    /// Where the installed system is mounted on the target (`format` to
+    /// `install`).
+    pub root: Option<String>,
+}
+
+/// Runs a machine's hooks as the install passes its steps.
+pub struct Runner {
+    hooks: BTreeMap<String, Hook>,
+    schedule: Schedule,
+    /// Where hooks run: the repository.
+    dir: PathBuf,
+    pub context: Context,
+    /// Files waiting for the installed system's root to be mounted.
+    pending: Vec<PlacedFile>,
+    /// The last step whose hooks ran.
+    reached: Option<Step>,
+}
+
+impl Runner {
+    pub fn new(hooks: BTreeMap<String, Hook>, dir: PathBuf, context: Context) -> Result<Self> {
+        Ok(Self {
+            schedule: schedule(&hooks)?,
+            hooks,
+            dir,
+            context,
+            pending: Vec::new(),
+            reached: None,
+        })
+    }
+
+    /// Runs the hooks that follow `step`. Files they write wait in
+    /// [`Self::take_files`].
+    pub async fn after(&mut self, step: Step) -> Result<()> {
+        self.reached = Some(step);
+        for name in self.schedule.after(step).to_vec() {
+            let Some(hook) = self.hooks.get(&name) else {
+                continue;
+            };
+            eprintln!("Running hook {name} (after {step})");
+            let files = run(&name, hook, step, &self.dir, &self.context).await?;
+            self.pending.extend(files);
+            let total: usize = self.pending.iter().map(|f| f.contents.len()).sum();
+            if total > MAX_FILES_BYTES {
+                bail!(
+                    "the hooks' files add up to {total} bytes; at most {MAX_FILES_BYTES} can go \
+                     into the installed system this way"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The files hooks wrote that aren't in the installed system yet.
+    pub fn take_files(&mut self) -> Vec<PlacedFile> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Every hook, the step it follows, and whether it ran.
+    pub fn report(&self) -> serde_json::Value {
+        self.schedule
+            .all()
+            .map(|(step, name)| {
+                serde_json::json!({
+                    "name": name,
+                    "after": step.name(),
+                    "ran": self.reached.is_some_and(|reached| step <= reached),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Runs one hook with `nix run`, in `dir`, on the operator's terminal (its
+/// stdout goes to our stderr: our stdout is the result). Returns the files
+/// it wrote for the installed system.
+async fn run(
+    name: &str,
+    hook: &Hook,
+    step: Step,
+    dir: &Path,
+    context: &Context,
+) -> Result<Vec<PlacedFile>> {
+    let scratch = private_dir()?;
+    let result = async {
+        let mut json = serde_json::to_value(context)?;
+        if let Some(object) = json.as_object_mut() {
+            object.insert("hook".into(), name.into());
+            object.insert("step".into(), step.name().into());
+        }
+        let context_file = scratch.join("context.json");
+        std::fs::write(&context_file, serde_json::to_vec_pretty(&json)?)
+            .context("writing the hook's context")?;
+        let out = scratch.join("out");
+        std::fs::create_dir(&out).context("creating the hook's output directory")?;
+
+        let status = tokio::process::Command::new("nix")
+            .arg("run")
+            .arg(installable(&context.flake, &hook.command))
+            .arg("--")
+            .args(&hook.args)
+            .current_dir(dir)
+            .env("PIXIE_CONTEXT", &context_file)
+            .env("PIXIE_OUT", &out)
+            .env("PIXIE_HOOK", name)
+            .stdout(Stdio::from(std::io::stderr()))
+            .kill_on_drop(true)
+            .status()
+            .await
+            .with_context(|| format!("running hook {name}"))?;
+        if !status.success() {
+            bail!("hook {name} failed ({status})");
+        }
+        collect_files(&out.join("files")).with_context(|| format!("the files hook {name} wrote"))
+    }
+    .await;
+    // Its outputs may be secrets.
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// The regular files under `root`, as files for the installed system (their
+/// path relative to `root` becomes the absolute path there).
+pub fn collect_files(root: &Path) -> Result<Vec<PlacedFile>> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            let relative = path
+                .strip_prefix(root)
+                .with_context(|| format!("{} is outside the outputs", path.display()))?;
+            if meta.is_dir() {
+                dirs.push(path);
+            } else if meta.is_file() {
+                let Some(relative) = relative.to_str() else {
+                    bail!("{} is not UTF-8", relative.display());
+                };
+                files.push(PlacedFile {
+                    path: format!("/{relative}"),
+                    mode: meta.permissions().mode() & 0o777,
+                    contents: Zeroizing::new(std::fs::read(&path)?),
+                });
+            } else {
+                bail!(
+                    "{}: only regular files can go into the installed system",
+                    relative.display()
+                );
+            }
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
 }
