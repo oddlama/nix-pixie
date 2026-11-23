@@ -21,6 +21,8 @@
 //! InstallDone | InstallFailed ->
 //!                           <-   PlaceFiles { root, files }  (root mounted)
 //! FilesPlaced | FilesRefused ->
+//!                           <-   RequestAddresses           (if found at a relay)
+//! Addresses                 ->
 //!                           <-   Finish { root, zpools, then }
 //! Finished | FinishFailed   ->
 //! ```
@@ -40,6 +42,7 @@
 //! connection without cutting it off mid-handshake.
 
 use std::fmt;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -104,6 +107,8 @@ pub enum TargetMsg {
     FilesPlaced,
     /// Why the files could not be placed.
     FilesRefused { reason: String },
+    /// The addresses of the target's own network interfaces, as requested.
+    Addresses { addrs: Vec<IpAddr> },
 }
 
 /// Messages the controller sends to the target.
@@ -164,6 +169,11 @@ pub enum ControllerMsg {
     /// passphrase) for `Install`, as if it had been generated. Answered
     /// like `GenerateHostKey`. Only after `Approve`.
     ProvideHostKey { private: Secret },
+    /// Send the addresses of the target's own network interfaces. A
+    /// controller that found the target at a relay compares them with the
+    /// address its connection goes to: that is the target itself, or a NAT
+    /// in front of it. Only after `Approve`.
+    RequestAddresses,
 }
 
 /// Secret bytes: wiped from memory when dropped, never shown by `Debug`.

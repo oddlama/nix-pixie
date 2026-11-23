@@ -7,8 +7,33 @@
     reason = "tests fail by panicking"
 )]
 
-use nix_pixie::net::{dial_addrs, sanitise};
-use std::net::SocketAddr;
+use nix_pixie::net::{dial_addrs, is_own, own_addresses, sanitise};
+use std::net::{IpAddr, SocketAddr};
+
+#[test]
+fn an_address_is_the_machines_own_or_a_nats() {
+    let own: Vec<IpAddr> = ["192.168.1.7", "fe80::7", "2001:db8::7"]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+    let is = |addr: &str| is_own(addr.parse().unwrap(), &own);
+    assert!(is("192.168.1.7:47011"));
+    assert!(is("[2001:db8::7]:47011"));
+    // The scope is ours, not the machine's.
+    assert!(is("[fe80::7%3]:47011"));
+    // The same address, as an IPv6 socket reports an IPv4 peer.
+    assert!(is("[::ffff:192.168.1.7]:47011"));
+    // What a NAT in front of it shows instead.
+    assert!(!is("203.0.113.9:61001"));
+    assert!(!is("[2001:db8::8]:47011"));
+    // A target that tells nothing has no address anybody may trust.
+    assert!(!is_own("192.168.1.7:47011".parse().unwrap(), &[]));
+}
+
+#[test]
+fn own_addresses_leave_out_loopback() {
+    assert!(own_addresses().iter().all(|a| !a.is_loopback()));
+}
 
 #[test]
 fn dial_addrs_prefers_routable_addresses() {

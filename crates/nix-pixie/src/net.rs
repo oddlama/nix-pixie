@@ -10,7 +10,7 @@
 //! machine never listens for anything.
 
 use std::collections::BTreeSet;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -157,6 +157,24 @@ fn io_failure(e: std::io::Error) -> PairFailure {
         error: PairError::Frame(e.into()),
         guess_spent: false,
     }
+}
+
+/// The addresses of this machine's network interfaces, except loopback ones.
+pub fn own_addresses() -> Vec<IpAddr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| !interface.is_loopback())
+        .map(|interface| interface.ip())
+        .collect()
+}
+
+/// Whether `addr`, where a connection to a machine goes, is one of the
+/// addresses `own` that machine has itself. If not, something in between
+/// translates addresses, and other ports of `addr` lead elsewhere.
+pub fn is_own(addr: SocketAddr, own: &[IpAddr]) -> bool {
+    let ip = addr.ip().to_canonical();
+    own.iter().any(|own| own.to_canonical() == ip)
 }
 
 /// Ends our side of `stream` and waits (briefly) until the peer has

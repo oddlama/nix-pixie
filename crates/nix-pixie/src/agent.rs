@@ -380,6 +380,9 @@ async fn serve_controller(
                 None => continue,
             },
             ControllerMsg::RequestFacterReport => facter_report(state).await,
+            ControllerMsg::RequestAddresses => TargetMsg::Addresses {
+                addrs: net::own_addresses(),
+            },
             ControllerMsg::PrepareStore { root } => prepare_store(&root),
             ControllerMsg::PrepareDisks { disks, labels } => {
                 prepared = None;
@@ -467,6 +470,8 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::Install { .. } => Some(TargetMsg::InstallFailed { error: reason }),
         ControllerMsg::Finish { .. } => Some(TargetMsg::FinishFailed { error: reason }),
         ControllerMsg::PlaceFiles { .. } => Some(TargetMsg::FilesRefused { reason }),
+        // None, rather than a message just for refusing this.
+        ControllerMsg::RequestAddresses => Some(TargetMsg::Addresses { addrs: Vec::new() }),
     }
 }
 
