@@ -26,10 +26,10 @@ we build on them.
 | `nixos-install`, finalize (unmount, `zpool export`), reboot or power off, post-boot host key check | done | `checks.vm-install-*` (boots the installed disks in a second VM; a run where the key doesn't arrive fails with a mismatch) |
 | Disk layouts, installed and booted: ext4, ZFS (pool exported, no forced import), btrfs subvolumes, LVM, mdadm RAID 1 on two disks, tmpfs root, LUKS, encrypted ZFS | done | `checks.vm-install-<layout>` |
 | Encrypted layouts: LUKS (`passwordFile`, `settings.keyFile`), ZFS native encryption (created from `keylocation=file://`), passphrases typed in on the controller | done, interactive only | `checks.vm-install-{luks,zfs-encrypted}`, unit tests of what is needed and refused |
-| Secrets from scripts instead of a terminal | not started (Future ideas) | |
+| Secrets from hooks: disk keys (`$PIXIE_OUT/disk-keys/<path>`, the terminal only for what's missing), host keys (push mode) | done | `checks.vm-install-luks-scripted` (no terminal at all), unit tests |
 | Hooks: declared per machine or globally, ordered as a DAG with the install's steps, resolved and built before pairing, files into the installed system; `lib.hooks.agenixRekey` | done | `checks.vm-install-hooks`, unit tests of the ordering, file collection and placement |
 | Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
-| Host keys: push mode | not started; the controller refuses it | |
+| Host keys: push mode (from a hook, stored on the target, checked after boot) | done | `checks.vm-install-luks-scripted` |
 | Long sessions across link-local flaps | not verified | needs the store push |
 
 ## Goal
@@ -568,9 +568,15 @@ without a terminal, so only files work:
   with `postCreateHook = "zfs set keylocation=prompt <dataset>"`, as in
   disko's own example), `additionalKeyFiles` and raw or hex ZFS keys (not
   typeable).
-- The controller asks for each passphrase on the terminal, twice and
-  without echo (ZFS: 8 to 512 characters), after the disk plan and before
-  the build, so the build runs unattended. Without a terminal it refuses.
+- Keys come from hooks first: `$PIXIE_OUT/disk-keys/<path>` is the key
+  disko reads at `<path>` on the target, from hooks that run up to `disks`.
+  Those can be what can't be typed: LUKS `additionalKeyFiles`, raw (32
+  bytes) and hex (64 digits) ZFS keys; each is checked for what reads it,
+  and keys nothing reads are dropped, not sent. Whatever no hook provided,
+  the controller asks for on the terminal, twice and without echo (ZFS: 8
+  to 512 characters), after the disk plan and before the build, so the
+  build runs unattended. Without a terminal, missing keys are an error;
+  without hooks, that is known before pairing.
 - `RunDisko` carries the key files. The agent writes them 0400 only to tmpfs
   or ramfs (checked against mountinfo), so they never touch a disk, runs
   disko, and removes them whatever the outcome. `KeyFile` zeroizes its
@@ -630,11 +636,23 @@ the repository, at points of the install.
     and what is known so far: the pulled host key (from `host-key`), the
     disk plan (`disks`), the system (`build`), the mounted root (`format`
     to `install`).
-  - `$PIXIE_OUT`: an empty directory. Regular files under `files/<path>`
-    go into the installed system at `<path>`, root-owned with their
-    permission bits (never setuid, setgid or sticky), at most 15 MiB in
-    all. Files from before `format` wait until the root is mounted; after
-    `finish` there is no target any more, and producing files is an error.
+  - `$PIXIE_OUT`: an empty directory for what the hook produces (anything
+    else in it is refused as a typo):
+    - `disk-keys/<path>`: keys for disko (see Encryption), from hooks up to
+      `disks`.
+    - `host-key`: push mode's private host key (OpenSSH, no passphrase),
+      from a hook before `host-key`. The agent keeps it where a generated
+      key would be and derives the public half with `ssh-keygen -y`; from
+      there it is pull mode (recorded, installed, checked after boot).
+    - `files/<path>`: into the installed system at `<path>`, root-owned
+      with their permission bits (never setuid, setgid or sticky), at most
+      15 MiB in all.
+    Outputs that come too late (disk keys after `disks`, a host key after
+    `host-key`), two hooks providing the same key, and a host key when the
+    mode isn't push are errors.
+  - Files for the installed system from before `format` wait until the
+    root is mounted; after `finish` there is no target any more, and
+    producing files is an error.
     The agent refuses paths that leave the root, also through symlinked
     directories inside it (NixOS's `/etc/static`).
   - Both live in a private directory, removed after each run.
@@ -658,9 +676,8 @@ the repository, at points of the install.
   - helpers on the hooks' PATH: `nix-pixie target exec [--chroot] -- …` (run
     a command on the target, e.g. `systemd-cryptenroll`, `sbctl
     enroll-keys`) and `nix-pixie wait "…"` (wait mode with a notification)
-  - disk keys from hooks (scripted secrets, see Future ideas) and a
-    `result.json` (e.g. asking for a rebuild)
-  - more presets: facter, host key push, sops
+  - a `result.json` (e.g. asking for a rebuild)
+  - more presets: facter, sops
 
 ## 7. Installer image
 
@@ -787,19 +804,17 @@ Running them: `checks [PATTERN]` in the devshell builds the matching checks
 `nix flake check` evaluates all of them in one process, which needs more
 memory than a busy machine has; `checks` evaluates each on its own first.
 A layout test takes 2 to 4 minutes and about 3 GiB while it runs; all
-twenty-two checks take about 25 minutes with `JOBS=2`. The install tests fail
+twenty-three checks take about 25 minutes with `JOBS=2`. The install tests fail
 as soon as the install fails instead of waiting out their timeouts.
 
 ## Future ideas
 
 Not in v1. Recorded so the v1 design doesn't block them.
 
-- **Secrets from scripts.** Encryption passphrases are typed in on the
-  controller's terminal for now. Scripted installs need them from somewhere
-  else: files, a command (`pass show ...`), or a hook; the same mechanism
-  would serve key files that can't be typed (`additionalKeyFiles`, raw ZFS
-  keys) and host-key push mode. Possibly also relaying disko's own terminal
-  to the operator, which would make `askPassword` work.
+- **disko's own terminal.** Relaying it to the operator would make LUKS
+  `askPassword` and ZFS `keylocation = "prompt"` work, which nix-pixie
+  refuses today (keys come from files: hooks or the controller's
+  terminal).
 
 - **WAN pairing.** The controller publishes its endpoint id via pkarr on the
   mainline DHT (`iroh-mainline-address-lookup`) under a key derived from the
