@@ -38,6 +38,13 @@ pub const MAX_FAILURES: u32 = 3;
 /// How long to wait for the controller to leave after `Finished` before
 /// shutting down anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// Pause after the first rotation before showing a new code; doubles with
+/// each further rotation, up to [`MAX_ROTATION_DELAY`].
+const ROTATION_DELAY: Duration = Duration::from_secs(2);
+/// The longest pause between codes. Bounds online guessing to
+/// [`MAX_FAILURES`] guesses per minute: an agent on the internet can be
+/// dialled by anyone, not just by machines on its own network.
+const MAX_ROTATION_DELAY: Duration = Duration::from_secs(60);
 /// How long to listen for other targets' nameplates before picking ours.
 const NAMEPLATE_SURVEY: Duration = Duration::from_secs(2);
 
@@ -127,6 +134,7 @@ impl Announcer<'_> {
 /// Default mode: show a code, let the operator type it on the controller.
 async fn show_code(announcer: &mut Announcer<'_>, state: &StateDir) -> Result<()> {
     let endpoint = announcer.endpoint;
+    let mut rotations = 0;
     loop {
         let taken = nameplates_in_use(announcer.mdns, endpoint).await?;
         let nameplate =
@@ -146,11 +154,25 @@ async fn show_code(announcer: &mut Announcer<'_>, state: &StateDir) -> Result<()
                 warn!("session ended with an error: {e:#}");
             }
         } else {
+            rotations += 1;
+            let delay = rotation_delay(rotations);
             warn!(
-                "{MAX_FAILURES} pairing attempts with a wrong code; someone may be guessing. Showing a new code."
+                "{MAX_FAILURES} pairing attempts with a wrong code; someone may be guessing. Showing a new code in {}s.",
+                delay.as_secs()
             );
+            tokio::time::sleep(delay).await;
         }
     }
+}
+
+/// The pause before the new code after `rotations` rotations (counting from
+/// 1): [`ROTATION_DELAY`], doubling up to [`MAX_ROTATION_DELAY`].
+#[must_use]
+pub fn rotation_delay(rotations: u32) -> Duration {
+    let doublings = rotations.saturating_sub(1).min(16);
+    ROTATION_DELAY
+        .saturating_mul(1 << doublings)
+        .min(MAX_ROTATION_DELAY)
 }
 
 /// Nameplates other targets currently advertise via DNS-SD.
