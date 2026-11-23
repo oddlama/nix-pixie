@@ -27,6 +27,7 @@ we build on them.
 | Disk layouts, installed and booted: ext4, ZFS (pool exported, no forced import), btrfs subvolumes, LVM, mdadm RAID 1 on two disks, tmpfs root, LUKS, encrypted ZFS | done | `checks.vm-install-<layout>` |
 | Encrypted layouts: LUKS (`passwordFile`, `settings.keyFile`), ZFS native encryption (created from `keylocation=file://`), passphrases typed in on the controller | done, interactive only | `checks.vm-install-{luks,zfs-encrypted}`, unit tests of what is needed and refused |
 | Secrets from scripts instead of a terminal | not started (Future ideas) | |
+| Hooks: declared per machine or globally, ordered as a DAG with the install's steps, resolved and built before pairing, files into the installed system; `lib.hooks.agenixRekey` | done | `checks.vm-install-hooks`, unit tests of the ordering, file collection and placement |
 | Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
 | Host keys: push mode | not started; the controller refuses it | |
 | Long sessions across link-local flaps | not verified | needs the store push |
@@ -592,43 +593,69 @@ rule. That's a documented limitation, not a bug.
 
 ## 6. Hooks
 
-Hooks are executables declared in Nix. The controller builds them, and they
-**run on the controller** in the repo root.
+Implemented in `crates/nix-pixie/src/hooks.rs`, declared in `nix/options.nix`;
+tested by `checks.vm-install-hooks` and unit tests.
 
+Hooks are programs from the user's flake that **run on the controller**, in
+the repository, at points of the install.
+
+- **Declaration:** `hooks.<name>` for every machine and
+  `machines.<name>.hooks.<name>` per machine. A machine's hooks get the
+  global ones as defaults, option by option, so it can change one setting
+  or drop a hook with `enable = false`. Each has `command` (a package of the
+  flake, by name or attribute path, or any installable with `#`), `args`,
+  `after` and `before`.
+- **Ordering: a DAG, not phases.** `after` and `before` name other hooks or
+  the install's own steps, which are nodes of the same graph in their fixed
+  order: `approve`, `facter`, `host-key`, `disks`, `build`, `format`,
+  `copy`, `install`, `finish`, `boot`. So `after = [ "host-key" ]; before =
+  [ "build" ]` places a hook between the two, and hooks can order each
+  other. Every hook comes after `approve` (it needs an approved target) and
+  runs as early as its constraints allow; ties go by name. Unknown names,
+  hooks named like steps and cycles are refused before pairing.
+- **Resolved once, before pairing:** each hook is evaluated to its
+  derivation and main program (like `nix run` and `lib.getExe` pick it),
+  and all are built together. A broken hook doesn't cost the pairing code,
+  running one later costs no evaluation, and a hook that changes the
+  repository can't change what other hooks run. Hooks must be packages,
+  not apps.
 - **Contract:**
-  - stdin: JSON context (machine, phase, inventory, selected disks, host
-    pubkey…)
-  - env: `PIXIE_STATE_DIR`, a per-session 0700 tmpdir
-  - output: `PIXIE_OUT/` containing
-    - `files/<abs path>` to place into `/mnt`
-    - `disk-keys/<name>` for LUKS etc. (sent to target tmpfs before disko,
-      deleted after)
-    - `result.json`, e.g. `{ "rebuild": true }`
-  - a non-zero exit aborts the session with the hook's log
-- **Helpers on PATH for hooks:**
-  - `nix-pixie target exec [--chroot] -- …`: run a command on the target over the
-    control channel (e.g. `systemd-cryptenroll`, `sbctl enroll-keys`)
-  - `nix-pixie wait "Enable Secure Boot setup mode, then continue"`: puts the
-    controller into wait mode with a notification
-- **Phases:** `post-pair`, `post-inventory`, `pre-build` (rekey happens here),
-  `secrets` (produce files), `pre-disko`, `pre-install`, `post-install`,
-  `post-reboot`.
-- **Secret hygiene:**
-  - Hook output never goes through a Nix build, which would put it in a
-    world-readable store on the controller.
-  - It is never logged and never written to the target's `/nix/store`.
-  - Files are placed root-owned with explicit modes. Don't use numeric uids of
-    service users that don't exist yet; let activation (sops/agenix) set
-    ownership.
-- **Built-in opt-in hooks:**
-  - facter (writes the report path)
-  - ssh host key push: `source` command prints the key; `generate` and
-    `store` commands for first install
-  - ssh host key pull
-  - agenix-rekey
-  - sops (`ssh-to-age` plus a user command or `sops updatekeys`)
-
-  Each one is just a hook built on the same interface.
+  - cwd: the repository (the local flake). Hooks that change it must
+    `git add` what the build needs, as `agenix rekey --add-to-git` does.
+  - stdin: the operator's terminal, not data: rekeying may need a
+    YubiKey PIN or touch. stdout goes to the controller's stderr, since the
+    controller's stdout is its JSON result.
+  - `$PIXIE_CONTEXT`: a JSON file with the hook's name and step, the
+    machine, configuration and flake, the target (id, label, inventory),
+    and what is known so far: the pulled host key (from `host-key`), the
+    disk plan (`disks`), the system (`build`), the mounted root (`format`
+    to `install`).
+  - `$PIXIE_OUT`: an empty directory. Regular files under `files/<path>`
+    go into the installed system at `<path>`, root-owned with their
+    permission bits (never setuid, setgid or sticky), at most 15 MiB in
+    all. Files from before `format` wait until the root is mounted; after
+    `finish` there is no target any more, and producing files is an error.
+    The agent refuses paths that leave the root, also through symlinked
+    directories inside it (NixOS's `/etc/static`).
+  - Both live in a private directory, removed after each run.
+  - A non-zero exit aborts the install. The JSON result lists every hook,
+    its step and whether it ran (`--then stay` and systems without sshd
+    never reach `finish`/`boot`).
+- **Secret hygiene:** hook output never goes through a Nix build (which
+  would put it in a world-readable store), is never logged, and never
+  touches the target's `/nix/store`. Placed files are zeroized in memory
+  and redacted from `Debug` output.
+- **Presets:** `lib.hooks.agenixRekey { command ? "agenix-rekey"; }` runs
+  `agenix rekey --add-to-git` after `host-key` and before `build`. The
+  configuration's `age.rekey.hostPubkey` should read the file at
+  `hostKey.publicKeyPath`.
+- **Not yet:**
+  - helpers on the hooks' PATH: `nix-pixie target exec [--chroot] -- …` (run
+    a command on the target, e.g. `systemd-cryptenroll`, `sbctl
+    enroll-keys`) and `nix-pixie wait "…"` (wait mode with a notification)
+  - disk keys from hooks (scripted secrets, see Future ideas) and a
+    `result.json` (e.g. asking for a rebuild)
+  - more presets: facter, host key push, sops
 
 ## 7. Installer image
 
@@ -755,7 +782,7 @@ Running them: `checks [PATTERN]` in the devshell builds the matching checks
 `nix flake check` evaluates all of them in one process, which needs more
 memory than a busy machine has; `checks` evaluates each on its own first.
 A layout test takes 2 to 4 minutes and about 3 GiB while it runs; all
-twenty-one checks take about 30 minutes with `JOBS=2`. The install tests fail
+twenty-two checks take about 25 minutes with `JOBS=2`. The install tests fail
 as soon as the install fails instead of waiting out their timeouts.
 
 ## Future ideas
