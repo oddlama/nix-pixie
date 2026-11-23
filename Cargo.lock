@@ -1924,6 +1924,7 @@ dependencies = [
  "if-addrs",
  "iroh",
  "mdns-sd",
+ "n0-error",
  "nix-pixie-proto",
  "rand",
  "rpassword",

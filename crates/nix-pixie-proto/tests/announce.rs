@@ -10,7 +10,7 @@
 use nix_pixie_proto::announce::*;
 use std::collections::HashMap;
 
-fn shows(nameplate: u8) -> Announcement {
+fn shows(nameplate: u32) -> Announcement {
     Announcement::new([7; 32], 47011, Pairing::ShowsCode { nameplate }, "target")
 }
 
@@ -85,7 +85,7 @@ fn replies_are_smaller_than_probes() {
     let announcement = Announcement::new(
         [0xff; 32],
         u16::MAX,
-        Pairing::ShowsCode { nameplate: 99 },
+        Pairing::ShowsCode { nameplate: 999_999 },
         &label,
     );
     assert_eq!(announcement.label.chars().count(), MAX_LABEL);

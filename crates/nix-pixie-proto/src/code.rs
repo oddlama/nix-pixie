@@ -1,8 +1,10 @@
 //! Pairing codes: an optional public nameplate plus three secret words.
 //!
-//! * Target-shown codes (the default pairing mode) look like `42-acid-acorn-acre`.
-//!   The nameplate `42` is public: the target advertises it over DNS-SD so the
-//!   controller knows which machine to dial. Only the words are secret.
+//! * Target-shown codes (the default pairing mode) look like
+//!   `482913-acid-acorn-acre`, or `42-acid-acorn-acre` for a target that
+//!   doesn't use relays. The nameplate is public: the target advertises it
+//!   so the controller knows which machine to dial (see [`NameplateSpace`]).
+//!   Only the words are secret.
 //! * Controller-shown codes have no nameplate: `acid-acorn-acre`.
 //!
 //! Three words from the 1295-word list give about 31 bits. That is only safe
@@ -16,14 +18,47 @@
 //! that no word can turn into a different word that way.
 
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::sync::OnceLock;
 
 use rand::seq::IndexedRandom;
 
 /// Number of secret words in a code.
 pub const WORDS: usize = 3;
-/// Nameplates are chosen from `1..=MAX_NAMEPLATE`.
-pub const MAX_NAMEPLATE: u8 = 99;
+
+/// Which range a target's nameplate comes from. The nameplate only has to
+/// tell apart the targets a controller can see at once, and that depends on
+/// where it looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameplateSpace {
+    /// `1..=99`, for targets found on their local network only. A target
+    /// picks one no other target there advertises.
+    Local,
+    /// Six digits, for targets that can also be found through a relay (see
+    /// [`crate::rendezvous`]). Everybody using that relay shares these, and
+    /// nobody can list the ones in use, so there are enough that two targets
+    /// picking the same one at random is unlikely (1 in 900,000 per pair).
+    Relay,
+}
+
+impl NameplateSpace {
+    /// The nameplates of this space.
+    #[must_use]
+    pub const fn range(self) -> RangeInclusive<u32> {
+        match self {
+            Self::Local => 1..=99,
+            Self::Relay => 100_000..=999_999,
+        }
+    }
+
+    /// The space `nameplate` belongs to, if it is a nameplate at all.
+    #[must_use]
+    pub fn of(nameplate: u32) -> Option<Self> {
+        [Self::Local, Self::Relay]
+            .into_iter()
+            .find(|space| space.range().contains(&nameplate))
+    }
+}
 
 const WORDLIST_SOURCE: &str = include_str!("wordlist.txt");
 
@@ -52,7 +87,7 @@ fn lookup(word: &str) -> Option<&'static str> {
 /// A parsed or generated pairing code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Code {
-    nameplate: Option<u8>,
+    nameplate: Option<u32>,
     /// Words from [`wordlist`], in order.
     words: [&'static str; WORDS],
 }
@@ -62,7 +97,7 @@ pub struct Code {
 pub enum CodeError {
     #[error("expected {WORDS} words, got {0}")]
     WordCount(usize),
-    #[error("`{0}` is not a valid nameplate (1-{MAX_NAMEPLATE})")]
+    #[error("`{0}` is not a valid nameplate (1-99, or six digits)")]
     Nameplate(String),
     #[error("`{0}` is not a code word")]
     UnknownWord(String),
@@ -80,7 +115,7 @@ impl Code {
     /// Only if the built-in wordlist were empty (the tests check it isn't).
     /// Returned rather than papered over: a fallback would be a code without
     /// any secret.
-    pub fn generate(nameplate: Option<u8>) -> Result<Self, CodeError> {
+    pub fn generate(nameplate: Option<u32>) -> Result<Self, CodeError> {
         let list = wordlist();
         let mut rng = rand::rng();
         let mut words = [""; WORDS];
@@ -90,16 +125,26 @@ impl Code {
         Ok(Self { nameplate, words })
     }
 
-    /// Picks a random nameplate that is not in `taken`, if one is left.
+    /// Picks a random nameplate of `space` that is not in `taken`, if one is
+    /// left.
     #[must_use]
-    pub fn free_nameplate(taken: &[u8]) -> Option<u8> {
-        let free: Vec<u8> = (1..=MAX_NAMEPLATE).filter(|n| !taken.contains(n)).collect();
-        free.choose(&mut rand::rng()).copied()
+    pub fn free_nameplate(space: NameplateSpace, taken: &[u32]) -> Option<u32> {
+        match space {
+            NameplateSpace::Local => {
+                let free: Vec<u32> = space.range().filter(|n| !taken.contains(n)).collect();
+                free.choose(&mut rand::rng()).copied()
+            }
+            // Too many to list, and `taken` (what the local network shows)
+            // is a handful at most: draw until one is free.
+            NameplateSpace::Relay => (0..64)
+                .map(|_| rand::random_range(space.range()))
+                .find(|n| !taken.contains(n)),
+        }
     }
 
     /// The public nameplate, if this is a target-shown code.
     #[must_use]
-    pub fn nameplate(&self) -> Option<u8> {
+    pub fn nameplate(&self) -> Option<u32> {
         self.nameplate
     }
 
@@ -120,9 +165,9 @@ impl Code {
         let nameplate = match tokens.first() {
             Some(first) if first.bytes().all(|b| b.is_ascii_digit()) => {
                 let n = first
-                    .parse::<u8>()
+                    .parse::<u32>()
                     .ok()
-                    .filter(|n| (1..=MAX_NAMEPLATE).contains(n))
+                    .filter(|n| NameplateSpace::of(*n).is_some())
                     .ok_or_else(|| CodeError::Nameplate((*first).to_string()))?;
                 tokens.remove(0);
                 Some(n)

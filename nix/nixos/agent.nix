@@ -8,6 +8,14 @@
 }:
 let
   cfg = config.services.nix-pixie-agent;
+  relayFlags =
+    if !cfg.relay.enable then
+      [ "--no-relay" ]
+    else
+      lib.concatMap (url: [
+        "--relay"
+        url
+      ]) cfg.relay.urls;
 in
 {
   options.services.nix-pixie-agent = {
@@ -27,7 +35,38 @@ in
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Open the agent's port, its probe port (UDP 47012) and mDNS (UDP 5353).";
+      description = ''
+        Open the agent's port, its probe port (UDP 47012) and mDNS (UDP 5353).
+        Controllers on the same network find the agent through these; one
+        that finds it at a relay needs none of them.
+      '';
+    };
+
+    relay = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Whether the agent waits at a relay server while it shows a code, so
+          a controller on another network finds it without this machine
+          being reachable from there. The relay also carries their
+          (end-to-end encrypted) traffic until they have a direct path.
+
+          Without it, pairing codes are shorter (`42-acid-acorn-acre`) and
+          only controllers on the same network, or with `--target`, find
+          this machine.
+        '';
+      };
+      urls = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "https://relay.example.org" ];
+        description = ''
+          The relay servers (`iroh-relay`) to use, instead of the public ones
+          run by n0, the makers of iroh. The controller needs the same:
+          `nix-pixie controller install --relay URL`.
+        '';
+      };
     };
   };
 
@@ -54,7 +93,17 @@ in
       ]
       ++ lib.optional (config.boot.supportedFilesystems.zfs or false) config.boot.zfs.package;
       serviceConfig = {
-        ExecStart = "${lib.getExe cfg.package} agent --port ${toString cfg.port} --state-dir /run/nix-pixie";
+        ExecStart = lib.escapeShellArgs (
+          [
+            (lib.getExe cfg.package)
+            "agent"
+            "--port"
+            (toString cfg.port)
+            "--state-dir"
+            "/run/nix-pixie"
+          ]
+          ++ relayFlags
+        );
         RuntimeDirectory = "nix-pixie";
         RuntimeDirectoryMode = "0700";
         # The pairing code is printed on stdout: show it on the console too.

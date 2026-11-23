@@ -2,6 +2,7 @@
 //! in and pair, and (for now) holds the session open until the controller
 //! leaves.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,7 @@ use iroh::endpoint::{Connection, VarInt};
 use iroh::{Endpoint, SecretKey};
 use mdns_sd::ServiceEvent;
 use nix_pixie_proto::announce::{Announcement, Pairing};
-use nix_pixie_proto::code::Code;
+use nix_pixie_proto::code::{Code, NameplateSpace};
 use nix_pixie_proto::ctrl::{
     ControllerMsg, DiskAssignment, KeyFile, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, Shutdown,
     StreamRequest, TargetMsg,
@@ -26,9 +27,10 @@ use tracing::{info, warn};
 use crate::disko;
 use crate::inventory;
 use crate::mdns::{self, Mdns};
-use crate::net::{self, Stream};
+use crate::net::{self, Relays, Stream};
 use crate::nixos;
 use crate::probe::Responder;
+use crate::rendezvous::Rendezvous;
 use crate::state::StateDir;
 use crate::store;
 
@@ -53,6 +55,8 @@ pub struct AgentArgs {
     pub state_dir: PathBuf,
     pub port: u16,
     pub controller_code: Option<String>,
+    /// Where controllers on other networks can find this machine.
+    pub relays: Relays,
 }
 
 pub async fn run(args: AgentArgs) -> Result<()> {
@@ -71,8 +75,15 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     }
 
     let state = StateDir::create(args.state_dir)?;
+    // A controller's code has no nameplate to meet at: without one, relays
+    // are of no use.
+    let relays = if controller_code.is_some() {
+        Relays::Disabled
+    } else {
+        args.relays
+    };
     // A fresh identity per boot. Nothing persists on the installer.
-    let endpoint = net::bind(SecretKey::generate(), args.port).await?;
+    let endpoint = net::bind(SecretKey::generate(), args.port, &relays).await?;
     let mdns = Mdns::new()?;
     let responder = Responder::bind().await?;
     let (announce_tx, announce_rx) = watch::channel(None);
@@ -84,7 +95,10 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         endpoint: &endpoint,
         mdns: &mdns,
         probe: &announce_tx,
+        relays: &relays,
+        state: &state,
         advertised: None,
+        rendezvous: None,
     };
     let result = tokio::select! {
         r = async {
@@ -95,23 +109,28 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         } => r,
         () = crate::shutdown_signal() => Ok(()),
     };
+    announcer.withdraw().await;
     responder.abort();
     mdns.shutdown();
     endpoint.close().await;
     result
 }
 
-/// Publishes our announcement via DNS-SD and probe replies.
+/// Publishes our announcement via DNS-SD and probe replies and, with
+/// relays, at the rendezvous of its nameplate.
 struct Announcer<'a> {
     endpoint: &'a Endpoint,
     mdns: &'a Mdns,
     probe: &'a watch::Sender<Option<Announcement>>,
+    relays: &'a Relays,
+    state: &'a StateDir,
     advertised: Option<String>,
+    rendezvous: Option<Rendezvous>,
 }
 
 impl Announcer<'_> {
-    fn announce(&mut self, pairing: Pairing) -> Result<()> {
-        self.withdraw();
+    async fn announce(&mut self, pairing: Pairing) -> Result<()> {
+        self.withdraw().await;
         let announcement = Announcement::new(
             *self.endpoint.id().as_bytes(),
             net::bound_port(self.endpoint)?,
@@ -119,15 +138,47 @@ impl Announcer<'_> {
             &net::hostname(),
         );
         self.advertised = Some(self.mdns.advertise(&announcement)?);
-        self.probe.send_replace(Some(announcement));
+        self.probe.send_replace(Some(announcement.clone()));
+        if self.relays.is_enabled() {
+            self.rendezvous = Rendezvous::spawn(
+                self.endpoint.clone(),
+                announcement,
+                self.relays.clone(),
+                self.state.clone(),
+            );
+        }
         Ok(())
     }
 
-    fn withdraw(&mut self) {
+    async fn withdraw(&mut self) {
         if let Some(name) = self.advertised.take() {
             self.mdns.withdraw(&name);
         }
         self.probe.send_replace(None);
+        if let Some(rendezvous) = self.rendezvous.take() {
+            rendezvous.close().await;
+        }
+    }
+
+    /// The nameplates our codes use: long ones if controllers may have to
+    /// find us at a relay, where every other target's nameplate is too.
+    fn nameplate_space(&self) -> NameplateSpace {
+        if self.relays.is_enabled() {
+            NameplateSpace::Relay
+        } else {
+            NameplateSpace::Local
+        }
+    }
+
+    /// What the controller needs besides the code to find us.
+    fn controller_flags(&self) -> String {
+        match self.relays {
+            Relays::Custom(urls) => urls.iter().fold(String::new(), |mut flags, url| {
+                let _ = write!(flags, " --relay {url}");
+                flags
+            }),
+            Relays::N0 | Relays::Disabled => String::new(),
+        }
     }
 }
 
@@ -137,17 +188,18 @@ async fn show_code(announcer: &mut Announcer<'_>, state: &StateDir) -> Result<()
     let mut rotations = 0;
     loop {
         let taken = nameplates_in_use(announcer.mdns, endpoint).await?;
-        let nameplate =
-            Code::free_nameplate(&taken).context("all nameplates on this network are in use")?;
+        let nameplate = Code::free_nameplate(announcer.nameplate_space(), &taken)
+            .context("all nameplates on this network are in use")?;
         let code = Code::generate(Some(nameplate))?;
-        announcer.announce(Pairing::ShowsCode { nameplate })?;
+        announcer.announce(Pairing::ShowsCode { nameplate }).await?;
         state.write("code", &code.to_string())?;
         println!(
-            "\n    nix-pixie pairing code:  {code}\n\n    On the controller: nix-pixie controller pair --code {code}\n"
+            "\n    nix-pixie pairing code:  {code}\n\n    On the controller: nix-pixie controller pair --code {code}{}\n",
+            announcer.controller_flags()
         );
 
         let paired = accept_pairing(endpoint, &code, Side::OwnsCode).await;
-        announcer.withdraw();
+        announcer.withdraw().await;
         state.remove("code");
         if let Some((conn, stream)) = paired? {
             if let Err(e) = session(endpoint, state, &conn, stream).await {
@@ -176,7 +228,7 @@ pub fn rotation_delay(rotations: u32) -> Duration {
 }
 
 /// Nameplates other targets currently advertise via DNS-SD.
-async fn nameplates_in_use(mdns: &Mdns, endpoint: &Endpoint) -> Result<Vec<u8>> {
+async fn nameplates_in_use(mdns: &Mdns, endpoint: &Endpoint) -> Result<Vec<u32>> {
     let events = mdns.browse()?;
     let mut taken = Vec::new();
     let _ = tokio::time::timeout(NAMEPLATE_SURVEY, async {
@@ -197,10 +249,10 @@ async fn nameplates_in_use(mdns: &Mdns, endpoint: &Endpoint) -> Result<Vec<u8>> 
 /// Alternative mode: the operator typed the controller's code here. The
 /// controller finds us and dials in.
 async fn typed_code(announcer: &mut Announcer<'_>, state: &StateDir, code: &Code) -> Result<()> {
-    announcer.announce(Pairing::TypedControllerCode)?;
+    announcer.announce(Pairing::TypedControllerCode).await?;
     println!("\n    Waiting for the controller to connect...\n");
     let paired = accept_pairing(announcer.endpoint, code, Side::TypedCode).await;
-    announcer.withdraw();
+    announcer.withdraw().await;
     match paired? {
         Some((conn, stream)) => session(announcer.endpoint, state, &conn, stream).await,
         None => bail!(

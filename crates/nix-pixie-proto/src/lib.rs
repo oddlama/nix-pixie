@@ -10,6 +10,7 @@ pub mod frame;
 pub mod hex;
 pub mod inventory;
 pub mod pair;
+pub mod rendezvous;
 
 /// Wire protocol version. Advertised in DNS-SD TXT records and checked in the
 /// handshake. The controller supports this version and the previous one, so
@@ -25,6 +26,8 @@ pub const DEFAULT_PORT: u16 = 47_011;
 
 /// iroh ALPN for control messages, starting with pairing.
 pub const ALPN_CTRL: &[u8] = b"nix-pixie/ctrl/1";
+/// iroh ALPN of a target's rendezvous endpoint (see [`rendezvous`]).
+pub const ALPN_RENDEZVOUS: &[u8] = b"nix-pixie/rendezvous/1";
 /// iroh ALPN for the byte stream forwarded to the target's store daemon.
 pub const ALPN_STORE: &[u8] = b"nix-pixie/store/1";
 /// iroh ALPN for log and progress streaming.

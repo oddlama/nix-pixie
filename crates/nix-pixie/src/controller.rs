@@ -5,15 +5,14 @@
 //! operator's machine.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, VarInt};
-use iroh::{Endpoint, EndpointId};
+use iroh::{Endpoint, EndpointId, TransportAddr};
 use nix_pixie_proto::announce::Pairing;
-use nix_pixie_proto::code::Code;
+use nix_pixie_proto::code::{Code, NameplateSpace};
 use nix_pixie_proto::ctrl::{ControllerMsg, MAX_FACTER_FRAME, MAX_TARGET_FRAME, TargetMsg};
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use nix_pixie_proto::inventory::{Disk, Inventory};
@@ -24,7 +23,7 @@ use crate::agent::MAX_FAILURES;
 use crate::discovery::{self, Discovery, Method, Peer};
 use crate::identity;
 use crate::metadata::{self, Metadata, Suggestion};
-use crate::net::{self, DialError, Stream, sanitise};
+use crate::net::{self, DialError, Relays, Route, Stream, sanitise};
 use crate::push;
 use crate::state::write_private;
 
@@ -58,6 +57,8 @@ pub struct PairArgs {
     pub store_root: String,
     /// Probe these hosts instead of searching the local network.
     pub targets: Vec<String>,
+    /// Where to meet targets on other networks.
+    pub relays: Relays,
 }
 
 /// Pairs with the target showing a code (default mode), shows what it is,
@@ -65,7 +66,7 @@ pub struct PairArgs {
 pub async fn pair(args: PairArgs) -> Result<()> {
     let code = Code::parse(&args.code)?;
     let nameplate = code.nameplate().context(
-        "target codes start with the number shown on the target, e.g. 42-acid-acorn-acre",
+        "target codes start with the number shown on the target, e.g. 482913-acid-acorn-acre",
     )?;
     // Check everything we can first: a mistake shouldn't cost a pairing code.
     push::check_local_paths(&args.push).await?;
@@ -85,9 +86,13 @@ pub async fn pair(args: PairArgs) -> Result<()> {
         _ => {}
     }
 
-    let targets = discovery::resolve_targets(&args.targets).await?;
-    let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
-    let mut discovery = Discovery::start(args.method, targets).await?;
+    let search = Search {
+        identity: &args.identity,
+        method: args.method,
+        targets: &args.targets,
+        relays: &args.relays,
+    };
+    let (endpoint, mut discovery) = search.start(nameplate).await?;
     let result = tokio::select! {
         r = async {
             let (conn, mut stream, peer) =
@@ -104,11 +109,44 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     result
 }
 
+/// Where and how the controller looks for the target showing a code.
+pub struct Search<'a> {
+    pub identity: &'a Path,
+    pub method: Method,
+    /// Probe these hosts instead of searching the local network.
+    pub targets: &'a [String],
+    pub relays: &'a Relays,
+}
+
+impl Search<'_> {
+    /// Binds the controller's endpoint and starts looking for the target
+    /// showing `nameplate`: at the given hosts, or else on the local network
+    /// and, if the nameplate is one for relays, at its rendezvous.
+    pub async fn start(&self, nameplate: u32) -> Result<(Endpoint, Discovery)> {
+        let targets = discovery::resolve_targets(self.targets).await?;
+        // A target with a short nameplate isn't at any rendezvous, so
+        // don't connect to relays for it.
+        let relays =
+            if targets.is_empty() && NameplateSpace::of(nameplate) == Some(NameplateSpace::Relay) {
+                self.relays.clone()
+            } else {
+                Relays::Disabled
+            };
+        let secret = identity::load_or_create(self.identity)?;
+        let endpoint = net::bind(secret, 0, &relays).await?;
+        let mut discovery = Discovery::start(self.method, targets).await?;
+        if relays.is_enabled() {
+            discovery.search_relays(&endpoint, nameplate, &relays);
+        }
+        Ok((endpoint, discovery))
+    }
+}
+
 pub async fn pair_with_target(
     endpoint: &Endpoint,
     discovery: &mut Discovery,
     code: &Code,
-    nameplate: u8,
+    nameplate: u32,
     timeout: Duration,
 ) -> Result<(Connection, Stream, Peer)> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -127,8 +165,9 @@ pub async fn pair_with_target(
                 );
             }
             bail!(
-                "no target with nameplate {nameplate} found ({}). Check that the target shows this code and is on the same network segment",
-                discovery.describe()
+                "no target with nameplate {nameplate} found ({}). {}",
+                discovery.describe(),
+                discovery.hint(nameplate)
             );
         };
         let peer = peer?;
@@ -294,6 +333,7 @@ async fn review(
         "target": conn.remote_id().to_string(),
         "label": label,
         "addrs": peer.addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "route": net::route(conn).kind(),
         "inventory": inventory,
         "suggestions": suggestions.iter().map(|s| serde_json::json!({
             "machine": s.machine, "reasons": s.reasons,
@@ -365,6 +405,19 @@ pub async fn confirm(question: &str) -> Result<bool> {
     ))
 }
 
+/// How we talk to the paired target, for the operator: the address in use,
+/// or that a relay carries it.
+fn describe_route(conn: &Connection, peer: &Peer) -> String {
+    match net::route(conn) {
+        Route::Unknown => net::dial_addrs(&peer.addrs)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        route => route.to_string(),
+    }
+}
+
 /// What the operator sees before approving. Everything from the target is
 /// sanitised again here: the controller doesn't trust the target's cleanup.
 fn summary(
@@ -379,11 +432,12 @@ fn summary(
     let clean = |s: &str| sanitise(s, 128);
     let opt = |s: &Option<String>| s.as_deref().map(clean);
     let mut out = String::new();
-    let addrs: Vec<String> = net::dial_addrs(&peer.addrs)
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    let _ = writeln!(out, "\nPaired with {} ({})", clean(label), addrs.join(", "));
+    let _ = writeln!(
+        out,
+        "\nPaired with {} ({})",
+        clean(label),
+        describe_route(conn, peer)
+    );
     let _ = writeln!(out, "  id        {}", conn.remote_id());
     let firmware = match (inventory.firmware.uefi, inventory.firmware.secure_boot) {
         (false, _) => "BIOS",
@@ -503,7 +557,7 @@ pub fn human_size(bytes: u64) -> String {
 /// when new addresses show up after a failed connection attempt.
 #[derive(Default)]
 struct Dialer {
-    attempted: HashMap<EndpointId, BTreeSet<SocketAddr>>,
+    attempted: HashMap<EndpointId, BTreeSet<TransportAddr>>,
     /// Targets we ran pairing with, successfully or not.
     done: HashSet<EndpointId>,
     /// Spent guesses at the current code.
@@ -524,11 +578,10 @@ impl Dialer {
     /// Whether `peer` is new, or has addresses we haven't tried yet.
     fn would_dial(&self, peer: &Peer) -> bool {
         !self.done.contains(&peer.id)
-            && self.attempted.get(&peer.id).is_none_or(|tried| {
-                !net::dial_addrs(&peer.addrs)
-                    .iter()
-                    .all(|a| tried.contains(a))
-            })
+            && self
+                .attempted
+                .get(&peer.id)
+                .is_none_or(|tried| !net::routes(peer).iter().all(|a| tried.contains(a)))
     }
 
     async fn attempt(
@@ -544,8 +597,8 @@ impl Dialer {
         self.attempted
             .entry(peer.id)
             .or_default()
-            .extend(net::dial_addrs(&peer.addrs));
-        info!(target = %peer.id, label = %peer.label, addrs = ?net::dial_addrs(&peer.addrs), "dialing target");
+            .extend(net::routes(peer));
+        info!(target = %peer.id, label = %peer.label, addrs = ?net::dial_addrs(&peer.addrs), relayed = !peer.relays.is_empty(), "dialing target");
         match net::dial_and_pair(endpoint, peer, side, code).await {
             Ok((conn, stream)) => {
                 self.done.insert(peer.id);
@@ -553,8 +606,15 @@ impl Dialer {
             }
             Err(DialError::Connect(e)) => {
                 warn!(target = %peer.id, "could not connect: {e:#}");
-                let addrs: Vec<String> = peer.addrs.iter().map(ToString::to_string).collect();
-                self.last_connect_error = Some(format!("{e:#} (tried {})", addrs.join(", ")));
+                let tried: Vec<String> = net::routes(peer)
+                    .iter()
+                    .map(|route| match route {
+                        TransportAddr::Ip(addr) => addr.to_string(),
+                        TransportAddr::Relay(url) => format!("relay {url}"),
+                        other => format!("{other:?}"),
+                    })
+                    .collect();
+                self.last_connect_error = Some(format!("{e:#} (tried {})", tried.join(", ")));
                 Attempt::Failed
             }
             Err(DialError::Pair(failure)) => {
@@ -595,8 +655,11 @@ pub struct ServeArgs {
 /// Alternative mode: show a controller code that operators type on targets,
 /// and pair with every target that did. Prints one JSON object per target.
 pub async fn serve(args: ServeArgs) -> Result<()> {
+    // Controller codes have no nameplate to meet at, so this mode works on
+    // local networks and with `--target` only.
     let targets = discovery::resolve_targets(&args.targets).await?;
-    let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
+    let secret = identity::load_or_create(&args.identity)?;
+    let endpoint = net::bind(secret, 0, &Relays::Disabled).await?;
     let mut discovery = Discovery::start(args.method, targets).await?;
     info!(id = %endpoint.id(), "controller ready");
 

@@ -2,7 +2,7 @@
 //! and dial it. Only targets announce. The controller never listens, so the
 //! operator's machine needs no open ports.
 //!
-//! The same [`Announcement`] travels two ways:
+//! The same [`Announcement`] travels three ways:
 //!
 //! * **DNS-SD** TXT records on `_nix-pixie._udp`. This works when the
 //!   controller's firewall lets mDNS replies in. Many don't: replies to a
@@ -14,6 +14,8 @@
 //!   matches the probe's connection-tracking entry, so it passes any stateful
 //!   firewall. The controller learns which addresses to probe from its
 //!   neighbour table (see the binary's `net` module).
+//! * **Through a relay**, to controllers on other networks (see
+//!   [`crate::rendezvous`]).
 //!
 //! Everything here comes from the network and is untrusted. The endpoint id
 //! is only a claim until iroh authenticates it when dialing.
@@ -21,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::PROTOCOL_VERSION;
-use crate::code::MAX_NAMEPLATE;
+use crate::code::NameplateSpace;
 use crate::hex;
 
 /// UDP port where targets answer probes.
@@ -33,13 +35,14 @@ pub const MAX_LABEL: usize = 63;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Pairing {
     /// The target shows a code starting with this nameplate.
-    ShowsCode { nameplate: u8 },
+    ShowsCode { nameplate: u32 },
     /// The operator typed a controller's code on the target.
     TypedControllerCode,
 }
 
-/// What a waiting target publishes, via DNS-SD TXT records and in probe
-/// replies: enough to dial it and to tell which code it is waiting for.
+/// What a waiting target publishes, via DNS-SD TXT records, in probe replies
+/// and at its rendezvous: enough to dial it and to tell which code it is
+/// waiting for.
 /// Unauthenticated; pairing proves who is behind it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Announcement {
@@ -130,12 +133,12 @@ impl Announcement {
         .validated()
     }
 
-    fn validated(self) -> Result<Self, AnnounceError> {
+    pub(crate) fn validated(self) -> Result<Self, AnnounceError> {
         if self.version != PROTOCOL_VERSION {
             return Err(AnnounceError::Version(self.version));
         }
         if let Pairing::ShowsCode { nameplate } = self.pairing
-            && !(1..=MAX_NAMEPLATE).contains(&nameplate)
+            && NameplateSpace::of(nameplate).is_none()
         {
             return Err(AnnounceError::Invalid("np"));
         }

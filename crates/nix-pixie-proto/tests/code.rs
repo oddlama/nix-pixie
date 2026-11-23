@@ -33,7 +33,14 @@ fn layouts_are_unambiguous() {
 
 #[test]
 fn round_trip() {
-    for nameplate in [None, Some(1), Some(42), Some(MAX_NAMEPLATE)] {
+    for nameplate in [
+        None,
+        Some(1),
+        Some(42),
+        Some(99),
+        Some(100_000),
+        Some(999_999),
+    ] {
         let code = Code::generate(nameplate).unwrap();
         assert_eq!(Code::parse(&code.to_string()), Ok(code));
     }
@@ -69,10 +76,13 @@ fn parse_errors() {
         Code::parse("0-acid-acorn-acre"),
         Err(CodeError::Nameplate("0".into()))
     );
-    assert_eq!(
-        Code::parse("100-acid-acorn-acre"),
-        Err(CodeError::Nameplate("100".into()))
-    );
+    // Between the two nameplate spaces, and beyond them.
+    for nameplate in ["100", "99999", "1000000", "99999999999999999999"] {
+        assert_eq!(
+            Code::parse(&format!("{nameplate}-acid-acorn-acre")),
+            Err(CodeError::Nameplate(nameplate.into()))
+        );
+    }
     assert_eq!(
         Code::parse("acid-acorn-xyzzy"),
         Err(CodeError::UnknownWord("xyzzy".into()))
@@ -81,8 +91,32 @@ fn parse_errors() {
 
 #[test]
 fn free_nameplate_avoids_taken_ones() {
-    let taken: Vec<u8> = (1..MAX_NAMEPLATE).collect();
-    assert_eq!(Code::free_nameplate(&taken), Some(MAX_NAMEPLATE));
-    let all: Vec<u8> = (1..=MAX_NAMEPLATE).collect();
-    assert_eq!(Code::free_nameplate(&all), None);
+    let taken: Vec<u32> = (1..99).collect();
+    assert_eq!(
+        Code::free_nameplate(NameplateSpace::Local, &taken),
+        Some(99)
+    );
+    let all: Vec<u32> = (1..=99).collect();
+    assert_eq!(Code::free_nameplate(NameplateSpace::Local, &all), None);
+}
+
+#[test]
+fn relay_nameplates_have_six_digits() {
+    for _ in 0..1000 {
+        let nameplate = Code::free_nameplate(NameplateSpace::Relay, &[]).unwrap();
+        assert_eq!(nameplate.to_string().len(), 6, "{nameplate}");
+        assert_eq!(NameplateSpace::of(nameplate), Some(NameplateSpace::Relay));
+    }
+}
+
+#[test]
+fn nameplate_spaces_dont_overlap() {
+    assert_eq!(NameplateSpace::of(0), None);
+    assert_eq!(NameplateSpace::of(1), Some(NameplateSpace::Local));
+    assert_eq!(NameplateSpace::of(99), Some(NameplateSpace::Local));
+    assert_eq!(NameplateSpace::of(100), None);
+    assert_eq!(NameplateSpace::of(99_999), None);
+    assert_eq!(NameplateSpace::of(100_000), Some(NameplateSpace::Relay));
+    assert_eq!(NameplateSpace::of(999_999), Some(NameplateSpace::Relay));
+    assert_eq!(NameplateSpace::of(1_000_000), None);
 }

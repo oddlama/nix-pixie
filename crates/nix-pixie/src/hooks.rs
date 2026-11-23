@@ -354,6 +354,11 @@ impl Runner {
         })
     }
 
+    /// The hooks that follow `step`, in the order they would run.
+    pub fn scheduled_after(&self, step: Step) -> &[String] {
+        self.schedule.after(step)
+    }
+
     /// Runs the hooks that follow `step`. Files they write wait in
     /// [`Self::take_files`].
     pub async fn after(&mut self, step: Step) -> Result<()> {

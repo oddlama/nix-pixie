@@ -1,4 +1,5 @@
-//! Finding targets from the controller: DNS-SD and probes, merged.
+//! Finding targets from the controller: DNS-SD, probes and the relay
+//! rendezvous, merged.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -6,15 +7,17 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use iroh::EndpointId;
+use iroh::{Endpoint, EndpointId, RelayUrl};
 use mdns_sd::ServiceEvent;
 use nix_pixie_proto::announce::{Announcement, MAX_LABEL, PROBE_PORT, Pairing};
+use nix_pixie_proto::code::NameplateSpace;
 use tokio::sync::watch;
 use tracing::{debug, info};
 
 use crate::mdns::{self, Mdns};
-use crate::net::sanitise;
+use crate::net::{Relays, sanitise};
 use crate::probe::{Prober, RoundReport};
+use crate::rendezvous::Search;
 
 const PROBE_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -37,6 +40,8 @@ pub struct Peer {
     /// Sanitised, safe to display.
     pub label: String,
     pub addrs: BTreeSet<SocketAddr>,
+    /// The relays it may be connected to, if it answered at its rendezvous.
+    pub relays: BTreeSet<RelayUrl>,
 }
 
 /// Counts for error messages.
@@ -44,11 +49,13 @@ pub struct Peer {
 pub struct Stats {
     pub mdns_records: usize,
     pub probe_replies: usize,
+    pub rendezvous_answers: usize,
 }
 
-/// Finds announcing targets via DNS-SD and probes, and merges what both
-/// report into one [`Peer`] per endpoint. Owns the mDNS daemon and the probe
-/// task; call `shutdown` when done.
+/// Finds announcing targets via DNS-SD, probes and (with
+/// [`Self::search_relays`]) their rendezvous, and merges what they report
+/// into one [`Peer`] per endpoint. Owns the mDNS daemon and the search
+/// tasks; call `shutdown` when done.
 pub struct Discovery {
     mdns: Option<(Mdns, mdns_sd::Receiver<ServiceEvent>)>,
     prober: Option<(
@@ -56,6 +63,7 @@ pub struct Discovery {
         tokio::task::JoinHandle<()>,
         watch::Receiver<RoundReport>,
     )>,
+    rendezvous: Option<Search>,
     peers: HashMap<EndpointId, Peer>,
     /// News that arrived while [`Self::settle`] waited for another peer.
     pending: VecDeque<Peer>,
@@ -92,11 +100,19 @@ impl Discovery {
         Ok(Self {
             mdns,
             prober,
+            rendezvous: None,
             peers: HashMap::new(),
             pending: VecDeque::new(),
             targets,
             stats: Stats::default(),
         })
+    }
+
+    /// Also asks at the relay rendezvous of `nameplate`, with `endpoint`
+    /// through `relays`: this finds a target on another network that can't
+    /// be reached from here, as long as both reach a relay.
+    pub fn search_relays(&mut self, endpoint: &Endpoint, nameplate: u32, relays: &Relays) {
+        self.rendezvous = Some(Search::spawn(endpoint.clone(), nameplate, relays));
     }
 
     /// Waits for news about a target: first sighting, or new addresses.
@@ -124,13 +140,13 @@ impl Discovery {
 
     async fn receive(&mut self) -> Result<Peer> {
         loop {
-            let (announcement, addrs, via) = tokio::select! {
+            let (announcement, addrs, relays, via) = tokio::select! {
                 event = recv_mdns(self.mdns.as_ref()) => {
                     match event? {
                         ServiceEvent::ServiceResolved(service) => match mdns::parse(&service) {
                             Ok((announcement, addrs)) => {
                                 self.stats.mdns_records += 1;
-                                (announcement, addrs, "mDNS")
+                                (announcement, addrs, BTreeSet::new(), "mDNS")
                             }
                             Err(e) => {
                                 debug!(fullname = %service.fullname, "ignoring record: {e:#}");
@@ -142,10 +158,14 @@ impl Discovery {
                 }
                 (announcement, addr) = recv_probe(self.prober.as_ref()) => {
                     self.stats.probe_replies += 1;
-                    (announcement, vec![addr], "probe")
+                    (announcement, vec![addr], BTreeSet::new(), "probe")
+                }
+                (announcement, relays) = recv_rendezvous(self.rendezvous.as_mut()) => {
+                    self.stats.rendezvous_answers += 1;
+                    (announcement, Vec::new(), relays, "relay")
                 }
             };
-            if let Some(peer) = self.merge(&announcement, addrs, via) {
+            if let Some(peer) = self.merge(&announcement, addrs, relays, via) {
                 return Ok(peer);
             }
         }
@@ -156,6 +176,7 @@ impl Discovery {
         &mut self,
         announcement: &Announcement,
         addrs: Vec<SocketAddr>,
+        relays: BTreeSet<RelayUrl>,
         via: &str,
     ) -> Option<Peer> {
         let id = EndpointId::from_bytes(&announcement.id).ok()?;
@@ -167,6 +188,7 @@ impl Discovery {
                 pairing: announcement.pairing,
                 label: label.clone(),
                 addrs: BTreeSet::new(),
+                relays: BTreeSet::new(),
             }
         });
         let mut changed = peer.pairing != announcement.pairing || peer.label != label;
@@ -174,6 +196,9 @@ impl Discovery {
         peer.label = label;
         for addr in addrs {
             changed |= peer.addrs.insert(addr);
+        }
+        for relay in relays {
+            changed |= peer.relays.insert(relay);
         }
         changed.then(|| peer.clone())
     }
@@ -211,6 +236,9 @@ impl Discovery {
                 );
             }
         }
+        if let Some(search) = &self.rendezvous {
+            parts.push(search.describe());
+        }
         let mut text = parts.join("; ");
         if self.prober.is_none() && self.stats.mdns_records == 0 {
             text.push_str(
@@ -221,12 +249,29 @@ impl Discovery {
         text
     }
 
+    /// What to check when no target showed `nameplate`, given where we
+    /// looked.
+    pub fn hint(&self, nameplate: u32) -> &'static str {
+        if !self.targets.is_empty() {
+            "Check that the target shows this code"
+        } else if self.rendezvous.is_some() {
+            "Check that the target shows this code, and that it is on this network or reaches the same relay"
+        } else if NameplateSpace::of(nameplate) == Some(NameplateSpace::Relay) {
+            "Check that the target shows this code and is on this network. Without a relay (--no-relay), a target elsewhere is only found with --target HOST"
+        } else {
+            "Check that the target shows this code and is on this network. A code this short is from a target that uses no relay: elsewhere, it is only found with --target HOST"
+        }
+    }
+
     pub fn shutdown(self) {
         if let Some((mdns, _)) = self.mdns {
             mdns.shutdown();
         }
         if let Some((_, task, _)) = self.prober {
             task.abort();
+        }
+        if let Some(search) = self.rendezvous {
+            search.shutdown();
         }
     }
 }
@@ -255,6 +300,16 @@ async fn recv_probe(
 ) -> (Announcement, SocketAddr) {
     match prober {
         Some((prober, _, _)) => prober.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_rendezvous(search: Option<&mut Search>) -> (Announcement, BTreeSet<RelayUrl>) {
+    match search {
+        Some(search) => {
+            let announcement = search.recv().await;
+            (announcement, search.relays.clone())
+        }
         None => std::future::pending().await,
     }
 }

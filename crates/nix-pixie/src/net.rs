@@ -1,10 +1,11 @@
 //! iroh endpoint and pairing over it.
 //!
-//! v1 is LAN-only: no relays and no iroh address lookup services (which would
-//! contact n0's DNS servers). Targets are found by `discovery` and dialed at
-//! the addresses it reports. iroh authenticates the dialed endpoint id, so a
-//! forged announcement can at most point us at the wrong machine, and pairing
-//! then fails.
+//! Targets are found by `discovery` and dialed at the addresses it reports,
+//! and through relays if they answered at their rendezvous (see
+//! `rendezvous`). No iroh address lookup services are used (those would
+//! publish endpoints on n0's DNS servers). iroh authenticates the dialed
+//! endpoint id, so a forged announcement can at most point us at the wrong
+//! machine, and pairing then fails.
 //!
 //! The controller always dials and the agent always accepts. The operator's
 //! machine never listens for anything.
@@ -13,15 +14,16 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use iroh::endpoint::{BindOpts, Connection, RecvStream, SendStream, presets};
-use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use nix_pixie_proto::ALPN_CTRL;
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::pair::{PairError, PairFailure, PairParams, Role, Side, pair};
 use tokio::io::Join;
 
 use crate::discovery::Peer;
+use crate::dns;
 
 /// How long to wait for a QUIC handshake with a discovered peer.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,11 +33,80 @@ pub const PAIR_TIMEOUT: Duration = Duration::from_secs(20);
 /// A bidirectional QUIC stream as one `AsyncRead + AsyncWrite`.
 pub type Stream = Join<RecvStream, SendStream>;
 
-/// Binds an iroh endpoint on `port` (0 = any) for IPv4 and, if available, IPv6.
-pub async fn bind(secret: SecretKey, port: u16) -> Result<Endpoint> {
+/// The relay servers an endpoint uses. A relay forwards (encrypted) packets
+/// between endpoints that connected to it, so a target behind NAT or a
+/// firewall can be reached, and helps the two find a direct path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Relays {
+    /// None: only local networks and addresses the controller can reach.
+    Disabled,
+    /// The public relays of n0, the makers of iroh.
+    N0,
+    /// Relays the user chose, e.g. their own `iroh-relay`.
+    Custom(BTreeSet<RelayUrl>),
+}
+
+impl Relays {
+    /// From the command line: `--relay URL` (repeatable) and `--no-relay`.
+    pub fn from_args(urls: &[String], disabled: bool) -> Result<Self> {
+        if disabled {
+            return Ok(Self::Disabled);
+        }
+        if urls.is_empty() {
+            return Ok(Self::N0);
+        }
+        let mut relays = BTreeSet::new();
+        for url in urls {
+            let relay: RelayUrl = url
+                .parse()
+                .with_context(|| format!("`{url}` is not a relay URL"))?;
+            if !matches!(relay.scheme(), "https" | "http") || relay.host_str().is_none() {
+                bail!("`{url}` is not a relay URL: expected https://HOST[:PORT]");
+            }
+            relays.insert(relay);
+        }
+        Ok(Self::Custom(relays))
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Every relay a peer using the same setting may be connected to.
+    pub fn urls(&self) -> BTreeSet<RelayUrl> {
+        self.mode().relay_map().urls()
+    }
+
+    pub(crate) fn mode(&self) -> RelayMode {
+        match self {
+            Self::Disabled => RelayMode::Disabled,
+            Self::N0 => RelayMode::Default,
+            Self::Custom(urls) => RelayMode::custom(urls.iter().cloned()),
+        }
+    }
+}
+
+impl std::fmt::Display for Relays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "no relay"),
+            Self::N0 => write!(f, "n0's public relays"),
+            Self::Custom(urls) => {
+                let urls: Vec<String> = urls.iter().map(ToString::to_string).collect();
+                write!(f, "{}", urls.join(", "))
+            }
+        }
+    }
+}
+
+/// Binds an iroh endpoint on `port` (0 = any) for IPv4 and, if available,
+/// IPv6.
+pub async fn bind(secret: SecretKey, port: u16, relays: &Relays) -> Result<Endpoint> {
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .alpns(vec![ALPN_CTRL.to_vec()])
+        .relay_mode(relays.mode())
+        .dns_resolver(dns::resolver())
         .clear_ip_transports()
         .bind_addr((Ipv4Addr::UNSPECIFIED, port))?
         .bind_addr_with_opts(
@@ -75,10 +146,7 @@ pub async fn dial_and_pair(
     side: Side,
     code: &Code,
 ) -> Result<(Connection, Stream), DialError> {
-    let addr = EndpointAddr::from_parts(
-        peer.id,
-        dial_addrs(&peer.addrs).into_iter().map(TransportAddr::Ip),
-    );
+    let addr = EndpointAddr::from_parts(peer.id, routes(peer));
     let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN_CTRL))
         .await
         .map_err(|_| DialError::Connect(anyhow::anyhow!("timed out")))?
@@ -108,6 +176,81 @@ pub fn dial_addrs(addrs: &BTreeSet<SocketAddr>) -> Vec<SocketAddr> {
         addrs.iter().copied().collect()
     } else {
         routable
+    }
+}
+
+/// Every way to reach `peer`: its addresses worth dialing, and the relays
+/// it may be connected to.
+pub fn routes(peer: &Peer) -> Vec<TransportAddr> {
+    dial_addrs(&peer.addrs)
+        .into_iter()
+        .map(TransportAddr::Ip)
+        .chain(peer.relays.iter().cloned().map(TransportAddr::Relay))
+        .collect()
+}
+
+/// The addresses of this machine's network interfaces, except loopback ones.
+pub fn own_addresses() -> Vec<IpAddr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| !interface.is_loopback())
+        .map(|interface| interface.ip())
+        .collect()
+}
+
+/// Whether `addr`, where a connection to a machine goes, is one of the
+/// addresses `own` that machine has itself. If not, something in between
+/// translates addresses, and other ports of `addr` lead elsewhere.
+pub fn is_own(addr: SocketAddr, own: &[IpAddr]) -> bool {
+    let ip = addr.ip().to_canonical();
+    own.iter().any(|own| own.to_canonical() == ip)
+}
+
+/// How data currently travels on `conn`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Straight to this address of the peer.
+    Direct(SocketAddr),
+    /// Through this relay: slow, and at the relay operator's expense.
+    Relayed(RelayUrl),
+    /// No path is selected (yet).
+    Unknown,
+}
+
+impl Route {
+    /// `direct`, `relay` or `unknown`, for machine-readable output.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Direct(_) => "direct",
+            Self::Relayed(_) => "relay",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct(addr) => write!(f, "{addr}"),
+            Self::Relayed(url) => write!(f, "relayed through {url}"),
+            Self::Unknown => write!(f, "no path"),
+        }
+    }
+}
+
+/// The path `conn` sends data on right now. A connection that started
+/// through a relay moves to a direct path once the two endpoints found one.
+pub fn route(conn: &Connection) -> Route {
+    let paths = conn.paths();
+    match paths
+        .iter()
+        .find(iroh::endpoint::Path::is_selected)
+        .map(|p| p.remote_addr().clone())
+    {
+        Some(TransportAddr::Ip(addr)) => Route::Direct(addr),
+        Some(TransportAddr::Relay(url)) => Route::Relayed(url),
+        _ => Route::Unknown,
     }
 }
 
@@ -157,24 +300,6 @@ fn io_failure(e: std::io::Error) -> PairFailure {
         error: PairError::Frame(e.into()),
         guess_spent: false,
     }
-}
-
-/// The addresses of this machine's network interfaces, except loopback ones.
-pub fn own_addresses() -> Vec<IpAddr> {
-    if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|interface| !interface.is_loopback())
-        .map(|interface| interface.ip())
-        .collect()
-}
-
-/// Whether `addr`, where a connection to a machine goes, is one of the
-/// addresses `own` that machine has itself. If not, something in between
-/// translates addresses, and other ports of `addr` lead elsewhere.
-pub fn is_own(addr: SocketAddr, own: &[IpAddr]) -> bool {
-    let ip = addr.ip().to_canonical();
-    own.iter().any(|own| own.to_canonical() == ip)
 }
 
 /// Ends our side of `stream` and waits (briefly) until the peer has

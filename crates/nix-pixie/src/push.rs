@@ -17,7 +17,7 @@ use tokio::net::UnixListener;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::net::{Stream, sanitise};
+use crate::net::{self, Route, Stream, sanitise};
 use crate::state::private_dir;
 
 /// What a finished push reports.
@@ -56,9 +56,21 @@ pub async fn push(
     paths: &[String],
 ) -> Result<PushReport> {
     let fstype = prepare_disk_store(ctrl, root).await?;
+    warn_if_relayed(conn);
     let request = StreamRequest::Store { root: root.into() };
     let seconds = copy(conn, &request, paths).await?;
     Ok(PushReport { fstype, seconds })
+}
+
+/// Tells the operator if a copy is about to go through a relay. Relays are
+/// for finding a direct path; a whole system through one is slow, and
+/// somebody else pays for the traffic.
+pub fn warn_if_relayed(conn: &Connection) {
+    if let Route::Relayed(relay) = net::route(conn) {
+        eprintln!(
+            "No direct path to the target (yet): copying through the relay {relay}, which is slow."
+        );
+    }
 }
 
 /// Asks the target to check that the store under `root` is on a disk.

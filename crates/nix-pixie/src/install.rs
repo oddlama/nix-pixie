@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -24,12 +25,11 @@ use tracing::{info, trace};
 use zeroize::Zeroizing;
 
 use crate::controller::{self, Approved, confirm, describe_disk};
-use crate::discovery::{self, Discovery, Method, Peer};
+use crate::discovery::{Method, Peer};
 use crate::hooks::{self, Step};
 use crate::hostkey::{self, PublicKey};
-use crate::identity;
 use crate::metadata::{self, HostKeyMode, Machine, Metadata};
-use crate::net::{self, Stream, sanitise};
+use crate::net::{self, Relays, Route, Stream, sanitise};
 use crate::plan::{self, Choice, Resolution};
 use crate::preflight;
 use crate::push;
@@ -40,6 +40,8 @@ use crate::system::{Built, Configuration, Disko, Facts, Ssh};
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Unmounting and exporting pools.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(120);
+/// For the target to list its addresses.
+const ADDRESSES_TIMEOUT: Duration = Duration::from_secs(10);
 /// How much of disko's and nixos-install's output to keep for showing a
 /// failure.
 const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
@@ -67,6 +69,8 @@ pub struct InstallArgs {
     pub boot_timeout: Duration,
     /// Probe these hosts instead of searching the local network.
     pub targets: Vec<String>,
+    /// Where to meet targets on other networks.
+    pub relays: Relays,
 }
 
 /// What the target does once the system is installed.
@@ -85,7 +89,7 @@ pub enum Then {
 pub async fn install(args: InstallArgs) -> Result<()> {
     let code = Code::parse(&args.code)?;
     let nameplate = code.nameplate().context(
-        "target codes start with the number shown on the target, e.g. 42-acid-acorn-acre",
+        "target codes start with the number shown on the target, e.g. 482913-acid-acorn-acre",
     )?;
     let requested = parse_disk_args(&args.disks)?;
     let metadata = metadata::load(&args.flake).await?;
@@ -116,9 +120,13 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         None
     };
 
-    let targets = discovery::resolve_targets(&args.targets).await?;
-    let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
-    let mut discovery = Discovery::start(args.method, targets).await?;
+    let search = controller::Search {
+        identity: &args.identity,
+        method: args.method,
+        targets: &args.targets,
+        relays: &args.relays,
+    };
+    let (endpoint, mut discovery) = search.start(nameplate).await?;
     let result = tokio::select! {
         r = async {
             let (conn, mut stream, peer) = controller::pair_with_target(
@@ -179,7 +187,7 @@ struct Installed {
 
 /// Where and what to ask the installed system's SSH server.
 struct Check {
-    addrs: Vec<std::net::SocketAddr>,
+    addrs: Vec<SocketAddr>,
     port: u16,
     /// Pull or push mode: the key the install put there.
     expected: Option<PublicKey>,
@@ -188,6 +196,43 @@ struct Check {
     machine: String,
     /// The first boot may wait for a disk passphrase on the console.
     encrypted: bool,
+}
+
+impl Check {
+    /// The check with the addresses to ask, if there are any: `ssh_at` is
+    /// [`ssh_addrs`]' answer, or `None` without an SSH server. Otherwise the
+    /// reason goes to the operator and into `report`.
+    fn at(
+        mut self,
+        ssh_at: Option<Result<Vec<SocketAddr>, String>>,
+        hooks: &hooks::Runner,
+        report: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Self> {
+        let mut entry = serde_json::Map::new();
+        match ssh_at {
+            Some(Ok(addrs)) => {
+                self.addrs = addrs;
+                return Some(self);
+            }
+            Some(Err(reason)) => {
+                eprintln!("\nNot waiting for {} to boot: {reason}.", self.machine);
+                if let Some(key) = &self.expected {
+                    eprintln!("Its host key, to compare when you first connect: {key}");
+                    entry.insert("expected".into(), key.to_string().into());
+                }
+                let hooks = hooks.scheduled_after(Step::Boot);
+                if !hooks.is_empty() {
+                    eprintln!("Not running the hooks after `boot`: {}", hooks.join(", "));
+                }
+                entry.insert("skipped".into(), reason.into());
+            }
+            None => {
+                entry.insert("skipped".into(), "services.openssh is not enabled".into());
+            }
+        }
+        report.insert("hostKey".into(), entry.into());
+        None
+    }
 }
 
 /// Waits for the installed system and compares its host key; records the
@@ -485,6 +530,7 @@ async fn apply(
     place_files(stream, &root, &mut hooks).await?;
 
     let fstype = push::prepare_disk_store(stream, &root).await?;
+    push::warn_if_relayed(conn);
     eprintln!("Sending the system into {root} ({fstype})");
     let seconds = push::copy(
         conn,
@@ -524,26 +570,25 @@ async fn apply(
         Then::Reboot => Shutdown::Reboot,
         Then::Poweroff => Shutdown::PowerOff,
     };
+    // Asked while the target still answers.
+    let ssh_at = if ssh.enable {
+        Some(ssh_addrs(stream, conn, peer).await?)
+    } else {
+        None
+    };
     let live = finish(stream, &root, &disko.zpools, shutdown).await?;
     hooks.context.root = None;
     hooks.after(Step::Finish).await?;
     no_files_left(&mut hooks, Step::Finish)?;
-    let check = if ssh.enable {
-        Some(Check {
-            addrs: peer.addrs.iter().copied().collect(),
-            port: ssh.ports.first().copied().unwrap_or(22),
-            expected,
-            live,
-            machine: name,
-            encrypted: !(disko.encryption.luks.is_empty() && disko.encryption.zfs.is_empty()),
-        })
-    } else {
-        report.insert(
-            "hostKey".into(),
-            serde_json::json!({ "skipped": "services.openssh is not enabled" }),
-        );
-        None
+    let check = Check {
+        addrs: Vec::new(),
+        port: ssh.ports.first().copied().unwrap_or(22),
+        expected,
+        live,
+        machine: name,
+        encrypted: !(disko.encryption.luks.is_empty() && disko.encryption.zfs.is_empty()),
     };
+    let check = check.at(ssh_at, &hooks, &mut report);
     Ok(Installed {
         report,
         check,
@@ -576,6 +621,7 @@ fn report(
         ("root", root.into()),
         ("fstype", fstype.into()),
         ("pushSeconds", seconds.into()),
+        ("route", net::route(conn).kind().into()),
         ("then", format!("{then:?}").to_ascii_lowercase().into()),
     ] {
         report.insert(key.into(), value);
@@ -721,6 +767,51 @@ async fn install_system(
             bail!("installing failed: {}", sanitise(&error, 300))
         }
         _ => bail!("unexpected message while installing"),
+    }
+}
+
+/// Where the installed system's SSH server can be asked for its host key,
+/// or why nowhere.
+///
+/// A target found on a network, or named with `--target`, answers where it
+/// was found. One found only at a relay has no address we know to be its
+/// own: a direct path to it may end at a NAT, and whatever answers SSH at a
+/// NAT's address is another machine. So the target is asked.
+async fn ssh_addrs(
+    stream: &mut Stream,
+    conn: &Connection,
+    peer: &Peer,
+) -> Result<Result<Vec<SocketAddr>, String>> {
+    if !peer.addrs.is_empty() {
+        return Ok(Ok(peer.addrs.iter().copied().collect()));
+    }
+    let Route::Direct(addr) = net::route(conn) else {
+        return Ok(Err(
+            "it was only reached through a relay, so there is no address to ask for its host key"
+                .into(),
+        ));
+    };
+    let own = own_addresses(stream).await?;
+    Ok(if net::is_own(addr, &own) {
+        Ok(vec![addr])
+    } else {
+        Err(format!(
+            "it is behind NAT ({} is not an address of its own), so its SSH server can't be \
+             asked for its host key from here",
+            addr.ip()
+        ))
+    })
+}
+
+/// The addresses of the target's network interfaces.
+async fn own_addresses(stream: &mut Stream) -> Result<Vec<IpAddr>> {
+    write_frame(stream, &ControllerMsg::RequestAddresses).await?;
+    let reply = tokio::time::timeout(ADDRESSES_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
+        .await
+        .context("timed out waiting for the target's addresses")??;
+    match reply {
+        TargetMsg::Addresses { addrs } => Ok(addrs),
+        _ => bail!("unexpected reply to asking for the target's addresses"),
     }
 }
 

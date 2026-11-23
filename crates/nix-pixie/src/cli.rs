@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
+use crate::net::Relays;
 use crate::{agent, controller, discovery, identity, install};
 
 /// The command line.
@@ -14,6 +15,28 @@ use crate::{agent, controller, discovery, identity, install};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Which relay servers to meet at (`--relay`, `--no-relay`). A target that
+/// shows a code waits at a relay, where a controller on another network
+/// finds it without the target having to be reachable; the relay also
+/// carries their (encrypted) traffic until they have found a direct path.
+#[derive(Debug, clap::Args)]
+pub struct RelayArgs {
+    /// Meet at this relay server (an `iroh-relay`; repeatable) instead of
+    /// the public ones run by n0, the makers of iroh. Controller and target
+    /// need the same.
+    #[arg(long = "relay", value_name = "URL")]
+    relays: Vec<String>,
+    /// Use no relay: pair on the local network, or with `--target`.
+    #[arg(long, conflicts_with = "relays")]
+    no_relay: bool,
+}
+
+impl RelayArgs {
+    fn relays(&self) -> Result<Relays> {
+        Relays::from_args(&self.relays, self.no_relay)
+    }
 }
 
 /// Top-level commands, one per role.
@@ -37,9 +60,12 @@ pub enum Command {
         port: u16,
         /// Pair using the code shown by a controller (`nix-pixie controller
         /// serve`) instead of showing a code here. The controller finds this
-        /// machine and connects to it.
+        /// machine and connects to it, on the local network or with
+        /// `--target`: relays aren't used.
         #[arg(long, value_name = "CODE")]
         controller_code: Option<String>,
+        #[command(flatten)]
+        relay: RelayArgs,
     },
     /// Serve DHCP and PXE for the installer image (needs root).
     Netboot,
@@ -52,7 +78,7 @@ pub enum ControllerCommand {
     Id,
     /// Pair with the target showing CODE; prints the paired target as JSON.
     Pair {
-        /// The code shown on the target, e.g. 42-acid-acorn-acre.
+        /// The code shown on the target, e.g. 482913-acid-acorn-acre.
         #[arg(long)]
         code: String,
         /// Give up after this many seconds.
@@ -67,6 +93,8 @@ pub enum ControllerCommand {
         /// and 47012 to it.
         #[arg(long = "target", value_name = "HOST")]
         targets: Vec<String>,
+        #[command(flatten)]
+        relay: RelayArgs,
         /// Flake whose `pixie` output describes your machines. Used to match
         /// the target to a machine and to write its facter report.
         #[arg(long)]
@@ -90,7 +118,7 @@ pub enum ControllerCommand {
     /// it: choose disks, build, format with disko, and send the system.
     /// Prints the result as JSON.
     Install {
-        /// The code shown on the target, e.g. 42-acid-acorn-acre.
+        /// The code shown on the target, e.g. 482913-acid-acorn-acre.
         #[arg(long)]
         code: String,
         /// Flake with the `pixie` output and the configurations.
@@ -129,6 +157,8 @@ pub enum ControllerCommand {
         /// and 47012 to it.
         #[arg(long = "target", value_name = "HOST")]
         targets: Vec<String>,
+        #[command(flatten)]
+        relay: RelayArgs,
     },
     /// Show a controller code for targets to type in; prints one JSON line
     /// per paired target.
@@ -163,91 +193,101 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(path) => path,
                 None => identity::default_path()?,
             };
-            match command {
-                ControllerCommand::Id => controller::print_id(&identity),
-                ControllerCommand::Pair {
-                    code,
-                    timeout,
-                    discovery,
-                    flake,
-                    machine,
-                    yes,
-                    push,
-                    store_root,
-                    targets,
-                } => {
-                    controller::pair(controller::PairArgs {
-                        identity,
-                        code,
-                        timeout: Duration::from_secs(timeout),
-                        method: discovery,
-                        flake,
-                        machine,
-                        yes,
-                        push,
-                        store_root,
-                        targets,
-                    })
-                    .await
-                }
-                ControllerCommand::Install {
-                    code,
-                    flake,
-                    machine,
-                    disks,
-                    yes,
-                    wipe,
-                    then,
-                    boot_timeout,
-                    timeout,
-                    discovery,
-                    targets,
-                } => {
-                    install::install(install::InstallArgs {
-                        identity,
-                        code,
-                        timeout: Duration::from_secs(timeout),
-                        method: discovery,
-                        flake,
-                        machine,
-                        disks,
-                        yes,
-                        wipe,
-                        then,
-                        boot_timeout: Duration::from_secs(boot_timeout),
-                        targets,
-                    })
-                    .await
-                }
-                ControllerCommand::Serve {
-                    code_file,
-                    max_targets,
-                    discovery,
-                    targets,
-                } => {
-                    controller::serve(controller::ServeArgs {
-                        identity,
-                        code_file,
-                        max_targets,
-                        method: discovery,
-                        targets,
-                    })
-                    .await
-                }
-            }
+            run_controller(identity, command).await
         }
         Command::Agent {
             state_dir,
             port,
             controller_code,
+            relay,
         } => {
             agent::run(agent::AgentArgs {
                 state_dir,
                 port,
                 controller_code,
+                relays: relay.relays()?,
             })
             .await
         }
         Command::Netboot => bail!("netboot is not implemented yet"),
+    }
+}
+
+async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result<()> {
+    match command {
+        ControllerCommand::Id => controller::print_id(&identity),
+        ControllerCommand::Pair {
+            code,
+            timeout,
+            discovery,
+            flake,
+            machine,
+            yes,
+            push,
+            store_root,
+            targets,
+            relay,
+        } => {
+            controller::pair(controller::PairArgs {
+                identity,
+                code,
+                timeout: Duration::from_secs(timeout),
+                method: discovery,
+                flake,
+                machine,
+                yes,
+                push,
+                store_root,
+                targets,
+                relays: relay.relays()?,
+            })
+            .await
+        }
+        ControllerCommand::Install {
+            code,
+            flake,
+            machine,
+            disks,
+            yes,
+            wipe,
+            then,
+            boot_timeout,
+            timeout,
+            discovery,
+            targets,
+            relay,
+        } => {
+            install::install(install::InstallArgs {
+                identity,
+                code,
+                timeout: Duration::from_secs(timeout),
+                method: discovery,
+                flake,
+                machine,
+                disks,
+                yes,
+                wipe,
+                then,
+                boot_timeout: Duration::from_secs(boot_timeout),
+                targets,
+                relays: relay.relays()?,
+            })
+            .await
+        }
+        ControllerCommand::Serve {
+            code_file,
+            max_targets,
+            discovery,
+            targets,
+        } => {
+            controller::serve(controller::ServeArgs {
+                identity,
+                code_file,
+                max_targets,
+                method: discovery,
+                targets,
+            })
+            .await
+        }
     }
 }

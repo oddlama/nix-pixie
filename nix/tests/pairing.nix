@@ -1,7 +1,9 @@
 # Discovery and pairing between a controller and installer agents on an
 # isolated network (test VMs have no internet, so this is also the airgapped
-# case). Covers both pairing modes, wrong codes, code rotation, and each
-# discovery method.
+# case: the relays both sides would use by default are out of reach).
+# Covers both pairing modes, wrong codes, code rotation, each discovery
+# method, agents with and without relays, and what an agent costs while its
+# relays are out of reach.
 #
 # The controller keeps the default NixOS firewall with nothing opened, like an
 # operator's laptop.
@@ -82,6 +84,8 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the code is on the console"):
         code = current_code()
+        # Long enough to be found at a relay, even though none is in reach.
+        assert len(code.split("-")[0]) == 6, code
         target.wait_until_succeeds(f"journalctl -u nix-pixie-agent -o cat | grep -F 'pairing code:  {code}'")
 
     with subtest("controller pairs through its closed firewall"):
@@ -119,9 +123,10 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a typo in the nameplate finds nobody, and the error says where it looked"):
         nameplate = int(code.split("-")[0])
-        other = f"{nameplate % 99 + 1}-{code.split('-', 1)[1]}"
+        other = f"{nameplate ^ 1}-{code.split('-', 1)[1]}"
         out = controller.fail(as_alice(f"nix-pixie controller pair --yes --timeout 5 --code {other} 2>&1"))
         assert "found" in out and "eth1 192.168.1.1/24" in out, out
+        assert "reached none of n0's public relays" in out, out
 
     with subtest("target types the controller's code; the controller dials it"):
         controller.succeed(
@@ -148,6 +153,33 @@ pkgs.testers.runNixOSTest {
         # serve exits after one target; the agent then ends cleanly.
         controller.wait_until_fails("systemctl is-active pixie-serve")
         target2.wait_until_succeeds("journalctl -u pixie-agent2 | grep -F 'controller disconnected'")
+
+    with subtest("an agent without relays shows a short code, and pairs"):
+        target2.wait_until_fails("systemctl is-active pixie-agent2")
+        target2.succeed(
+            "systemd-run --unit=pixie-agent3 ${exe} agent --state-dir /run/nix-pixie3 --no-relay"
+        )
+        target2.wait_for_file("/run/nix-pixie3/code")
+        short = target2.succeed("cat /run/nix-pixie3/code").strip()
+        assert 1 <= int(short.split("-")[0]) <= 99, short
+        out = controller.succeed(as_alice(f"nix-pixie controller pair --yes --code {short}"))
+        assert json.loads(out)["label"] == "target2", out
+        target2.succeed("systemctl stop pixie-agent3")
+
+    with subtest("an agent that reaches no relay doesn't pile up sockets"):
+        # Looking up the relays' names where no name server answers once held
+        # hundreds of sockets at a time: enough to run out of open files, so
+        # that a pairing just then failed.
+        target2.succeed("systemd-run --unit=pixie-agent4 ${exe} agent --state-dir /run/nix-pixie4")
+        target2.wait_for_file("/run/nix-pixie4/code")
+        most = int(target2.succeed(
+            "pid=$(systemctl show -p MainPID --value pixie-agent4); most=0;"
+            " for _ in $(seq 60); do"
+            " n=$(ls /proc/$pid/fd | wc -l); [ $n -gt $most ] && most=$n; sleep 0.2;"
+            " done; echo $most"
+        ))
+        assert 0 < most < 64, most
+        target2.succeed("systemctl stop pixie-agent4")
 
     with subtest("the controller never listened"):
         # No sockets bound to the agent ports on the operator's machine.
