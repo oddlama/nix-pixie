@@ -31,6 +31,8 @@ we build on them.
 | Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
 | Host keys: push mode (from a hook, stored on the target, checked after boot) | done | `checks.vm-install-luks-scripted` |
 | Long sessions across link-local flaps | not verified | needs the store push |
+| Targets on other networks (`--target HOST`, unicast probes) running the agent package on a stock NixOS live system (`nix run …#agent`) | done; the target must be reachable on UDP 47011/47012 (no NAT traversal) | `checks.vm-remote` (target behind a router with its default firewall; plain NixOS, none of our modules) |
+| Online guessing: rotation after 3 spent guesses, backing off 2 s doubling to 60 s | done | unit tests of the delay, `checks.vm-pairing` |
 
 ## Goal
 
@@ -63,7 +65,7 @@ or opinions.
 | Network | mDNS/DNS-SD + probes + iroh; optional DHCP server for direct-cable setups; fully airgapped must work |
 | Operator's firewall | Needs no open ports. The controller only dials out (see §1) |
 | License | MIT |
-| Scope v1 | LAN and airgapped only. WAN is recorded under [Future ideas](#future-ideas) |
+| Scope v1 | LAN and airgapped, plus targets the controller can reach by address (`--target`, e.g. a server on the internet). Pairing through NAT is recorded under [Future ideas](#future-ideas) |
 | Default pairing | Mode 3 (target shows code, operator types it on the controller). Mode 2 (controller shows code) also available |
 | Auto-approve | Not in v1. Match hints only pre-select a configuration; a human always approves |
 | Name | nix-pixie (binary `nix-pixie`) |
@@ -171,7 +173,17 @@ flake evaluation, hooks and secret decryption running as root.
   another DHCP server answers**, unless `--force`. A rogue DHCP server on an
   office LAN causes an outage. proxyDHCP mode for PXE on networks that have
   DHCP already.
-- **WAN:** not in v1, see [Future ideas](#future-ideas).
+- **Targets on other networks** (`controller pair|install|serve --target
+  HOST`, repeatable): instead of DNS-SD and broadcasts, the controller probes
+  only the given addresses by unicast, every 1.5 s. HOST is an IP address or
+  a name, looked up before anything else so a typo fails early. The reply is
+  the same announcement as on a LAN, so pairing, approval and the install run
+  unchanged; the code still authenticates the target, and the controller
+  still only dials out. The target must be reachable on UDP 47011 and 47012:
+  a server with a public address, or one behind a VPN or port forwarding.
+  The probe reply is shorter than the (padded) probe, so an agent on the
+  internet is no amplifier. Targets behind NAT that can't be reached are
+  [Future ideas](#future-ideas).
 
 ### Why not piggyback on magic-wormhole
 
@@ -256,6 +268,12 @@ Implemented in `crates/nix-pixie-proto/src/pair.rs`.
   guesses and logs an alert ("someone may be guessing"). Rotating rather than
   locking out avoids a permanent DoS. Timeouts and protocol errors don't count,
   since they reveal nothing.
+- **Backing off between codes.** On a LAN, guessing needs a machine on that
+  network. An agent on the internet (`--target`) can be dialled by anyone, and
+  rotation alone only bounds guesses by how fast pairing round trips go. So
+  the owner waits before showing the next code: 2 s, doubling up to 60 s.
+  That leaves 3 guesses a minute, about 1 in 500,000 per day of the agent
+  running. An operator who mistyped three times waits 2 s.
 - **Nameplates** are 1–99. A target surveys DNS-SD for 2 s and picks an
   unused one. Collisions are still possible, so the controller tries every
   target with that nameplate.
@@ -688,6 +706,27 @@ the boot menu in QEMU. The code is printed by the agent's service onto the
 console, next to the autologin prompt, until the tty1 UI exists.
 `nixosModules.installer` works in any custom live image.
 
+**Stock live systems** (`packages.<system>.agent`): where only the
+provider's NixOS ISO boots (Hetzner Cloud, say), the operator runs
+`sudo nix --extra-experimental-features 'nix-command flakes' run
+github:oddlama/nix-pixie#agent` on its console. That's the agent as
+`nixosModules.agent` would run it, set up by a script:
+
+- refuses to run without root (bash's `$EUID`, not `id`: a bare PATH must
+  not make the check pass);
+- appends the system profile and then its own tools (util-linux, kmod,
+  OpenSSH, nixos-install, nixos-facter) to PATH. The system's `nix`, `zpool`
+  (matching its kernel module) and `modprobe` win, also when started with a
+  bare PATH (`systemd-run`);
+- opens UDP 47011 and 47012 with `nixos-firewall-tool`, which handles both
+  firewall backends. Not mDNS: mdns-sd answers unicast queries from any
+  address, with more bytes than it got (RFC 6762 §11 says to ignore
+  off-link queries). On the internet that is a reflector. Probes find the
+  agent on a LAN anyway.
+
+The system must bring Nix and, for the respective layouts, ZFS and mdadm's
+udev rules; the stock NixOS ISO has all of them.
+
 - Extends `installation-cd-minimal` and `netboot-minimal` and adds:
   - the agent service, plus agent UI on tty1 (pairing code, status, logs)
   - getty on tty2+ for manual debugging
@@ -816,7 +855,8 @@ Not in v1. Recorded so the v1 design doesn't block them.
   refuses today (keys come from files: hooks or the controller's
   terminal).
 
-- **WAN pairing.** The controller publishes its endpoint id via pkarr on the
+- **Pairing through NAT.** `--target` covers targets the controller can
+  reach. For the rest: the controller publishes its endpoint id via pkarr on the
   mainline DHT (`iroh-mainline-address-lookup`) under a key derived from the
   code with an expensive KDF. Relays enabled. An attacker who brute-forces
   the lookup key only learns an address: they still have to beat the PAKE,
@@ -829,4 +869,5 @@ Not in v1. Recorded so the v1 design doesn't block them.
   because a MAC/DMI match does not authenticate the hardware. Possibly gated
   on TPM endorsement-key attestation.
 - **kexec / foreign live systems.** Run the portable agent on any live Linux
-  (cloud rescue systems, stock signed NixOS ISO), bootstrapping `/nix` itself.
+  (cloud rescue systems), bootstrapping `/nix` itself. Stock NixOS live
+  systems are done (`packages.agent`).
