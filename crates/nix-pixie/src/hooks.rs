@@ -16,7 +16,7 @@ use std::process::Stdio;
 
 use anyhow::{Context as _, Result, bail};
 use nix_pixie_proto::ctrl::PlacedFile;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::metadata::Hook;
@@ -221,7 +221,7 @@ pub fn schedule(hooks: &BTreeMap<String, Hook>) -> Result<Schedule> {
 /// belong in the configuration.
 const MAX_FILES_BYTES: usize = 15 * 1024 * 1024;
 
-/// The `nix run` installable for a hook's command: a name in `flake`, or an
+/// The installable for a hook's command: a name in `flake`, or an
 /// installable of its own if it has a `#`.
 pub fn installable(flake: &str, command: &str) -> String {
     if command.contains('#') {
@@ -231,30 +231,68 @@ pub fn installable(flake: &str, command: &str) -> String {
     }
 }
 
-/// Builds the hooks, so a broken one fails before anything happens.
-pub async fn build(flake: &str, hooks: &BTreeMap<String, Hook>) -> Result<()> {
-    if hooks.is_empty() {
-        return Ok(());
+/// How a package's program is found, like `nix run` and `lib.getExe` do.
+const PROGRAM: &str = "p: {
+  drv = p.drvPath;
+  out = p.outPath;
+  program = p.meta.mainProgram or (builtins.parseDrvName p.name).name;
+}";
+
+/// Resolves each hook to its program and builds them, so a broken hook
+/// fails before anything happens. Done once: running a hook later costs no
+/// evaluation, and a hook that changes the repository can't change what
+/// the others run.
+pub async fn resolve(
+    flake: &str,
+    hooks: &BTreeMap<String, Hook>,
+) -> Result<BTreeMap<String, PathBuf>> {
+    #[derive(Deserialize)]
+    struct Package {
+        drv: String,
+        out: String,
+        program: String,
     }
-    let installables: Vec<String> = hooks
-        .values()
-        .map(|h| installable(flake, &h.command))
-        .collect();
+    let mut packages = BTreeMap::new();
+    for (name, hook) in hooks {
+        let installable = installable(flake, &hook.command);
+        let output = tokio::process::Command::new("nix")
+            .args(["eval", "--json", &installable, "--apply", PROGRAM])
+            .output()
+            .await
+            .context("running `nix eval` for a hook")?;
+        if !output.status.success() {
+            bail!(
+                "hook {name}: {installable} must be a package with a main program:\n{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let package: Package = serde_json::from_slice(&output.stdout)
+            .with_context(|| format!("hook {name}: unexpected evaluation result"))?;
+        packages.insert(name.clone(), package);
+    }
+    if packages.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let status = tokio::process::Command::new("nix")
         .args(["build", "--no-link"])
-        .args(&installables)
+        .args(packages.values().map(|p| format!("{}^out", p.drv)))
         .stdout(Stdio::null())
         .status()
         .await
         .context("running `nix build` for the hooks")?;
     if !status.success() {
-        let names: Vec<&str> = hooks.keys().map(String::as_str).collect();
-        bail!(
-            "building the hooks ({}) failed; they must be packages with a main program",
-            names.join(", ")
-        );
+        bail!("building the hooks failed (see above)");
     }
-    Ok(())
+    packages
+        .into_iter()
+        .map(|(name, package)| {
+            let program = Path::new(&package.out).join("bin").join(&package.program);
+            if !program.is_file() {
+                bail!("hook {name}: {} doesn't exist", program.display());
+            }
+            Ok((name, program))
+        })
+        .collect()
 }
 
 /// What a hook learns about the install so far, in `$PIXIE_CONTEXT`.
@@ -280,6 +318,8 @@ pub struct Context {
 /// Runs a machine's hooks as the install passes its steps.
 pub struct Runner {
     hooks: BTreeMap<String, Hook>,
+    /// Each hook's program, from [`resolve`].
+    programs: BTreeMap<String, PathBuf>,
     schedule: Schedule,
     /// Where hooks run: the repository.
     dir: PathBuf,
@@ -291,10 +331,16 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(hooks: BTreeMap<String, Hook>, dir: PathBuf, context: Context) -> Result<Self> {
+    pub fn new(
+        hooks: BTreeMap<String, Hook>,
+        programs: BTreeMap<String, PathBuf>,
+        dir: PathBuf,
+        context: Context,
+    ) -> Result<Self> {
         Ok(Self {
             schedule: schedule(&hooks)?,
             hooks,
+            programs,
             dir,
             context,
             pending: Vec::new(),
@@ -307,11 +353,12 @@ impl Runner {
     pub async fn after(&mut self, step: Step) -> Result<()> {
         self.reached = Some(step);
         for name in self.schedule.after(step).to_vec() {
-            let Some(hook) = self.hooks.get(&name) else {
-                continue;
+            let (Some(hook), Some(program)) = (self.hooks.get(&name), self.programs.get(&name))
+            else {
+                bail!("hook {name} was not resolved");
             };
             eprintln!("Running hook {name} (after {step})");
-            let files = run(&name, hook, step, &self.dir, &self.context).await?;
+            let files = run(&name, program, hook, step, &self.dir, &self.context).await?;
             self.pending.extend(files);
             let total: usize = self.pending.iter().map(|f| f.contents.len()).sum();
             if total > MAX_FILES_BYTES {
@@ -344,11 +391,12 @@ impl Runner {
     }
 }
 
-/// Runs one hook with `nix run`, in `dir`, on the operator's terminal (its
-/// stdout goes to our stderr: our stdout is the result). Returns the files
-/// it wrote for the installed system.
+/// Runs one hook's program, in `dir`, on the operator's terminal (its stdout
+/// goes to our stderr: our stdout is the result). Returns the files it wrote
+/// for the installed system.
 async fn run(
     name: &str,
+    program: &Path,
     hook: &Hook,
     step: Step,
     dir: &Path,
@@ -367,10 +415,7 @@ async fn run(
         let out = scratch.join("out");
         std::fs::create_dir(&out).context("creating the hook's output directory")?;
 
-        let status = tokio::process::Command::new("nix")
-            .arg("run")
-            .arg(installable(&context.flake, &hook.command))
-            .arg("--")
+        let status = tokio::process::Command::new(program)
             .args(&hook.args)
             .current_dir(dir)
             .env("PIXIE_CONTEXT", &context_file)

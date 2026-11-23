@@ -86,7 +86,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     let requested = parse_disk_args(&args.disks)?;
     let metadata = metadata::load(&args.flake).await?;
     // Check what we can before pairing: a mistake shouldn't cost the code.
-    if let Some(name) = &args.machine {
+    let programs = if let Some(name) = &args.machine {
         let machine = machine(&metadata, &args.flake, name)?;
         refuse_push(name, machine)?;
         let disko = disko_of(&Configuration::new(&args.flake, &machine.configuration)?).await?;
@@ -96,8 +96,10 @@ pub async fn install(args: InstallArgs) -> Result<()> {
             repo_root(&args.flake)?;
         }
         hooks::schedule(&machine.hooks)?;
-        hooks::build(&args.flake, &machine.hooks).await?;
-    }
+        Some(hooks::resolve(&args.flake, &machine.hooks).await?)
+    } else {
+        None
+    };
 
     let endpoint = net::bind(identity::load_or_create(&args.identity)?, 0).await?;
     let mut discovery = Discovery::start(args.method).await?;
@@ -107,7 +109,10 @@ pub async fn install(args: InstallArgs) -> Result<()> {
                 &endpoint, &mut discovery, &code, nameplate, args.timeout,
             )
             .await?;
-            let result = session(&mut stream, &conn, &peer, &metadata, &args, requested).await;
+            let result = session(
+                &mut stream, &conn, &peer, &metadata, &args, requested, programs,
+            )
+            .await;
             // Closing is what lets the target shut down.
             net::finish(&mut stream).await;
             conn.close(VarInt::from_u32(0), b"done");
@@ -245,8 +250,9 @@ async fn session(
     metadata: &Metadata,
     args: &InstallArgs,
     requested: BTreeMap<String, String>,
+    programs: Option<BTreeMap<String, PathBuf>>,
 ) -> Result<Installed> {
-    let plan = prepare(stream, conn, peer, metadata, args, requested).await?;
+    let plan = prepare(stream, conn, peer, metadata, args, requested, programs).await?;
     apply(stream, conn, peer, args, plan).await
 }
 
@@ -275,6 +281,7 @@ async fn prepare(
     metadata: &Metadata,
     args: &InstallArgs,
     mut requested: BTreeMap<String, String>,
+    programs: Option<BTreeMap<String, PathBuf>>,
 ) -> Result<Plan> {
     let Approved {
         label,
@@ -299,7 +306,7 @@ async fn prepare(
         "label": label,
         "inventory": inventory,
     });
-    let mut hooks = start_hooks(args, &name, machine, target).await?;
+    let mut hooks = start_hooks(args, &name, machine, target, programs).await?;
     hooks.after(Step::Approve).await?;
     if let Some(path) = &machine.facter.report_path {
         controller::fetch_facter_report(stream, &args.flake, path)
@@ -371,19 +378,22 @@ async fn prepare(
     })
 }
 
-/// The hooks of the approved machine, ready to run. They were built before
-/// pairing if the machine was known then.
+/// The hooks of the approved machine, ready to run. `programs`: resolved
+/// before pairing, if the machine was known then.
 async fn start_hooks(
     args: &InstallArgs,
     name: &str,
     machine: &Machine,
     target: serde_json::Value,
+    programs: Option<BTreeMap<String, PathBuf>>,
 ) -> Result<hooks::Runner> {
-    if args.machine.is_none() {
-        hooks::build(&args.flake, &machine.hooks).await?;
-    }
+    let programs = match programs {
+        Some(programs) => programs,
+        None => hooks::resolve(&args.flake, &machine.hooks).await?,
+    };
     hooks::Runner::new(
         machine.hooks.clone(),
+        programs,
         metadata::local_flake_dir(&args.flake).map_or_else(std::env::current_dir, Ok)?,
         hooks::Context {
             machine: name.to_string(),

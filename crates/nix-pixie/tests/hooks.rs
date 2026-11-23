@@ -131,14 +131,15 @@ fn collects_regular_files_with_their_modes() {
     };
     assert_eq!(collect_files(&files).unwrap(), []);
     write("etc/hook.conf", b"x", 0o644);
-    write("var/lib/secrets/key", b"secret", 0o4600);
+    // Sticky (setuid can't be created in the Nix build sandbox).
+    write("var/lib/secrets/key", b"secret", 0o1600);
 
     let collected = collect_files(&files).unwrap();
     let summary: Vec<(&str, u32, &[u8])> = collected
         .iter()
         .map(|f| (f.path.as_str(), f.mode, f.contents.as_slice()))
         .collect();
-    // setuid is gone already here; the agent drops it as well.
+    // Special bits are gone already here; the agent drops them as well.
     assert_eq!(
         summary,
         [
