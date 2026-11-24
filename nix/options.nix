@@ -78,6 +78,58 @@ let
 
   macAddress = types.strMatching "([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}";
 
+  # A definition with `mkDefault` at every leaf, below its conditions: a
+  # `mkDefault` around a `mkIf` would hide the condition from the option.
+  # Explicit priorities (`mkForce`, ...) stay. Machine options take no raw
+  # attribute sets, so every attribute set here is a group of options.
+  weakly =
+    value:
+    if lib.isAttrs value && !lib.isDerivation value then
+      if value._type or null == "if" then
+        lib.mkIf value.condition (weakly value.content)
+      else if value._type or null == "merge" then
+        lib.mkMerge (map weakly value.contents)
+      else if value._type or null == "override" then
+        value
+      else if value ? _type then
+        lib.mkDefault value
+      else
+        lib.mapAttrs (_: weakly) value
+    else
+      lib.mkDefault value;
+
+  # A module with every definition at `mkDefault` priority, so that a
+  # machine's own settings win over `defaults`, option by option.
+  weaken =
+    module:
+    let
+      structural = [
+        "_class"
+        "_file"
+        "key"
+        "imports"
+        "options"
+        "disabledModules"
+        "freeformType"
+        "meta"
+      ];
+    in
+    if lib.isFunction module then
+      # Keeps the arguments it asks for (`name`, ...): the module system
+      # passes only those.
+      lib.setFunctionArgs (args: weaken (module args)) (lib.functionArgs module)
+    else if builtins.isPath module || builtins.isString module then
+      {
+        _file = toString module;
+        imports = [ (weaken (import module)) ];
+      }
+    else
+      lib.filterAttrs (name: _: lib.elem name structural) module
+      // {
+        imports = map weaken (module.imports or [ ]);
+        config = weakly (module.config or (removeAttrs module structural));
+      };
+
   # Paths the controller writes into, relative to the flake root. A Nix path
   # literal would be copied to the store (or fail for a file that does not
   # exist yet), and the controller needs the location inside the repository.
@@ -88,7 +140,19 @@ let
   machineModule =
     { name, ... }:
     {
+      imports = [ (weaken topLevel.defaults) ];
+
       options = {
+        enable = mkOption {
+          type = types.bool;
+          default = true;
+          description = ''
+            Whether nix-pixie installs this machine. Every
+            `nixosConfiguration` is a machine; `false` leaves out one that
+            isn't meant to be installed (a container, an installer image).
+          '';
+        };
+
         configuration = mkOption {
           type = types.str;
           default = name;
@@ -200,9 +264,38 @@ in
     machines = mkOption {
       type = types.attrsOf (types.submodule machineModule);
       default = { };
-      description = "Machines nix-pixie can install.";
+      description = ''
+        Machines nix-pixie can install. Every `nixosConfiguration` is one,
+        named like it; set options here where `defaults` don't fit, or add
+        machines that install another configuration.
+      '';
+    };
+
+    defaults = mkOption {
+      type = types.deferredModule;
+      default = { };
+      example = lib.literalExpression ''
+        { name, ... }: {
+          hostKey.mode = "pull";
+          hostKey.publicKeyPath = "hosts/''${name}/host.pub";
+        }
+      '';
+      description = ''
+        Settings for every machine, as a module of machine options that
+        gets the machine's `name`. A machine's own settings win over these,
+        option by option.
+      '';
     };
 
     hooks = hooksOption "Hooks for every machine, by name.";
+
+    configurations = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      internal = true;
+      description = "The names of the flake's `nixosConfigurations`: each is a machine.";
+    };
   };
+
+  config.machines = lib.genAttrs topLevel.configurations (_: { });
 }

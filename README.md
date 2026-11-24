@@ -52,17 +52,23 @@ few things about your machines, which you expose as a `pixie` output.
    ```
    Don't know the id yet? nix-pixie can let you pick the disk during the
    install instead, see [Disks](#disks).
-3. Define your machines. Every option is optional, a machine named `web1`
-   installs `nixosConfigurations.web1` unless you say otherwise.
+3. Add the `pixie` output. Every configuration is a machine nix-pixie can
+   install, and all options are optional: `defaults` set them for every
+   machine (by its name), `machines.<name>` for one of them, winning over the
+   defaults.
    ```nix
    pixie = nix-pixie.lib.mkPixie {
      inherit (self) nixosConfigurations;
-     config.machines.web1 = {
-       # Generate the SSH host key before the build, see Host keys below
-       hostKey = {
-         mode = "pull";
-         publicKeyPath = "hosts/web1/host.pub";
+     config = {
+       # Generate each machine's SSH host key before the build, see Host keys below
+       defaults = { name, ... }: {
+         hostKey.mode = "pull";
+         hostKey.publicKeyPath = "hosts/${name}/host.pub";
        };
+       # Just for web1: pre-selects it for the target with this MAC address
+       machines.web1.match.mac = [ "9c:6b:00:12:34:56" ];
+       # A configuration that isn't for installing
+       machines.my-iso.enable = false;
      };
    };
    ```
@@ -91,9 +97,9 @@ you:
   outputs = inputs:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [ inputs.nix-pixie.flakeModules.default ];
-      pixie.machines.web1 = {
+      pixie.defaults = { name, ... }: {
         hostKey.mode = "pull";
-        hostKey.publicKeyPath = "hosts/web1/host.pub";
+        hostKey.publicKeyPath = "hosts/${name}/host.pub";
       };
     };
 }
@@ -117,10 +123,7 @@ your configurations to nix-pixie:
     # Your existing configurations, e.g. `{ web1 = import ./hosts/web1 { ... }; }`,
     # given nix-pixie for its helpers
     nixosConfigurations = import ./configurations.nix { inherit nix-pixie; };
-    pixie = nix-pixie.lib.mkPixie {
-      inherit (self) nixosConfigurations;
-      config.machines.web1 = { };
-    };
+    pixie = nix-pixie.lib.mkPixie { inherit (self) nixosConfigurations; };
   };
 }
 ```

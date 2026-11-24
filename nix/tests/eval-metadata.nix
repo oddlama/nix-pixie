@@ -15,9 +15,17 @@ let
   nixosConfigurations = {
     web1 = throw "nixosConfigurations.web1 was evaluated";
     generic = throw "nixosConfigurations.generic was evaluated";
+    installer = throw "nixosConfigurations.installer was evaluated";
   };
 
   pixieConfig = {
+    # For every machine, by its name; the machines' own settings win.
+    defaults =
+      { name, ... }:
+      {
+        hostKey.publicKeyPath = "machines/${name}/host.pub";
+        facter.reportPath = "machines/${name}/facter.json";
+      };
     hooks = {
       rekey = pixieLib.hooks.agenixRekey { };
       notify = {
@@ -41,7 +49,12 @@ let
         configuration = "web1";
         disks.file = "machines/db1/disks.json";
         hooks.notify.enable = false;
+        # Back to the option's own default.
+        facter.reportPath = null;
       };
+      # A configuration that isn't for installing.
+      installer.enable = false;
+      # `generic` isn't mentioned: it is a machine of its own all the same.
     };
   };
 
@@ -105,9 +118,23 @@ let
         disks.file = null;
         hostKey = {
           mode = "none";
-          publicKeyPath = null;
+          publicKeyPath = "machines/rack-a/host.pub";
         };
-        facter.reportPath = null;
+        facter.reportPath = "machines/rack-a/facter.json";
+        hooks = { inherit rekey notify; };
+      };
+      generic = {
+        configuration = "generic";
+        match = {
+          mac = [ ];
+          dmiSerial = [ ];
+        };
+        disks.file = null;
+        hostKey = {
+          mode = "none";
+          publicKeyPath = "machines/generic/host.pub";
+        };
+        facter.reportPath = "machines/generic/facter.json";
         hooks = { inherit rekey notify; };
       };
       db1 = {
@@ -119,13 +146,30 @@ let
         disks.file = "machines/db1/disks.json";
         hostKey = {
           mode = "none";
-          publicKeyPath = null;
+          publicKeyPath = "machines/db1/host.pub";
         };
         facter.reportPath = null;
         hooks = { inherit rekey; };
       };
     };
   };
+
+  # `defaults` as plain modules: conditions, imports, and a machine that
+  # overrides one of them.
+  plainDefaults =
+    (pixieLib.mkPixie {
+      nixosConfigurations = {
+        a = throw "a was evaluated";
+        b = throw "b was evaluated";
+      };
+      config = {
+        defaults = {
+          imports = [ { match.dmiSerial = [ "imported" ]; } ];
+          config = lib.mkIf true { hostKey.mode = "pull"; };
+        };
+        machines.b.hostKey.mode = "push";
+      };
+    }).machines;
 
   # Error cases: evaluation must fail.
   fails = expr: !(builtins.tryEval (builtins.deepSeq expr expr)).success;
@@ -212,6 +256,11 @@ assert lib.assertMsg (
   unexpectedSuccesses == [ ]
 ) "these invalid configurations evaluated: ${lib.concatStringsSep ", " unexpectedSuccesses}";
 assert lib.assertMsg (pinned == expectedPinned) "pinnedDisk returned ${json pinned}";
+assert lib.assertMsg (
+  plainDefaults.a.hostKey.mode == "pull"
+  && plainDefaults.b.hostKey.mode == "push"
+  && plainDefaults.b.match.dmiSerial == [ "imported" ]
+) "plain defaults gave ${json plainDefaults}";
 assert lib.assertMsg (
   pubkeys == {
     recorded = builtins.readFile ./host.pub;

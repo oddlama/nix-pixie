@@ -8,7 +8,7 @@ we build on them.
 
 | Area | State | Covered by |
 |---|---|---|
-| `pixie` metadata (lib + flake-parts module) | done (machines, match hints, pinned-disks file, host-key mode, facter path) | `checks.eval-metadata` |
+| `pixie` metadata (lib + flake-parts module) | done (every configuration is a machine, `defaults` by name, match hints, pinned-disks file, host-key mode, facter path) | `checks.eval-metadata` |
 | Pairing codes, wordlist, layout normalization | done | `nix-pixie-proto` unit tests |
 | SPAKE2 pairing with channel binding | done | unit tests incl. relay attack and early-hangup guessing |
 | Firewall-free discovery (DNS-SD + neighbour-table probes), controller never listens | done | `checks.vm-pairing` (controller behind the default NixOS firewall) |
@@ -954,8 +954,22 @@ direct path to a server with a public address, without any hole punching.
   - `packages.<system>.pixie` (controller wrapper with the flake baked in, so
     `nix run .#pixie` works)
   - `packages.<system>.pixie-installer-{iso,netboot}` (baked images)
-- `lib.mkPixie { self, machines, hooks, … }`: the **source of truth**. The
+- `lib.mkPixie { nixosConfigurations, config }`: the **source of truth**. The
   flake-parts module is a thin wrapper, so the two can't drift apart.
+  - **Every configuration is a machine** of the same name (only the names
+    are read, so nothing is evaluated); `machines.<name>.enable = false`
+    leaves one out, and `machines.<name>.configuration` adds machines that
+    install another configuration.
+  - **`defaults`** is a module of machine options for every machine, which
+    gets the machine's `name`. Its definitions get `mkDefault` priority at
+    every leaf (below `mkIf`, which a `mkDefault` around it would hide), so
+    a machine's own settings win option by option.
+  - **Why not options of the NixOS configurations?** The controller reads
+    this before pairing, without evaluating any configuration: matching a
+    target by its hints would otherwise evaluate every configuration (and
+    fail on any broken one), and a configuration that imports its facter
+    report can't evaluate before the report is fetched, so the report's
+    path can't come from it.
 - `nixosModules.installer`: the agent side.
 - `nixosModules.default`: installed-system side (by-pixie udev rule, so only
   agnostic disks need it; later host keys).

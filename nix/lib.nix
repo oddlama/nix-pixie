@@ -4,6 +4,8 @@
 #     nixosConfigurations.web1 = nixpkgs.lib.nixosSystem { ... };
 #     pixie = nix-pixie.lib.mkPixie {
 #       inherit (self) nixosConfigurations;
+#       # Every configuration is a machine; these set its options.
+#       config.defaults = { name, ... }: { hostKey.mode = "pull"; };
 #       config.machines.web1.match.mac = [ "aa:bb:cc:dd:ee:ff" ];
 #     };
 #   };
@@ -29,7 +31,7 @@ let
           throw "nix-pixie: machine `${name}` refers to nixosConfigurations.${machine.configuration}, which does not exist. Known: ${lib.concatStringsSep ", " known}";
       normalise =
         machine:
-        machine
+        removeAttrs machine [ "enable" ]
         // {
           match = machine.match // {
             mac = map lib.toLower machine.match.mac;
@@ -42,7 +44,9 @@ let
     in
     {
       version = metadataVersion;
-      machines = lib.mapAttrs (name: machine: normalise (checkMachine name machine)) config.machines;
+      machines = lib.mapAttrs (name: machine: normalise (checkMachine name machine)) (
+        lib.filterAttrs (_: machine: machine.enable) config.machines
+      );
     };
 in
 {
@@ -109,6 +113,7 @@ in
           modules = [
             optionsModule
             config
+            { configurations = builtins.attrNames nixosConfigurations; }
           ];
         })
         config
