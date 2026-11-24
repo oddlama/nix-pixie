@@ -27,6 +27,9 @@ const FACTS: &str = r#"config: {
           else [ ];
       }) config.disko.devices.disk;
       zpools = builtins.attrNames (config.disko.devices.zpool or { });
+      # nix-pixie.nixosModules.default recreates /dev/disk/by-pixie on the
+      # installed system, for the configurations that use it.
+      byPixieLinks = config.system.build ? nixPixieDiskRules;
       encryption =
         let
           devices = config.disko.devices;
@@ -142,6 +145,9 @@ pub struct Disko {
     pub disks: BTreeMap<String, DiskoDisk>,
     /// `disko.devices.zpool` names, exported before the first boot.
     pub zpools: Vec<String>,
+    /// Whether the installed system recreates `/dev/disk/by-pixie/<role>`
+    /// (`nixosModules.default` with agnostic disks).
+    pub by_pixie_links: bool,
     /// What is encrypted, and where disko expects its keys.
     pub encryption: Encryption,
 }

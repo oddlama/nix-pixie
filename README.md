@@ -311,8 +311,9 @@ configuration. During the install the chosen disk is linked at
 `/dev/disk/by-pixie/main`, and some options keep using that path afterwards:
 GRUB on a BIOS machine installs itself there on every rebuild. The module
 recreates the link on the installed system, recognising the disk by the
-partition labels disko gave it (so the disk needs a GPT). Fixed and pinned
-disks don't need the module.
+partition labels disko gave it (so the disk needs a GPT). nix-pixie refuses an
+agnostic configuration without the module before it erases anything. Fixed
+and pinned disks don't need the module.
 
 If exactly one disk is free for the last open role, it is taken. Otherwise
 nix-pixie asks, or you pass `--disk main=nvme0n1` (a kernel name, a

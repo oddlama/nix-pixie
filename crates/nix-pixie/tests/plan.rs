@@ -50,6 +50,7 @@ fn disko(disks: &[(&str, Option<&str>)]) -> Disko {
     Disko {
         root_mount_point: "/mnt".into(),
         zpools: Vec::new(),
+        by_pixie_links: true,
         encryption: Encryption::default(),
         disks: disks
             .iter()
@@ -365,4 +366,24 @@ fn refuses_other_disks_carrying_names_disko_creates() {
     // Formatting the old disk too erases its names.
     let formatting = ["vdb", "vdc", "sda"].into_iter().collect();
     assert_eq!(check_name_clashes(&names, &formatting, &disks), Ok(()));
+}
+
+#[test]
+fn agnostic_disks_need_the_module_that_keeps_their_links() {
+    let mut without = agnostic();
+    without.by_pixie_links = false;
+    let error = check_links(&without, false, "web1")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("/dev/disk/by-pixie/main") && error.contains("nixosModules.default"),
+        "{error}"
+    );
+    check_links(&agnostic(), false, "web1").unwrap();
+    // Pinned mode falls back to by-pixie paths only until it records.
+    check_links(&without, true, "web1").unwrap();
+    // Fixed disks need nothing.
+    let mut fixed = disko(&[("main", Some("/dev/disk/by-id/nvme-x"))]);
+    fixed.by_pixie_links = false;
+    check_links(&fixed, false, "web1").unwrap();
 }

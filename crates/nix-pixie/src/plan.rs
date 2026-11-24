@@ -88,6 +88,29 @@ pub fn choosable_roles(disko: &Disko, pinned: bool) -> BTreeSet<String> {
         .collect()
 }
 
+/// Agnostic disks need `nixosModules.default`: on the installed system no
+/// agent links `/dev/disk/by-pixie/<role>`, and some options keep using it
+/// (GRUB on BIOS installs to it on every rebuild). In pinned mode the
+/// configuration falls back to these paths only until the disks are
+/// recorded, which happens before the build.
+pub fn check_links(disko: &Disko, pinned: bool, configuration: &str) -> Result<()> {
+    if pinned || disko.by_pixie_links {
+        return Ok(());
+    }
+    let Some((name, device)) = disko.disks.iter().find_map(|(name, disk)| {
+        let device = disk.device.as_deref()?;
+        device.starts_with(BY_PIXIE).then_some((name, device))
+    }) else {
+        return Ok(());
+    };
+    bail!(
+        "disko.devices.disk.{name} uses {device}, but nixosConfigurations.{configuration} \
+         doesn't import nix-pixie.nixosModules.default, which keeps that path working on the \
+         installed system (GRUB on BIOS machines installs to it on every rebuild). Add the \
+         module, or pin the disk instead (disks.file and nix-pixie.lib.pinnedDisk)"
+    )
+}
+
 /// Checks `--disk` arguments against the configuration, before pairing.
 pub fn check_requested(
     disko: &Disko,

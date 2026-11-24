@@ -735,6 +735,12 @@ streamed back (the tail is shown on failure), and the system is pushed into
   by its partitions' GPT labels (the kernel's `PARTNAME`), using the labels
   disko actually assigned. They are evaluated, never reconstructed, since
   disko hashes labels longer than 36 characters.
+- Only agnostic disks need the module. The controller refuses a
+  configuration with by-pixie devices that doesn't import it (its facts say
+  whether `system.build.nixPixieDiskRules` exists), before pairing if it can
+  evaluate the configuration then, else right after approval. Pinned mode is
+  exempt: its by-pixie fallback only lasts until the pins are recorded,
+  which happens before the build.
 - Disks without a GPT can't be recognised; an assertion says so.
 - Two disks with the same labels (e.g. one moved over from another machine
   with the same configuration) both claim the link, and udev picks one.

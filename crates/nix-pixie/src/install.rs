@@ -286,7 +286,9 @@ async fn check_machine(
             machine.configuration
         ));
         let disko = disko_of(&Configuration::new(&args.flake, &machine.configuration)?).await?;
-        plan::check_requested(&disko, machine.disks.file.is_some(), requested)?;
+        let pinned = machine.disks.file.is_some();
+        plan::check_links(&disko, pinned, &machine.configuration)?;
+        plan::check_requested(&disko, pinned, requested)?;
         let has_hooks = !machine.hooks.is_empty();
         secrets::check_available(&secrets::needs(&disko.encryption)?, has_hooks)?;
     }
@@ -730,6 +732,7 @@ async fn evaluate(
         .disko
         .take()
         .with_context(|| no_disko(&machine.configuration))?;
+    plan::check_links(&disko, machine.disks.file.is_some(), &machine.configuration)?;
     let needs = secrets::needs(&disko.encryption)?;
     secrets::check_available(&needs, !machine.hooks.is_empty())?;
     ui::steps(step_list(
