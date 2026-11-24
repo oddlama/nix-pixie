@@ -34,6 +34,7 @@ pub mod secrets;
 pub mod state;
 pub mod store;
 pub mod system;
+pub mod ui;
 
 use tokio::signal::unix::{SignalKind, signal};
 
