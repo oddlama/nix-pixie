@@ -145,6 +145,10 @@ pub enum ControllerCommand {
         /// How long to wait for the installed system, in seconds.
         #[arg(long, default_value_t = 600)]
         boot_timeout: u64,
+        /// How often to ask the installed system for its host key while
+        /// waiting, in seconds. Pressing Enter asks right away.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        boot_check_interval: u64,
         /// Give up pairing after this many seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -252,6 +256,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
             wipe,
             then,
             boot_timeout,
+            boot_check_interval,
             timeout,
             discovery,
             targets,
@@ -269,6 +274,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
                 wipe,
                 then,
                 boot_timeout: Duration::from_secs(boot_timeout),
+                boot_check_interval: Duration::from_secs(boot_check_interval),
                 targets,
                 relays: relay.relays()?,
             })

@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info};
@@ -20,8 +20,6 @@ const KIND: &str = "ssh-ed25519";
 /// type name and the length of the 32-byte key.
 const BLOB_PREFIX: &str = "AAAAC3NzaC1lZDI1NTE5AAAAI";
 const BLOB_LEN: usize = 68;
-/// Between rounds of asking every address while the target boots.
-const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 
 /// An ed25519 public key in OpenSSH's format, without the comment.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -144,57 +142,101 @@ pub fn judge(
     }
 }
 
-/// Asks every address in `addrs` for the SSH host key until one answers
-/// with a key other than `ignore` (the installer's own, while the target
-/// is still going down), or `timeout` passes. With an `expected` key, any
-/// other key is a mismatch: it isn't the installer's, so it is another
-/// machine or an attacker.
-pub async fn wait_for(
-    addrs: &[SocketAddr],
-    port: u16,
-    expected: Option<&PublicKey>,
-    ignore: Option<&PublicKey>,
-    timeout: Duration,
-) -> Result<Seen> {
-    // One per IP (and IPv6 scope): the ports in `addrs` are the agent's.
-    let hosts: BTreeSet<SocketAddr> = addrs
+/// The hosts to ask: one per IP (and IPv6 scope) in `addrs`, whose ports
+/// are the agent's, not SSH's.
+pub fn hosts(addrs: &[SocketAddr]) -> BTreeSet<SocketAddr> {
+    addrs
         .iter()
         .map(|a| {
             let mut host = *a;
             host.set_port(0);
             host
         })
-        .collect();
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        for &addr in &hosts {
-            let keys = scan(addr, port).await?;
-            debug!(%addr, keys = keys.len(), "ssh-keyscan");
-            match judge(&keys, expected, ignore) {
-                Verdict::Wait => {}
-                Verdict::Seen(key) => {
-                    info!(%addr, "host key seen");
-                    return Ok(Seen {
-                        key,
-                        addr: addr.ip(),
-                    });
-                }
-                Verdict::Mismatch(other) => bail!(
-                    "HOST KEY MISMATCH: {} answered with {other}, not with the key the \
-                     install put there. It is another machine, or someone is impersonating \
-                     this one",
-                    host_arg(addr)
-                ),
+        .collect()
+}
+
+/// `hosts` for people: link-local IPv6 with its scope.
+pub fn describe_hosts(hosts: &BTreeSet<SocketAddr>) -> String {
+    hosts
+        .iter()
+        .map(|a| host_arg(*a))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Asks every host for its SSH host key once. `Some` once one answers with
+/// a key other than `ignore` (the installer's own, while the target is
+/// still going down). With an `expected` key, any other key is a mismatch:
+/// it isn't the installer's, so it is another machine or an attacker.
+pub async fn check(
+    hosts: &BTreeSet<SocketAddr>,
+    port: u16,
+    expected: Option<&PublicKey>,
+    ignore: Option<&PublicKey>,
+) -> Result<Option<Seen>> {
+    for &addr in hosts {
+        let keys = scan(addr, port).await?;
+        debug!(%addr, keys = keys.len(), "ssh-keyscan");
+        match judge(&keys, expected, ignore) {
+            Verdict::Wait => {}
+            Verdict::Seen(key) => {
+                info!(%addr, "host key seen");
+                return Ok(Some(Seen {
+                    key,
+                    addr: addr.ip(),
+                }));
             }
+            Verdict::Mismatch(other) => bail!(
+                "HOST KEY MISMATCH: {} answered with {other}, not with the key the install put \
+                 there. It is another machine, or someone is impersonating this one",
+                host_arg(addr)
+            ),
         }
-        if tokio::time::Instant::now() >= deadline {
-            let tried: Vec<String> = hosts.iter().map(|a| host_arg(*a)).collect();
-            bail!(
-                "no SSH answer from {} within {} s",
-                tried.join(", "),
-                timeout.as_secs()
-            );
-        }
-        tokio::time::sleep(SCAN_INTERVAL).await;
+    }
+    Ok(None)
+}
+
+/// When to ask a booting machine for its host key: every `interval`, and
+/// once more at the deadline. An operator who says the machine is up gets a
+/// check right away, from which the interval counts anew. A fixed pace
+/// instead of retrying in a loop: a machine that is powered off for a while
+/// isn't asked hundreds of times, and there is no backoff to wait out once
+/// it is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cadence {
+    interval: Duration,
+    deadline: Instant,
+    next: Option<Instant>,
+}
+
+impl Cadence {
+    /// From `start` on, for up to `timeout`. A zero `interval` counts as a
+    /// second.
+    pub fn new(start: Instant, interval: Duration, timeout: Duration) -> Self {
+        let mut cadence = Self {
+            interval: interval.max(Duration::from_secs(1)),
+            deadline: start + timeout,
+            next: None,
+        };
+        cadence.schedule(start);
+        cadence
+    }
+
+    fn schedule(&mut self, from: Instant) {
+        self.next = (from < self.deadline).then(|| (from + self.interval).min(self.deadline));
+    }
+
+    /// When to check next; `None` once the check at the deadline is done.
+    pub fn next(&self) -> Option<Instant> {
+        self.next
+    }
+
+    /// A check was done at `at`.
+    pub fn checked(&mut self, at: Instant) {
+        self.schedule(at);
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
     }
 }

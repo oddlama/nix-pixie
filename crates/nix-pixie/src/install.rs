@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, VarInt};
@@ -20,7 +20,7 @@ use nix_pixie_proto::ctrl::{
 };
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use nix_pixie_proto::inventory::Disk;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 use zeroize::Zeroizing;
 
 use crate::controller::{self, Approved, describe_disk, show_disk};
@@ -67,6 +67,8 @@ pub struct InstallArgs {
     pub then: Then,
     /// How long to wait for the installed system's SSH server.
     pub boot_timeout: Duration,
+    /// How often to ask it meanwhile.
+    pub boot_check_interval: Duration,
     /// Probe these hosts instead of searching the local network.
     pub targets: Vec<String>,
     /// Where to meet targets on other networks.
@@ -387,32 +389,8 @@ async fn verify(
     report: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
     let step = ui::start("boot");
-    let wait = args.boot_timeout.as_secs();
-    let mut lines = vec![if args.then == Then::Poweroff {
-        format!(
-            "{} is powered off. Remove the installer medium if needed and power it on; \
-             waiting up to {wait} s for it.",
-            check.machine
-        )
-    } else {
-        format!("Waiting up to {wait} s for {} to boot.", check.machine)
-    }];
-    if check.encrypted {
-        lines.push(
-            "Its disks are encrypted: it may ask for the passphrase on its console while \
-             booting; type it there."
-                .into(),
-        );
-    }
-    ui::show(lines);
-    let result = hostkey::wait_for(
-        &check.addrs,
-        check.port,
-        check.expected.as_ref(),
-        check.live.as_ref(),
-        args.boot_timeout,
-    )
-    .await;
+    ui::show(boot_notice(&check, args));
+    let result = wait_for_boot(&check, args, &step).await;
     let verified = check.expected.is_some();
     let entry = match &result {
         Ok(seen) => {
@@ -448,6 +426,105 @@ async fn verify(
     };
     step.done(format!("up at {}, {key}", seen.addr));
     Ok(())
+}
+
+/// What the operator learns while the controller waits for the first boot.
+fn boot_notice(check: &Check, args: &InstallArgs) -> Vec<String> {
+    let mut lines = vec![if args.then == Then::Poweroff {
+        format!(
+            "{} is powered off. Remove the installer medium if needed and power it on.",
+            check.machine
+        )
+    } else {
+        format!("{} reboots into the installed system.", check.machine)
+    }];
+    if check.encrypted {
+        lines.push(
+            "Its disks are encrypted: it may ask for the passphrase on its console while \
+             booting; type it there."
+                .into(),
+        );
+    }
+    let pace = format!(
+        "Checking for it every {}, for up to {}",
+        ui::span(args.boot_check_interval),
+        ui::span(args.boot_timeout)
+    );
+    lines.push(if ui::interactive() {
+        format!("{pace}. Press Enter once it is up to check right away.")
+    } else {
+        format!("{pace}.")
+    });
+    lines
+}
+
+/// Asks the installed system for its host key at the boot check interval,
+/// and whenever the operator presses Enter, until it answers or the boot
+/// timeout passes.
+async fn wait_for_boot(
+    check: &Check,
+    args: &InstallArgs,
+    step: &ui::Running,
+) -> Result<hostkey::Seen> {
+    let hosts = hostkey::hosts(&check.addrs);
+    let at = hostkey::describe_hosts(&hosts);
+    let mut cadence =
+        hostkey::Cadence::new(Instant::now(), args.boot_check_interval, args.boot_timeout);
+    let mut enter = ui::interactive();
+    let mut checks = 0_u32;
+    while let Some(next) = cadence.next() {
+        let asked = wait_until(next, &mut enter, step, checks).await;
+        checks += 1;
+        info!(
+            check = checks,
+            %at,
+            port = check.port,
+            asked,
+            "checking whether {} is up",
+            check.machine
+        );
+        step.detail("asking for its host key");
+        let seen = hostkey::check(
+            &hosts,
+            check.port,
+            check.expected.as_ref(),
+            check.live.as_ref(),
+        )
+        .await?;
+        if let Some(seen) = seen {
+            return Ok(seen);
+        }
+        debug!(check = checks, "no answer yet");
+        cadence.checked(Instant::now());
+    }
+    bail!(
+        "no SSH answer from {at} within {}",
+        ui::span(args.boot_timeout)
+    )
+}
+
+/// Waits until `next`, counting down on `step`, or until the operator
+/// presses Enter (then `true`). Stops listening for Enter once stdin ends.
+async fn wait_until(next: Instant, enter: &mut bool, step: &ui::Running, checks: u32) -> bool {
+    let deadline = tokio::time::Instant::from_std(next);
+    let mut clock = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => return false,
+            line = ui::line(), if *enter => match line {
+                Some(_) => return true,
+                None => *enter = false,
+            },
+            _ = clock.tick() => {
+                let left = next.saturating_duration_since(Instant::now()).as_millis().div_ceil(1000);
+                step.detail(if checks == 0 {
+                    format!("first check in {left} s")
+                } else {
+                    format!("no answer yet · next check in {left} s")
+                });
+            }
+        }
+    }
 }
 
 /// The machine's facter report path, if it wants one and the repository

@@ -96,3 +96,49 @@ fn short_keys_keep_their_end() {
     let key = PublicKey::parse(A).unwrap();
     assert_eq!(key.short(), "ssh-ed25519 …LVSO3OiU+MZo");
 }
+
+#[test]
+fn checks_at_a_steady_pace_and_once_more_at_the_deadline() {
+    let start = std::time::Instant::now();
+    let secs = std::time::Duration::from_secs;
+    let mut cadence = Cadence::new(start, secs(30), secs(70));
+    assert_eq!(cadence.next(), Some(start + secs(30)));
+    cadence.checked(start + secs(30));
+    assert_eq!(cadence.next(), Some(start + secs(60)));
+    // Enter: right away, and the pace counts from there.
+    cadence.checked(start + secs(45));
+    assert_eq!(cadence.next(), Some(start + secs(70)));
+    cadence.checked(start + secs(70));
+    assert_eq!(cadence.next(), None);
+}
+
+#[test]
+fn a_cadence_has_a_pace() {
+    let start = std::time::Instant::now();
+    let cadence = Cadence::new(
+        start,
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(
+        cadence.next(),
+        Some(start + std::time::Duration::from_secs(1))
+    );
+    let never = Cadence::new(
+        start,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::ZERO,
+    );
+    assert_eq!(never.next(), None);
+}
+
+#[test]
+fn asks_each_address_once() {
+    let hosts = hosts(&[
+        "192.168.1.3:47011".parse().unwrap(),
+        "192.168.1.3:47012".parse().unwrap(),
+        "[fe80::1%2]:47011".parse().unwrap(),
+    ]);
+    assert_eq!(hosts.len(), 2);
+    assert_eq!(describe_hosts(&hosts), "192.168.1.3, fe80::1%2");
+}
