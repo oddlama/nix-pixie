@@ -15,7 +15,8 @@ we build on them.
 | iroh over IPv6 link-local | done, via a fork of iroh (`oddlama/iroh`, branch `nix-pixie-link-local`) until upstream fixes iroh#4584 | `checks.vm-link-local`; regression test in the fork |
 | NetworkManager on the operator's machine (direct cable) | behaviour pinned down, mitigation documented | `checks.vm-link-local` |
 | Agent service (target-shown code, rotation) | done | `checks.vm-pairing` |
-| Controller `id` / `pair` / `serve` (scriptable, no TUI yet) | done | `checks.vm-pairing` |
+| Controller `id` / `pair` / `serve` (scriptable, no full-screen TUI) | done | `checks.vm-pairing` |
+| Controller console: live step list with Nix's progress, log lines above, questions below; plain lines without a terminal | done | unit tests of the rendering and of Nix's log; `checks.vm-install-hooks` (live, on a pty, Enter for the boot check), every other VM test (plain) |
 | Installer ISO (`packages.installer-iso`) | builds, boots with UEFI, installs | `checks.vm-iso-uefi` (the image plus the test backdoor, link-local only); BIOS boot of the ISO only by hand |
 | UEFI with systemd-boot (EFI system partition, boot entry in the firmware's variables) | done | `checks.vm-iso-uefi` |
 | Preflight: boot loader vs the firmware the installer booted with | done | unit tests |
@@ -502,7 +503,13 @@ target boots ─► network (DHCP | IPv4LL | IPv6LL) ─► DNS-SD ─► pair �
   `post-reboot` hooks.
   - Implemented: after closing the session, the controller asks every
     address the target had for its ed25519 key (`--boot-timeout`, default
-    600 s), on the configuration's first `services.openssh.ports` entry.
+    600 s), on the configuration's first `services.openssh.ports` entry. It
+    asks at a fixed pace (`--boot-check-interval`, default 30 s), once more
+    at the deadline, and right away when the operator presses Enter, after
+    which the pace counts anew. No retry loop and no backoff: a machine that
+    stays powered off until somebody pulls the USB stick isn't asked
+    hundreds of times meanwhile, and there is no backoff to wait out once
+    it is up. Every check is logged; the step counts down to the next.
     `Finished` carries the installer's own host key, which is ignored, since
     it may still answer while the target goes down. Any other key than the
     expected one fails at once with HOST KEY MISMATCH. In mode `none` the
@@ -514,6 +521,67 @@ target boots ─► network (DHCP | IPv4LL | IPv6LL) ─► DNS-SD ─► pair �
   `$XDG_STATE_HOME/nix-pixie/sessions/`. A controller restart resumes. The
   agent reconnects using the pinned keys, and store pushes are idempotent per
   path.
+
+### The operator's terminal
+
+Implemented in `crates/nix-pixie/src/ui/`, for every controller command.
+
+- **Live**, when stderr is a terminal and `TERM` isn't `dumb`: log lines
+  scroll by above a region at the bottom that is redrawn in place. It shows a
+  rule, the steps, another rule, and what the operator is told or asked right
+  now. The steps are known from the start (`□`), spin while running and end
+  as `▣` (done), `✗` (failed) or `–` (turned out not to apply, e.g. no
+  address to check the first boot at), with how long they took and a detail
+  on what they do or did. The list is refined as more is known: the
+  machine's optional steps and its hooks once it is approved, disk keys and
+  the boot check once its configuration is evaluated.
+- **Questions** are asked at the bottom of the region, with the cursor after
+  them. Once answered, what was shown with the question, the question and the
+  answer move up into the scrollback, which so reads as a transcript of log
+  lines and decisions. At the end the region stays on the screen as the
+  final summary, and the JSON result follows below it.
+- **Plain** for pipes, files and the journal: a line per step as it starts
+  (`▸ Send the system (into /mnt, zfs)`), everything said printed as it
+  comes, no colour, nothing redrawn, and Nix's own output on stderr as
+  before. The VM tests run this way, except `vm-install-hooks`, which runs
+  the controller on a pty with `TERM` set and presses Enter for the boot
+  check.
+- **One owner of stderr.** Tracing writes through the console
+  (`ui::log_writer`, installed by `main.rs`): a log line clears the region,
+  is printed, and the region is drawn again below it. A thread draws the
+  spinner and reads stdin. Step lines are cut to the terminal's width and
+  what is said is wrapped, so every row is accounted for; the region never
+  takes more than the terminal's height minus a row, and a long list shows a
+  window around the running step. Redraws use synchronized output where the
+  terminal knows it.
+- **stdin is never read blocking.** A blocking read can't be cancelled: the
+  process couldn't exit while one waits, and it would take the next line
+  from a hook that reads the terminal itself. stdin is polled, and read only
+  while somebody waits for a line, or to drop a line typed while nobody
+  asked. On a terminal that line was echoed into the region (which is redrawn
+  a row lower), and a stray `y` mustn't answer the next question; before a
+  question, what was typed ahead is flushed as well. Input from a pipe or a
+  file is a script's answers and kept in order. Only the foreground process
+  drops input; in the background, reading the terminal would stop it.
+- **Hooks and passphrase prompts** get the terminal to themselves
+  (`ui::suspend`): the region is cleared and neither drawn nor is stdin read
+  until they are done. A hook's output follows a line naming it.
+- **Nix's progress.** On a live console, `nix build` and `nix copy` run with
+  `--log-format internal-json` and stdin from `/dev/null` (so Nix never asks,
+  e.g. about a flake's `nixConfig`). Their activities add up to the running
+  step's detail the way Nix's own progress bar adds them up (`actBuilds`,
+  `actCopyPaths`, the bytes of `actCopyPath`, from `resProgress` and
+  `resSetExpected`), followed by the newest build, copy or download. Errors
+  are printed as Nix wrote them, warnings become log lines, everything else
+  is logged at debug level.
+- **Why not a full-screen TUI (yet).** An alternate screen gives up the
+  scrollback, which is the transcript, and copy and paste with it. It would
+  have to be left for every hook that needs the terminal (agenix-rekey with
+  a YubiKey PIN) and every passphrase prompt, and it is a second front end
+  to keep apart from the scriptable one. The inline region gets the steps,
+  the progress and the questions where the operator looks, and degrades to
+  plain lines by itself. A full-screen view earns its keep once several
+  machines are installed at once.
 
 ## 4. Store push (no tmpfs, no pull)
 
@@ -753,8 +821,9 @@ the repository, at points of the install.
   - cwd: the repository (the local flake). Hooks that change it must
     `git add` what the build needs, as `agenix rekey --add-to-git` does.
   - stdin: the operator's terminal, not data: rekeying may need a
-    YubiKey PIN or touch. stdout goes to the controller's stderr, since the
-    controller's stdout is its JSON result.
+    YubiKey PIN or touch. The live console steps aside while a hook runs.
+    stdout goes to the controller's stderr, since the controller's stdout
+    is its JSON result.
   - `$PIXIE_CONTEXT`: a JSON file with the hook's name and step, the
     machine, configuration and flake, the target (id, label, inventory),
     and what is known so far: the pulled host key (from `host-key`), the

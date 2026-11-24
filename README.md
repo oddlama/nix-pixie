@@ -153,7 +153,30 @@ your normal user:
 
 ```console
 $ nix run github:oddlama/nix-pixie -- controller install --machine web1 --code 482913-acid-acorn-acre
+```
 
+Log lines scroll by at the top of your terminal, the steps of the install
+are listed below them, and below those is whatever nix-pixie wants to know
+from you right now:
+
+```
+  0.4s  INFO loaded the machines flake=/home/you/infra machines=3 seconds=0.41
+  3.0s  INFO found target target=0ce794e9b709437dd91b62ddddb6f81f558628c985e924080844938b9be677a5 label=nixos via="probe"
+  3.6s  INFO dialing target target=0ce794e9b709437dd91b62ddddb6f81f558628c985e924080844938b9be677a5 label=nixos addrs=[192.168.1.57:47011] relayed=false
+────────────────────────────────────────────────────────────────────────────────
+ ▣ Check the flake                      2.6s  machine web1
+ ▣ Pair with the target                 1.1s  nixos at 192.168.1.57:47011
+ ? Approve the target                   4.0s
+ □ Pull the host key
+ □ Evaluate nixosConfigurations.web1
+ □ Choose the disks
+ □ Build nixosConfigurations.web1
+ □ Format the disks
+ □ Send the system
+ □ Install the boot loader
+ □ Unmount and reboot
+ □ Wait for the first boot
+────────────────────────────────────────────────────────────────────────────────
 Paired with nixos (192.168.1.57:47011)
   id        0ce794e9b709437dd91b62ddddb6f81f558628c985e924080844938b9be677a5
   system    x86_64-linux, 16 threads, 62.7 GiB RAM, UEFI
@@ -162,24 +185,32 @@ Paired with nixos (192.168.1.57:47011)
   disk      nvme0n1 931.5 GiB nvme Samsung SSD 990 PRO 1TB [empty]
   disk      sda 14.9 GiB usb SanDisk Cruzer [in use, not installable]
   machine   web1 (chosen)
-
-Approve this machine? [y/N] y
-
-Building nixosConfigurations.web1
-
-This erases everything on:
-  main       nvme0n1 931.5 GiB nvme Samsung SSD 990 PRO 1TB [empty]
-Format these disks? [y/N] y
-Sending the disko script
-Formatting
-Sending the system into /mnt (zfs)
-Installing the boot loader
-
-Waiting up to 600 s for web1 to boot.
-web1 is up, with the host key the install put there.
+Approve this machine? [y/N] █
 ```
 
-(Shortened a bit, the real thing also shows log lines and nix copying paths.)
+Once you answered, the question moves up into the log, so you keep a record
+of what you approved, and the install goes on. A spinner shows the step that
+is running and what it is doing right now, like how far Nix is with building
+and copying. Hooks get your terminal to themselves while they run. At the
+end, the list stays as the last word:
+
+```
+────────────────────────────────────────────────────────────────────────────────
+ ▣ Check the flake                      2.6s  machine web1
+ ▣ Pair with the target                 1.1s  nixos at 192.168.1.57:47011
+ ▣ Approve the target                   6.3s  web1
+ ▣ Pull the host key                    0.1s  ssh-ed25519 …vOq8C3Y1sV4m
+ ▣ Evaluate nixosConfigurations.web1    3.9s  x86_64-linux
+ ▣ Choose the disks                     0.0s  main = nvme0n1
+ ▣ Build nixosConfigurations.web1      2m41s  12 built · 840 copied · 1.9 GiB
+ ▣ Format the disks                     7.2s  mounted at /mnt
+ ▣ Send the system                     1m02s  1123 copied · 3.4 GiB into /mnt, zfs
+ ▣ Install the boot loader              4.6s
+ ▣ Unmount and reboot                   1.3s  rebooting
+ ▣ Wait for the first boot             1m00s  up at 192.168.1.57, host key verified
+────────────────────────────────────────────────────────────────────────────────
+web1 is up, with the host key the install put there.
+```
 
 What happens in between:
 
@@ -196,8 +227,9 @@ What happens in between:
 5. **Installing.** disko formats, the system is copied into the new `/nix/store`
    and `nixos-install` sets up the boot loader.
 6. **First boot.** The target reboots. If your configuration runs an SSH
-   server, the controller waits for it and checks that it presents the right
-   host key.
+   server, the controller asks it for its host key every 30 seconds
+   (`--boot-check-interval`), or right away when you press Enter, and checks
+   that it is the right one.
 
 - **`--machine`** can be left out for machines with `match.mac` or
   `match.dmiSerial` set, which pre-select the machine for a target that has
@@ -207,6 +239,11 @@ What happens in between:
   everything else goes to stderr. `--yes` approves the target and formats empty
   disks, `--wipe` also erases disks that hold data, and `--then poweroff` or
   `--then stay` replace the reboot.
+- **Output:** when stderr isn't a terminal, or with `TERM=dumb`, nothing is
+  redrawn: each step is announced on a line of its own (`▸ Send the system`)
+  and Nix prints its own output, which is what you want in a log file or CI.
+  `NO_COLOR` turns off colours, and `RUST_LOG=nix_pixie=debug` shows more of
+  what happens.
 - **Just looking:** `nix-pixie controller pair --code …` only pairs and prints
   the inventory, which is handy to see what a machine has before you write its
   configuration.
