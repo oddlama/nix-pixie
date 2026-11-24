@@ -221,3 +221,32 @@ fn input_keeps_lines_only_when_asked_for() {
     input.take(b"o\n", true);
     assert_eq!(input.next_line(), Some(Ok("no".into())));
 }
+
+#[test]
+fn ctrl_d_on_a_terminal_ends_an_answer_not_the_input() {
+    let mut input = Input::new(true);
+    // Nobody asked: nothing changes.
+    assert!(!input.nothing(false, false).answered);
+    assert!(input.next_line().is_none());
+    assert!(input.nothing(true, false).answered);
+    assert_eq!(input.next_line(), Some(Err(())));
+    assert_eq!(input.next_line(), None);
+    assert!(!input.ended());
+    input.take(b"y\n", true);
+    assert_eq!(input.next_line(), Some(Ok("y".into())));
+    // Hung up: over for good.
+    input.nothing(false, true);
+    assert!(input.ended());
+    assert_eq!(input.next_line(), Some(Err(())));
+}
+
+#[test]
+fn the_end_of_a_pipe_ends_the_input() {
+    let mut input = Input::new(false);
+    input.take(b"y\nlast", true);
+    assert!(input.nothing(true, false).answered);
+    assert!(input.ended());
+    assert_eq!(input.next_line(), Some(Ok("y".into())));
+    assert_eq!(input.next_line(), Some(Ok("last".into())));
+    assert_eq!(input.next_line(), Some(Err(())));
+}

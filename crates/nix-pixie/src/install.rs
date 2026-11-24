@@ -504,7 +504,8 @@ async fn wait_for_boot(
 }
 
 /// Waits until `next`, counting down on `step`, or until the operator
-/// presses Enter (then `true`). Stops listening for Enter once stdin ends.
+/// presses Enter (then `true`). Stops listening for Enter once stdin ended
+/// for good.
 async fn wait_until(next: Instant, enter: &mut bool, step: &ui::Running, checks: u32) -> bool {
     let deadline = tokio::time::Instant::from_std(next);
     let mut clock = tokio::time::interval(Duration::from_secs(1));
@@ -513,7 +514,7 @@ async fn wait_until(next: Instant, enter: &mut bool, step: &ui::Running, checks:
             () = tokio::time::sleep_until(deadline) => return false,
             line = ui::line(), if *enter => match line {
                 Some(_) => return true,
-                None => *enter = false,
+                None => *enter = !ui::input_ended(),
             },
             _ = clock.tick() => {
                 let left = next.saturating_duration_since(Instant::now()).as_millis().div_ceil(1000);

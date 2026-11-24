@@ -567,6 +567,11 @@ pub async fn confirm(question: &str) -> bool {
         .is_some_and(|answer| matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
+/// Whether stdin ended for good: nothing will answer any more.
+pub fn input_ended() -> bool {
+    console().lock().input.ended()
+}
+
 /// Counts a waiter for [`line`] while it waits, also if it is cancelled.
 struct Waiting;
 
@@ -584,8 +589,9 @@ impl Drop for Waiting {
     }
 }
 
-/// The next line from stdin, `None` once it has ended. Cancel-safe: a line
-/// is only taken when it is returned.
+/// The next line from stdin; `None` for Ctrl-D on a terminal, or once
+/// input ended ([`input_ended`]). Cancel-safe: a line is only taken when it
+/// is returned.
 pub async fn line() -> Option<String> {
     let console = console();
     let _waiting = Waiting::new();

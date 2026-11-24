@@ -19,7 +19,10 @@ pub struct Input {
     /// Whether stdin is a terminal, which echoes what is typed.
     pub tty: bool,
     partial: Vec<u8>,
-    lines: VecDeque<String>,
+    /// `None` for a Ctrl-D on a terminal: no answer to one question.
+    lines: VecDeque<Option<String>>,
+    /// Stdin ended for good: a pipe or file at its end, or a terminal that
+    /// hung up.
     eof: bool,
     /// How many are waiting for a line; stdin is only read for them.
     pub waiting: usize,
@@ -67,15 +70,12 @@ impl Input {
         if !matches!(poll(&mut fds, Some(&now)), Ok(n) if n > 0) {
             return Serviced::default();
         }
+        let hangup = fds
+            .first()
+            .is_some_and(|fd| fd.revents().intersects(PollFlags::HUP | PollFlags::ERR));
         let mut buf = [0_u8; 4096];
         match rustix::io::read(&stdin, &mut buf[..]) {
-            Ok(0) => {
-                self.end(keep);
-                Serviced {
-                    newlines: 0,
-                    answered: true,
-                }
-            }
+            Ok(0) => self.nothing(keep, hangup),
             Ok(n) => self.take(buf.get(..n).unwrap_or_default(), keep),
             Err(Errno::INTR | Errno::AGAIN) => Serviced::default(),
             // The terminal hung up, or stdin is unreadable: no more answers.
@@ -97,7 +97,7 @@ impl Input {
                 newlines += 1;
                 let line = std::mem::take(&mut self.partial);
                 if keep {
-                    self.lines.push_back(decode(&line));
+                    self.lines.push_back(Some(decode(&line)));
                 }
             } else {
                 self.partial.push(byte);
@@ -109,18 +109,45 @@ impl Input {
         }
     }
 
+    /// A read of nothing. Ctrl-D on a terminal ends one answer; a pipe or
+    /// file at its end, or a terminal that hung up, ends all input.
+    pub fn nothing(&mut self, keep: bool, hangup: bool) -> Serviced {
+        if self.tty && !hangup {
+            if keep {
+                self.lines.push_back(None);
+            }
+            return Serviced {
+                newlines: 0,
+                answered: keep,
+            };
+        }
+        self.end(keep);
+        Serviced {
+            newlines: 0,
+            answered: true,
+        }
+    }
+
+    /// Whether input ended for good.
+    pub fn ended(&self) -> bool {
+        self.eof
+    }
+
     fn end(&mut self, keep: bool) {
         self.eof = true;
         let rest = std::mem::take(&mut self.partial);
         if keep && !rest.is_empty() {
-            self.lines.push_back(decode(&rest));
+            self.lines.push_back(Some(decode(&rest)));
         }
     }
 
-    /// The next line, or `Err(())` once input ended and every line is taken.
+    /// The next line; `Err(())` for no answer (Ctrl-D on a terminal, or
+    /// the end of input once every line is taken); `None` while nothing is
+    /// there yet.
     pub fn next_line(&mut self) -> Option<Result<String, ()>> {
         match self.lines.pop_front() {
-            Some(line) => Some(Ok(line)),
+            Some(Some(line)) => Some(Ok(line)),
+            Some(None) => Some(Err(())),
             None if self.eof => Some(Err(())),
             None => None,
         }
