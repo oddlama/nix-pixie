@@ -951,8 +951,8 @@ direct path to a server with a public address, without any hole punching.
 - `lib.mkPixie { self, machines, hooks, … }`: the **source of truth**. The
   flake-parts module is a thin wrapper, so the two can't drift apart.
 - `nixosModules.installer`: the agent side.
-- `nixosModules.default`: installed-system side (by-pixie udev rule; later
-  host keys).
+- `nixosModules.default`: installed-system side (by-pixie udev rule, so only
+  agnostic disks need it; later host keys).
 - `lib.pinnedDisk file name`: pinned mode's device for disko disk `name`,
   falling back to `/dev/disk/by-pixie/<name>` until one is recorded, so the
   configuration builds before the first install.

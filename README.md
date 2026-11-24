@@ -7,59 +7,60 @@ nix-pixie is like
 setting up NixOS machines, and you can integrate it into your existing
 configuration. You basically boot the ISO image from this repository, the new
 machine shows a pairing code like `482913-acid-acorn-acre`. On any other
-machine that has access to your config repo, you just execute the nix pixie
-controller and by entering the code it will automatically setup the target
-machine without any further interaction from your side.
+machine that has access to your config repo, you just run the nix-pixie
+controller with that code, approve the machine and its disks, and it sets up
+the target machine without any further interaction from your side.
 
-It uses [iroh](https://github.com/n0-computer/iroh) and SPAKE2 to automatically
-find the target machine, so it works without SSH access, and even behind CG-NAT
-or a firewall. This can also automate all the things that traditionally require
-multiple steps, like secret rekeying, secure boot key enrollment, disk
-encryption password setup or anything else you need via hooks. Finally, it
-ensures that the target system is directly pushed to the disk, so this also works
-on target devices with low RAM.
+It finds the target machine by itself and connects to it with
+[iroh](https://github.com/n0-computer/iroh), authenticated by the code through
+SPAKE2, so it works without SSH access, and even behind CG-NAT or a firewall.
+This can also automate all the things that traditionally require multiple
+steps, like secret rekeying, host keys, disk encryption passwords, hardware
+reports or anything else you need via hooks. Finally, it pushes the target
+system directly to the disk, so this also works on target devices with low RAM.
 
 It is agnostic to the way you normally deploy machines and is specifically
 meant as a tool for initial deployments.
 
-- 🥚 **Solves the chicken-egg problem** of the initial setup: secrets required for host requires rekeying or out of band provisioning, both of which can be done with nix-pixie automatically
-- 🔢 **Single SPAKE2 code** to pair and setup a machine
-- 🔍 **Finds the target** via [iroh](https://github.com/n0-computer/iroh) on your network, over a direct cable without DHCP, or on another network through a relay
-- 🪝 **Automates multi-step setup** which can including formatting disks, transferring host keys, rekeying secrets, enrolling secure boot keys, running nixos-facter, ...
+- 🥚 **Solves the chicken-and-egg problem** of the initial setup: a host's secrets need its host key, which requires rekeying after the first boot or provisioning the key out of band. nix-pixie does either before the one and only build
+- 🔢 **Single SPAKE2 code** to pair and set up a machine
+- 🔍 **Finds the target** by itself on your network, over a direct cable without DHCP, or on another network through an [iroh](https://github.com/n0-computer/iroh) relay
+- 🪝 **Automates multi-step setup** which can include formatting disks, transferring host keys, rekeying secrets, running nixos-facter, ...
 - 🚚 **Straight to ~~jail~~ disk**, never pushes a system closure to RAM so you can directly install the final system configuration
 - ✈️ **Works airgapped**, as the target needs neither the internet nor a binary cache
 
 ## 📦 Installation
 
-You need a flake with the `nixosConfigurations` you want to install, and each
-of them must describe its disks with [disko](https://github.com/nix-community/disko).
-nix-pixie then needs to know a few things about your machines, which you expose
-as a `pixie` output.
+You need a flake with the `nixosConfigurations` you want to install (no flake?
+see below), and each of them must describe its disks with
+[disko](https://github.com/nix-community/disko). nix-pixie then needs to know a
+few things about your machines, which you expose as a `pixie` output.
 
 1. Add nix-pixie as an input to your flake
    ```nix
    inputs.nix-pixie.url = "github:oddlama/nix-pixie";
    ```
-2. Import the NixOS module in the configurations you want to install.
-   It keeps the `/dev/disk/by-pixie` names from [Disks](#disks) working on the installed system.
+2. Describe each machine's disks with disko, as you would for any disko-based
+   install. The simplest is to name the disk by its id:
    ```nix
-   nixosConfigurations.web1 = nixpkgs.lib.nixosSystem {
-     modules = [
-       disko.nixosModules.disko
-       nix-pixie.nixosModules.default
-       ./hosts/web1
-     ];
+   # hosts/web1/default.nix
+   disko.devices.disk.main = {
+     device = "/dev/disk/by-id/nvme-Samsung_SSD_990_PRO_1TB_S6Z1NJ0W123456";
+     type = "disk";
+     content = { /* your partitions */ };
    };
    ```
+   Don't know the id yet? nix-pixie can let you pick the disk during the
+   install instead, see [Disks](#disks).
 3. Define your machines. Every option is optional, a machine named `web1`
    installs `nixosConfigurations.web1` unless you say otherwise.
    ```nix
    pixie = nix-pixie.lib.mkPixie {
      inherit (self) nixosConfigurations;
      config.machines.web1 = {
-       disks.file = "hosts/web1/disks.json"; # see Disks below
+       # Generate the SSH host key before the build, see Host keys below
        hostKey = {
-         mode = "pull"; # see Host keys below
+         mode = "pull";
          publicKeyPath = "hosts/web1/host.pub";
        };
      };
@@ -70,7 +71,7 @@ as a `pixie` output.
    nix build github:oddlama/nix-pixie#installer-iso
    sudo cp result/iso/*.iso /dev/sdX # your USB stick
    ```
-5. Setup hooks to automate your setup flow. See [Hooks](#hooks).
+5. Optionally, set up hooks to automate the rest of your flow, see [Hooks](#hooks).
 
 There is no binary cache yet, so the first `nix build` and `nix run` compile
 nix-pixie, which takes a few minutes. `nix flake check` will warn you about the
@@ -91,12 +92,48 @@ you:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [ inputs.nix-pixie.flakeModules.default ];
       pixie.machines.web1 = {
-        disks.file = "hosts/web1/disks.json";
         hostKey.mode = "pull";
         hostKey.publicKeyPath = "hosts/web1/host.pub";
       };
     };
 }
+```
+
+</details>
+
+<details>
+<summary>Without flakes</summary>
+
+nix-pixie reads your machines from a flake, but your repository doesn't have
+to be built around one. If you pin your dependencies with
+[npins](https://github.com/andir/npins) or [niv](https://github.com/nmattia/niv),
+a small `flake.nix` next to your existing entry point is enough, which hands
+your configurations to nix-pixie:
+
+```nix
+{
+  inputs.nix-pixie.url = "github:oddlama/nix-pixie";
+  outputs = { self, nix-pixie }: {
+    # Your existing configurations, e.g. `{ web1 = import ./hosts/web1 { ... }; }`,
+    # given nix-pixie for its helpers
+    nixosConfigurations = import ./configurations.nix { inherit nix-pixie; };
+    pixie = nix-pixie.lib.mkPixie {
+      inherit (self) nixosConfigurations;
+      config.machines.web1 = { };
+    };
+  };
+}
+```
+
+A flake only sees files that git knows about, so `git add flake.nix`. Hooks
+are packages of a flake, so expose them from this one if you use any. Your
+configurations must evaluate without `<nixpkgs>` or `builtins.currentSystem`,
+which npins and niv don't need since they pin with hashes. You don't have to
+enable flakes in your `nix.conf` either: the controller enables what it needs
+for its own calls to Nix, so this is all it takes to run it:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' run github:oddlama/nix-pixie -- controller install --machine web1 --code …
 ```
 
 </details>
@@ -140,8 +177,9 @@ your normal user:
 $ nix run github:oddlama/nix-pixie -- controller install --machine web1 --code 482913-acid-acorn-acre
 ```
 
-From here on the setup process should proceed automatically and leave you with
-a full setup machine. The steps happening in between are:
+From here on it runs by itself, apart from approving the machine and the disks
+it erases, and leaves you with a fully set up machine. The steps happening in
+between are:
 
 1. **Pairing.** The controller looks for a target that shows this code, on your
    network and at a relay. Both sides then prove to each other that they know
@@ -211,9 +249,10 @@ or none at all:
 <details>
 <summary>A direct cable and NetworkManager</summary>
 
-NetworkManager's default profile unfortunately gives up on a cable without DHCP after 45
-seconds and takes the link-local address away again (in a loop). You man need to tell it
-to stop doing that:
+Only if NetworkManager manages the cable on your machine: its default profile
+waits for DHCP, gives up after 45 seconds and takes the link-local address away
+for a moment, again and again. Pairing survives this. For a long install, tell
+it that link-local is all there is:
 
 ```sh
 nmcli connection modify "Wired connection 1" ipv4.method disabled ipv6.method link-local
@@ -223,23 +262,57 @@ nmcli connection modify "Wired connection 1" ipv4.method disabled ipv6.method li
 
 ### Disks
 
-The disks come from your configuration's `disko.devices.disk`. The `device` attribute decides
-how that get mapped to nix-pixie:
+nix-pixie formats the disks your configuration describes in
+`disko.devices.disk`. Each disk's `device` says which of the target's disks it
+is, in one of three ways:
 
 | `device` | Mode | What happens |
 | --- | --- | --- |
-| `nix-pixie.lib.pinnedDisk ./disks.json "main"` | pinned | You choose a disk on the first install. nix-pixie records its `/dev/disk/by-id/…` path in the machine's `disks.file` and uses it from then on. |
-| `"/dev/disk/by-pixie/main"` | agnostic | You choose a disk on every install, nothing is recorded. One configuration can install many machines. |
-| anything else | fixed | Must exist on the target and be known ahead of time. |
+| `"/dev/disk/by-id/nvme-…"`, or any other path | fixed | The disk must exist on the target. Simple, but you need to know its id before the first install. |
+| `nix-pixie.lib.pinnedDisk ./disks.json "main"` | pinned | You pick the disk during the first install, and nix-pixie writes its `/dev/disk/by-id/…` path into `disks.json` for you. Later installs use that disk. |
+| `"/dev/disk/by-pixie/main"` | agnostic | You pick a disk on every install and nothing is recorded, so one configuration can install many machines. |
+
+For a fixed disk, `nix-pixie controller pair --code …` tells you the ids: it
+prints the target's inventory as JSON, with each disk's `by_id` names.
+
+**Pinned** mode also needs to know where `disks.json` goes, relative to your
+flake:
 
 ```nix
-# hosts/web1/default.nix, with `disks.file = "hosts/web1/disks.json"` from above
+# In the pixie config
+machines.web1.disks.file = "hosts/web1/disks.json";
+
+# hosts/web1/default.nix
 disko.devices.disk.main = {
   device = nix-pixie.lib.pinnedDisk ./disks.json "main";
   type = "disk";
   content = { /* ... */ };
 };
 ```
+
+You don't create `disks.json`. Until it exists, `pinnedDisk` returns a
+placeholder, so your configuration evaluates and builds anyway. During the
+first install, right after you picked the disk and before anything is built,
+nix-pixie writes the file and `git add`s it, so the build already uses the
+recorded disk:
+
+```json
+{
+  "main": "/dev/disk/by-id/nvme-Samsung_SSD_990_PRO_1TB_S6Z1NJ0W123456"
+}
+```
+
+It is JSON rather than Nix because nix-pixie writes it: plain data that
+`pinnedDisk` reads with `lib.importJSON`, so nix-pixie never generates Nix code
+in your repository. The facter report works the same way.
+
+**Agnostic** mode also needs `nix-pixie.nixosModules.default` in the
+configuration. During the install the chosen disk is linked at
+`/dev/disk/by-pixie/main`, and some options keep using that path afterwards:
+GRUB on a BIOS machine installs itself there on every rebuild. The module
+recreates the link on the installed system, recognising the disk by the
+partition labels disko gave it (so the disk needs a GPT). Fixed and pinned
+disks don't need the module.
 
 If exactly one disk is free for the last open role, it is taken. Otherwise
 nix-pixie asks, or you pass `--disk main=nvme0n1` (a kernel name, a
@@ -282,6 +355,49 @@ hooks.rekey = nix-pixie.lib.hooks.agenixRekey { };
 # until the first install recorded the real one.
 age.rekey.hostPubkey = nix-pixie.lib.agenixRekey.hostPubkey ./host.pub;
 ```
+
+With [sops-nix](https://github.com/Mic92/sops-nix), the host decrypts its
+secrets with an age key derived from its SSH host key, which is what sops-nix
+does by default. A hook converts the pulled key, puts it into `.sops.yaml` and
+re-encrypts the machine's secrets for it. Give the machine a line in
+`.sops.yaml` with any age key (e.g. from `age-keygen`) until its first install:
+
+```yaml
+keys:
+  - &admin age1...
+  - &web1 age1... # replaced by the hook
+creation_rules:
+  - path_regex: hosts/web1/secrets\.yaml$
+    key_groups:
+      - age:
+          - *admin
+          - *web1
+```
+
+```nix
+# In the pixie config
+hooks.sops = {
+  command = "sops-rekey";
+  after = [ "host-key" ];
+  before = [ "build" ];
+};
+
+# In your flake's packages. Adapt the paths to your layout.
+packages.sops-rekey = pkgs.writeShellApplication {
+  name = "sops-rekey";
+  runtimeInputs = [ pkgs.jq pkgs.ssh-to-age pkgs.sops pkgs.gnused pkgs.git ];
+  text = ''
+    machine=$(jq -r .machine "$PIXIE_CONTEXT")
+    key=$(jq -r .hostKey "$PIXIE_CONTEXT" | ssh-to-age)
+    sed -i "s|^\( *- &$machine \).*|\1$key|" .sops.yaml
+    sops updatekeys --yes "hosts/$machine/secrets.yaml"
+    git add .sops.yaml "hosts/$machine/secrets.yaml"
+  '';
+};
+```
+
+`sops updatekeys` decrypts with your own key, so a YubiKey prompt works here
+too.
 
 ### Hooks
 
