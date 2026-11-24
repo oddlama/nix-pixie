@@ -194,6 +194,7 @@
                 };
                 vm-link-local = import ./nix/tests/link-local.nix {
                   inherit pkgs;
+                  inherit (inputs) nixpkgs disko;
                   package = config.packages.default;
                   installerModule = ./nix/nixos/installer.nix;
                 };

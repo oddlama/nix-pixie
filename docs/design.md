@@ -13,7 +13,7 @@ we build on them.
 | SPAKE2 pairing with channel binding | done | unit tests incl. relay attack and early-hangup guessing |
 | Firewall-free discovery (DNS-SD + neighbour-table probes), controller never listens | done | `checks.vm-pairing` (controller behind the default NixOS firewall) |
 | iroh over IPv6 link-local | done, via a fork of iroh (`oddlama/iroh`, branch `nix-pixie-link-local`) until upstream fixes iroh#4584 | `checks.vm-link-local`; regression test in the fork |
-| NetworkManager on the operator's machine (direct cable) | behaviour pinned down, mitigation documented | `checks.vm-link-local` |
+| NetworkManager on the operator's machine (direct cable) | done: the installer sends router advertisements on links nobody else serves, which keep NetworkManager's default profile up; without them its behaviour is pinned down | `checks.vm-link-local` (a whole install over the cable, throttled to span two of its 45 s rounds) |
 | Agent service (target-shown code, rotation) | done | `checks.vm-pairing` |
 | Controller `id` / `pair` / `serve` (scriptable, no full-screen TUI) | done | `checks.vm-pairing` |
 | Controller console: live step list with Nix's progress, log lines above, questions below; plain lines without a terminal | done | unit tests of the rendering and of Nix's log; `checks.vm-install-hooks` (live, on a pty, Enter for the boot check), every other VM test (plain) |
@@ -32,7 +32,7 @@ we build on them.
 | Hooks: declared per machine or globally, ordered as a DAG with the install's steps, resolved and built before pairing, files into the installed system; `lib.hooks.agenixRekey` | done | `checks.vm-install-hooks`, unit tests of the ordering, file collection and placement |
 | Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
 | Host keys: push mode (from a hook, stored on the target, checked after boot) | done | `checks.vm-install-luks-scripted` |
-| Long sessions across link-local flaps | not verified | needs the store push |
+| Long sessions across link-local flaps | verified that they don't survive one (the connection never recovers); the installer avoids the flaps | `checks.vm-link-local` |
 | Targets on other networks (`--target HOST`, unicast probes) running the agent package on a stock NixOS live system (`nix run …#agent`) | done; this way the target must be reachable on UDP 47011/47012 | `checks.vm-remote` (target behind a router with its default firewall; plain NixOS, none of our modules) |
 | Targets nobody can connect to (NAT, closed firewall): found at a relay with only the code, then a direct path where one can be punched. n0's public relays by default, `--relay URL` for others, `--no-relay` for none | done for target-shown codes | `checks.vm-relay` (no open ports; first a whole install through the relay with no route at all, then one over a punched path, with the host key checked after boot); by hand through n0's relay between two NATed network namespaces |
 | Online guessing: rotation after 3 spent guesses, backing off 2 s doubling to 60 s | done | unit tests of the delay, `checks.vm-pairing` |
@@ -182,9 +182,24 @@ flake evaluation, hooks and secret decryption running as root.
   - **NetworkManager's default wired profile** fails the activation every 45 s
     when no DHCP lease arrives, and each time *deletes the link-local address*,
     flushes the neighbour table, and re-adds the address as tentative (usable
-    ~2 s later). Pairing survives it. Long installs will see a ~2 s outage
-    every 45 s, which QUIC should ride out (**VERIFY** with the store push).
-    Recommended profile for a direct cable, which the test shows is stable:
+    ~2 s later). Pairing survives it, a session doesn't: in
+    `checks.vm-link-local` the agent dropped its last path 19 s after a flap
+    (`LastOpenPath`) and the connection timed out, although the address was
+    back after 2 s. Why iroh's path doesn't recover is open.
+  - **Router advertisements keep the profile up.** One RA completes the
+    profile's IPv6 setup (`ipv4.may-fail` is on by default), and the device
+    stays activated without DHCP. So the installer (`nixosModules.installer`)
+    watches its wired links, and on one that has carried a signal for 10 s
+    without a DHCP lease or a router there (no RA-learned routes), runs radvd:
+    router lifetime 0 and no prefixes, so nobody routes through it or gets an
+    address from it. Never on links that somebody else serves: NetworkManager
+    takes the DHCPv6 flags from the latest RA, so one more could change what
+    a LAN's hosts do, and rogue-RA monitors would notice. Unplugging stops
+    it, so the next network is looked at anew. radvd rather than networkd's
+    own RA sender, which would need a reload that reconfigures the link while
+    someone may be pairing.
+  - For targets that aren't our installer (the agent package on another live
+    system), the profile we recommend, which the test shows is stable:
     `nmcli connection modify <profile> ipv4.method disabled ipv6.method link-local`.
   - **The NixOS installer profile enables NetworkManager too.** In our image,
     NetworkManager leaves Ethernet alone (`unmanaged = type:ethernet`) and keeps

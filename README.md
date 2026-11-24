@@ -258,10 +258,15 @@ or none at all:
 <details>
 <summary>A direct cable and NetworkManager</summary>
 
-Only if NetworkManager manages the cable on your machine: its default profile
-waits for DHCP, gives up after 45 seconds and takes the link-local address away
-for a moment, again and again. Pairing survives this. For a long install, tell
-it that link-local is all there is:
+NetworkManager's default profile waits for DHCP on a cable, gives up after 45
+seconds and takes the link-local address away for a moment, again and again,
+which breaks a running install. Our installer prevents this by itself: on a
+cable where nobody hands out addresses or advertises a router, it sends router
+advertisements (as no router, and without any prefix), and that is all
+NetworkManager needs to keep the link up.
+
+With the agent package on another live system, tell NetworkManager on your
+machine that link-local is all there is:
 
 ```sh
 nmcli connection modify "Wired connection 1" ipv4.method disabled ipv6.method link-local
