@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tracing::info;
 
+use crate::nixlog;
+
 /// What the controller needs to know before building: evaluated without
 /// building anything. Devices that aren't set evaluate to `null` instead of
 /// failing, so the controller can say what's missing.
@@ -248,18 +250,16 @@ impl Configuration {
             .with_context(|| format!("unexpected facts about nixosConfigurations.{}", self.name))
     }
 
-    /// Builds the disko script and the system in one evaluation. Nix shows
-    /// its progress on our stderr.
+    /// Builds the disko script and the system in one evaluation, with Nix's
+    /// progress on the running step.
     pub async fn build(&self) -> Result<Built> {
         let started = std::time::Instant::now();
-        let output = tokio::process::Command::new("nix")
+        let mut command = tokio::process::Command::new("nix");
+        command
             .args(["build", "--no-link", "--json"])
             .arg(self.attr(".system.build.diskoScript"))
-            .arg(self.attr(".system.build.toplevel"))
-            .stderr(std::process::Stdio::inherit())
-            .output()
-            .await
-            .context("running `nix build`")?;
+            .arg(self.attr(".system.build.toplevel"));
+        let output = nixlog::run(command).await.context("running `nix build`")?;
         if !output.status.success() {
             bail!(
                 "building nixosConfigurations.{} failed (see above)",
@@ -270,6 +270,7 @@ impl Configuration {
         info!(
             seconds = started.elapsed().as_secs_f64(),
             toplevel = %built.toplevel,
+            nix = output.progress.outcome(),
             "built"
         );
         Ok(built)

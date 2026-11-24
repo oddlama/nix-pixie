@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::metadata::Hook;
+use crate::nixlog;
 use crate::state::private_dir;
 
 /// The install's own steps, in the order they happen.
@@ -273,14 +274,14 @@ pub async fn resolve(
     if packages.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let status = tokio::process::Command::new("nix")
+    let mut command = tokio::process::Command::new("nix");
+    command
         .args(["build", "--no-link"])
-        .args(packages.values().map(|p| format!("{}^out", p.drv)))
-        .stdout(Stdio::null())
-        .status()
+        .args(packages.values().map(|p| format!("{}^out", p.drv)));
+    let built = nixlog::run(command)
         .await
         .context("running `nix build` for the hooks")?;
-    if !status.success() {
+    if !built.status.success() {
         bail!("building the hooks failed (see above)");
     }
     packages

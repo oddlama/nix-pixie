@@ -24,6 +24,7 @@ pub mod inventory;
 pub mod mdns;
 pub mod metadata;
 pub mod net;
+pub mod nixlog;
 pub mod nixos;
 pub mod plan;
 pub mod preflight;
