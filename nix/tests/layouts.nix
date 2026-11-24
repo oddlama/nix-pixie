@@ -11,6 +11,8 @@
 # - passphrase: typed in on the controller for each key file (unless
 #   `typed = false`: then hooks provide them), and at boot.
 # - bootPrompt: how the installed system asks for it on its console.
+# - live: the controller runs on a terminal (with TERM set), so its console
+#   is live, and the first boot is checked once the test presses Enter.
 # - checks: Python run against the booted `installed` machine.
 {
   ext4 = {
@@ -119,8 +121,10 @@
     '';
   };
 
+  # Also the live console: hooks get the terminal in the middle of it.
   hooks = {
     disks = [ "main" ];
+    live = true;
     packages = "hook-packages.nix";
     hooks = ''
       {
@@ -149,6 +153,14 @@
       assert seen["booted"]["step"] == "boot" and seen["booted"]["system"].startswith("/nix/store/"), seen["booted"]
       ran = {h["name"]: (h["after"], h["ran"]) for h in report["hooks"]}
       assert ran == {"stamp": ("host-key", True), "secret": ("disks", True), "booted": ("boot", True)}, ran
+      # The live console left the steps as the last word, all done.
+      shown = without_escapes(output)
+      steps = shown[shown.rindex("Check the flake"):]
+      for step in ["Run hook stamp", "Build nixosConfigurations.web1", "Run hook booted", "Wait for the first boot"]:
+          assert re.search(r"▣ " + re.escape(step), steps), steps
+      # Details are cut at the terminal's width (80 columns here).
+      assert "✗" not in steps and "up at 192.168.1.3, host key" in steps, steps
+      assert "checking whether web1 is up" in shown, shown
     '';
   };
 

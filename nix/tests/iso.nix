@@ -48,7 +48,7 @@ let
 
   install = lib.concatStringsSep " " [
     "nix-pixie controller install --code CODE --machine web1 --disk main=vda"
-    "--yes --then poweroff --boot-timeout 300"
+    "--yes --then poweroff --boot-timeout 300 --boot-check-interval 5"
   ];
 in
 pkgs.testers.runNixOSTest {

@@ -127,7 +127,7 @@ pkgs.testers.runNixOSTest {
     target_address = "${targetAddress}"
     install = (
         f"nix-pixie controller install --relay {relay_url} --machine web1 --disk main=vdb --yes"
-        + " --then poweroff --boot-timeout 300"
+        + " --then poweroff --boot-timeout 300 --boot-check-interval 5"
     )
 
     def as_alice(cmd):
@@ -235,7 +235,7 @@ pkgs.testers.runNixOSTest {
             output = controller.succeed("cat /tmp/install.out")
             assert result == "success", f"the install failed ({result}):\n{output}"
 
-        wait_for_output("Sending the system")
+        wait_for_output("Send the system")
         # The target's firewall never opened anything.
         assert target.succeed("iptables -S nixos-fw") == rules
         wait_for_output("is powered off")

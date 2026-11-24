@@ -54,18 +54,51 @@ let
   }) spec.disks;
   diskArgs = lib.concatMapStringsSep " " (d: "--disk ${d.name}=${d.onTarget}") disks;
 
-  install = "nix-pixie controller install --code CODE --machine web1 ${diskArgs} --yes --then poweroff --boot-timeout 300";
+  # Live: the controller's console on a terminal. It checks the first boot
+  # only every 10 minutes, so only pressing Enter gets it done in time.
+  live = spec.live or false;
+  interval = if live then 600 else 5;
+  install = "nix-pixie controller install --code CODE --machine web1 ${diskArgs} --yes --then poweroff --boot-timeout 300 --boot-check-interval ${toString interval}";
   encrypted = spec.passphrase != null;
   # Passphrases are typed in on a terminal: give it one (`script`), fed from
   # a file with the passphrase twice (it is asked again to confirm). Unless
   # hooks provide them: then there is no terminal at all.
   typed = spec.typed or encrypted;
   command =
-    if typed then "script --quiet --return --flush --command '${install}' /dev/null" else install;
-  stdin = lib.optionalString typed " -p StandardInput=file:/tmp/answers";
-  writeAnswers = lib.optionalString typed ''
-    controller.succeed("printf '%s\\n' ${spec.passphrase} ${spec.passphrase} > /tmp/answers")
+    if typed || live then
+      "script --quiet --return --flush --command '${install}' /dev/null"
+    else
+      install;
+  # Without TERM, the console on a terminal is plain.
+  stdin =
+    lib.optionalString typed " -p StandardInput=file:/tmp/answers"
+    + lib.optionalString live " -p StandardInput=file:/tmp/enter -E TERM=xterm-256color";
+  # Python, at the indentation of a subtest's body.
+  writeAnswers =
+    lib.optionalString typed ''
+      controller.succeed("printf '%s\\n' ${spec.passphrase} ${spec.passphrase} > /tmp/answers")
+    ''
+    # A pipe to press Enter into, held open so the install's input doesn't end.
+    + lib.optionalString live ''
+      controller.succeed("mkfifo -m 666 /tmp/enter && systemd-run --unit=hold-enter -E PATH=$PATH sh -c 'exec sleep infinity > /tmp/enter'")
+    '';
+  # Python, at the indentation of a subtest's body.
+  pressEnter = lib.optionalString live ''
+    installed.wait_for_unit("sshd.service")
+        # Once is enough unless sshd isn't listening yet. Opened read-write:
+        # a FIFO nobody reads any more would block a writer.
+        try:
+            controller.wait_until_succeeds(
+                "systemctl show -P SubState pixie-install | grep -qx -e exited -e failed"
+                + " || { echo 1<>/tmp/enter; false; }",
+                timeout=60,
+            )
+        except Exception:
+            print(console_end(install_output()))
+            raise
   '';
+  # A live console redraws itself: its end, without colours, is enough.
+  printOutput = if live then "print(console_end(output))" else "print(output)";
   # Python, at the indentation of a subtest's body.
   unlockAtBoot = lib.optionalString encrypted ''
     installed.wait_for_console_text(${builtins.toJSON spec.bootPrompt})
@@ -73,6 +106,8 @@ let
   '';
 in
 assert lib.length spec.disks <= 2;
+# Both would be the install's stdin.
+assert !(typed && live);
 pkgs.testers.runNixOSTest {
   name = "nix-pixie-install-${layout}";
 
@@ -126,6 +161,14 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import json
+    import re
+
+    def without_escapes(output):
+        return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output)
+
+    def console_end(output):
+        """The end of a live console's output, which redraws itself."""
+        return "\n".join(without_escapes(output).splitlines()[-80:])
 
     controller.start()
     target.start()
@@ -160,7 +203,9 @@ pkgs.testers.runNixOSTest {
             result = controller.succeed("systemctl show -P Result pixie-install").strip()
             assert result == "success", f"the install failed ({result}):\n{install_output()}"
 
-        wait_for_output("Sending the system")
+        # The step with where it goes: on a live console, the list shows the
+        # step from the start.
+        wait_for_output("Send the system.*into /")
         # disko is done: its keys must be gone.
         target.fail("test -e /tmp/secret.key")
         # The target powers off once installed.
@@ -183,13 +228,14 @@ pkgs.testers.runNixOSTest {
     ) disks}
 
     with subtest("the controller checks the host key"):
+        ${pressEnter}
         controller.wait_until_succeeds(
             "systemctl show -P SubState pixie-install | grep -qx -e exited -e failed",
             timeout=300,
         )
         result = controller.succeed("systemctl show -P Result pixie-install").strip()
         output = install_output()
-        print(output)
+        ${printOutput}
         assert result == "success", result
         # The result is the last JSON line (under `script`, stderr is mixed in).
         report = json.loads(next(l for l in reversed(output.splitlines()) if l.lstrip().startswith("{")))
