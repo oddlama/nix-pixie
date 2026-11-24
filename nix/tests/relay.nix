@@ -196,7 +196,7 @@ pkgs.testers.runNixOSTest {
         print(err)
         assert report["disks"][0]["disk"] == "vdb", report
         assert report["route"] == "relay", report
-        assert f"copying through the relay {relay_url}/" in err, err
+        assert "copying through the relay" in err and f"relay={relay_url}/" in err, err
         # No address to ask for the host key: said, not waited for.
         recorded = controller.succeed("cat ~alice/repo/machines/web1/ssh_host_ed25519_key.pub")
         host_key = report["hostKey"]

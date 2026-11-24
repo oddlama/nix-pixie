@@ -113,7 +113,7 @@ pkgs.testers.runNixOSTest {
         print(controller.succeed("cat /tmp/install.err"))
         assert report["disks"][0]["disk"] == "vdb", report
         # The machine's facter report didn't exist yet: no evaluation before pairing.
-        controller.succeed("grep -q 'Not evaluating nixosConfigurations.web1 before pairing' /tmp/install.err")
+        controller.succeed("grep -qF 'not evaluating nixosConfigurations.web1 before pairing' /tmp/install.err")
         controller.succeed("test -s ~alice/repo/machines/web1/facter.json")
         controller.succeed("test -s ~alice/repo/machines/web1/ssh_host_ed25519_key.pub")
         target.succeed("test -L /mnt/nix/var/nix/profiles/system")
