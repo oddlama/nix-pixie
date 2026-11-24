@@ -267,12 +267,12 @@ impl Configuration {
             );
         }
         let built = parse_build_output(&output.stdout)?;
-        info!(
-            seconds = started.elapsed().as_secs_f64(),
-            toplevel = %built.toplevel,
-            nix = output.progress.outcome(),
-            "built"
-        );
+        let seconds = started.elapsed().as_secs_f64();
+        // Nix's progress is only read on a live console.
+        match output.progress.outcome() {
+            done if done.is_empty() => info!(seconds, toplevel = %built.toplevel, "built"),
+            done => info!(seconds, toplevel = %built.toplevel, nix = done, "built"),
+        }
         Ok(built)
     }
 }

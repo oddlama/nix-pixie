@@ -133,7 +133,12 @@ pub async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) 
     }
     let seconds = started.elapsed().as_secs_f64();
     let what = output.progress.outcome();
-    info!(seconds, copied = what, "pushed");
+    // Nix's progress is only read on a live console.
+    if what.is_empty() {
+        info!(seconds, "pushed");
+    } else {
+        info!(seconds, copied = what, "pushed");
+    }
     Ok(Copied { seconds, what })
 }
 
