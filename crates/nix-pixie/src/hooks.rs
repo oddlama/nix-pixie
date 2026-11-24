@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::metadata::Hook;
-use crate::nixlog;
 use crate::state::private_dir;
 use crate::ui;
+use crate::{nix, nixlog};
 
 /// The install's own steps, in the order they happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -257,7 +257,7 @@ pub async fn resolve(
     let mut packages = BTreeMap::new();
     for (name, hook) in hooks {
         let installable = installable(flake, &hook.command);
-        let output = tokio::process::Command::new("nix")
+        let output = nix::command()
             .args(["eval", "--json", &installable, "--apply", PROGRAM])
             .output()
             .await
@@ -275,7 +275,7 @@ pub async fn resolve(
     if packages.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let mut command = tokio::process::Command::new("nix");
+    let mut command = nix::command();
     command
         .args(["build", "--no-link"])
         .args(packages.values().map(|p| format!("{}^out", p.drv)));

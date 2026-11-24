@@ -960,6 +960,11 @@ direct path to a server with a public address, without any hole punching.
   `nix run github:…/nix-pixie -- controller --flake .`.
 - **Unknown output `pixie`:** `nix flake check` warns about it. That's
   harmless, but document it.
+- **No flakes in `nix.conf` needed:** the controller runs the operator's `nix`
+  with `--extra-experimental-features 'nix-command flakes'`. A repository
+  that isn't a flake gets a small `flake.nix` that re-exports its
+  configurations (README, "Without flakes"); its configurations must
+  evaluate purely.
 
 ### Option sketch
 

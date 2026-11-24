@@ -102,7 +102,7 @@ pub struct Suggestion {
 pub async fn load(flake: &str) -> Result<Metadata> {
     let started = std::time::Instant::now();
     let attr = format!("{flake}#pixie");
-    let output = tokio::process::Command::new("nix")
+    let output = crate::nix::command()
         .args(["eval", "--json", &attr])
         .output()
         .await

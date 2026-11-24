@@ -18,8 +18,8 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::net::{self, Route, Stream, sanitise};
-use crate::nixlog;
 use crate::state::private_dir;
+use crate::{nix, nixlog};
 
 /// What a finished push reports.
 pub struct PushReport {
@@ -41,8 +41,8 @@ pub async fn check_local_paths(paths: &[String]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    let output = tokio::process::Command::new("nix")
-        .args(["--extra-experimental-features", "nix-command", "path-info"])
+    let output = nix::command()
+        .arg("path-info")
         .args(paths)
         .output()
         .await
@@ -111,17 +111,11 @@ pub async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) 
 
     info!(?request, ?paths, "pushing");
     let started = Instant::now();
-    let mut command = tokio::process::Command::new("nix");
+    let mut command = nix::command();
     // Paths the controller built itself carry no signatures, and the target
     // trusts the paired, approved controller anyway.
     command
-        .args([
-            "--extra-experimental-features",
-            "nix-command",
-            "copy",
-            "--no-check-sigs",
-            "--to",
-        ])
+        .args(["copy", "--no-check-sigs", "--to"])
         .arg(format!("unix://{}", socket.display()))
         .args(paths);
     let output = nixlog::run(command).await.context("running `nix copy`");

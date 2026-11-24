@@ -169,11 +169,9 @@ in
     environment.systemPackages = [ pkgs.git ];
     users.users.alice.isNormalUser = true;
     nix.settings = {
-      experimental-features = [
-        "nix-command"
-        "flakes"
-      ];
-      flake-registry = "";
+      # No experimental features (and so no flake-registry setting either):
+      # the controller enables what it uses. The flake is locked to `path:`
+      # inputs, so the registry is never asked.
       substituters = lib.mkForce [ ];
       # Fail at once instead of building a whole system in the VM.
       max-jobs = 0;

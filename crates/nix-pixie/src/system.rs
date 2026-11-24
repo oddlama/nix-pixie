@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tracing::info;
 
-use crate::nixlog;
+use crate::{nix, nixlog};
 
 /// What the controller needs to know before building: evaluated without
 /// building anything. Devices that aren't set evaluate to `null` instead of
@@ -234,7 +234,7 @@ impl Configuration {
     /// Evaluates [`Facts`]. Cheap compared to building.
     pub async fn facts(&self) -> Result<Facts> {
         let attr = self.attr("");
-        let output = tokio::process::Command::new("nix")
+        let output = nix::command()
             .args(["eval", "--json", &attr, "--apply", FACTS])
             .output()
             .await
@@ -254,7 +254,7 @@ impl Configuration {
     /// progress on the running step.
     pub async fn build(&self) -> Result<Built> {
         let started = std::time::Instant::now();
-        let mut command = tokio::process::Command::new("nix");
+        let mut command = nix::command();
         command
             .args(["build", "--no-link", "--json"])
             .arg(self.attr(".system.build.diskoScript"))
