@@ -191,8 +191,8 @@ What happens in between:
    the machine you meant. Up to here it has received nothing from you.
 3. **Preparation.** The disks are chosen, the host key is generated, your hooks
    run and the system is built. All of this can fail without consequences.
-4. **Erasing.** You confirm the disks. Empty ones take a `y`, disks with data
-   on them want the machine's name typed out.
+4. **Erasing.** You see exactly which disks get erased, and what is on them,
+   and confirm with a `y`.
 5. **Installing.** disko formats, the system is copied into the new `/nix/store`
    and `nixos-install` sets up the boot loader.
 6. **First boot.** The target reboots. If your configuration runs an SSH
@@ -454,7 +454,7 @@ Protected:
 - **A machine pretending to be your target** fails the pairing since it doesn't know the code, and the controller gives up after three of them
 - **The relay** learns who talks to whom and how much, but none of the content. It can't pair with anything either.
 - **Your own machine** opens no ports, and the target can't read your nix store, it only receives what you push
-- **The wrong disk** is hard to hit: everything is built first, disks with data need the machine's name typed out, disks in use are never offered and the target checks again right before formatting
+- **The wrong disk** is hard to hit: everything is built first, you confirm the exact disks and what is on them, scripts need `--wipe` for disks with data, disks in use are never offered and the target checks again right before formatting
 - **Disk keys** never touch a nix store or a log, exist only in RAM on the target and are deleted as soon as the disks are formatted
 - **The first SSH connection** to the new machine is no leap of faith with a pulled or pushed host key, since it was fixed before the build and is checked after the boot
 

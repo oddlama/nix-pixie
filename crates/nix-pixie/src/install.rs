@@ -510,7 +510,7 @@ async fn apply(
         key_files,
         mut hooks,
     } = plan;
-    confirm_erase(&disks, &choices, &name, args.yes, args.wipe).await?;
+    confirm_erase(&disks, &choices, args.yes, args.wipe).await?;
 
     eprintln!("Sending the disko script");
     push::copy(
@@ -949,13 +949,9 @@ async fn record_pins(
 }
 
 /// Shows what gets erased and asks, unless the flags already answered.
-async fn confirm_erase(
-    disks: &[Disk],
-    choices: &[Choice],
-    machine: &str,
-    yes: bool,
-    wipe: bool,
-) -> Result<()> {
+/// The operator approved the machine already, so a `y` is enough here too;
+/// without a terminal, data needs `--wipe` on top of `--yes`.
+async fn confirm_erase(disks: &[Disk], choices: &[Choice], yes: bool, wipe: bool) -> Result<()> {
     let chosen: Vec<(&Choice, &Disk)> = choices
         .iter()
         .filter_map(|c| Some((c, disks.iter().find(|d| d.name == c.disk)?)))
@@ -972,11 +968,7 @@ async fn confirm_erase(
         if yes || !std::io::stdin().is_terminal() {
             bail!("there is data on these disks; pass --wipe to erase it");
         }
-        let answer = read_line(&format!(
-            "Type the machine's name ({machine}) to erase it: "
-        ))
-        .await?;
-        if answer.trim() != machine {
+        if !confirm("Erase these disks and the data on them? [y/N] ").await? {
             bail!("not erasing");
         }
     } else if !(yes || confirm("Format these disks? [y/N] ").await?) {

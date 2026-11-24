@@ -484,8 +484,7 @@ target boots ─► network (DHCP | IPv4LL | IPv6LL) ─► DNS-SD ─► pair �
   - closure size (`nix path-info -S`) vs the expected `/mnt` capacity
   - airgapped: `nix build --dry-run --offline` shows nothing to fetch
 - **Destructive confirm:** warn if partition tables, fs signatures or a
-  detected NixOS install are present. Optionally require typing the machine
-  name.
+  detected NixOS install are present (see [Order of operations](#order-of-operations)).
 - **Clock.** Airgapped hardware often has a wrong RTC (dead CMOS battery). Over
   the authenticated control channel the controller sends its time and the
   agent sets the clock. Otherwise TLS certificates (nix-grpc mTLS) fail with
@@ -645,8 +644,10 @@ evaluate, choose, record pins, build the disko script **and** the system.
 Then the operator sees exactly what gets erased:
 
 - only empty disks: `y/N`, or `--yes`
-- any disk with a partition table or signatures: type the machine's name,
-  or `--wipe`. `--yes` alone refuses.
+- any disk with a partition table or signatures: `y/N` as well, since the
+  operator approved this very machine moments ago and typing its name again
+  added friction, not safety. Its contents are listed. Without a terminal
+  it takes `--wipe`; `--yes` alone refuses.
 
 Then the disko script (`system.build.diskoScript`, which destroys without
 prompting) goes into the installer's live store, the agent re-checks every
