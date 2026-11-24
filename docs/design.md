@@ -18,6 +18,7 @@ we build on them.
 | Controller `id` / `pair` / `serve` (scriptable, no full-screen TUI) | done | `checks.vm-pairing` |
 | Controller console: live step list with Nix's progress, log lines above, questions below; plain lines without a terminal | done | unit tests of the rendering and of Nix's log; `checks.vm-install-hooks` (live, on a pty, Enter for the boot check), every other VM test (plain) |
 | Installer ISO (`packages.installer-iso`) | builds, boots with UEFI, installs | `checks.vm-iso-uefi` (the image plus the test backdoor, link-local only); BIOS boot of the ISO only by hand |
+| Release ISOs: x86_64 and aarch64, built by GitHub Actions for each published release, with checksums and build provenance attestations (`.github/workflows/release.yml`) | set up, not run yet | `actionlint` and `zizmor` in the treefmt check; the x86_64 ISO builds locally (1.5 GB, GitHub allows 2 GiB per file) |
 | UEFI with systemd-boot (EFI system partition, boot entry in the firmware's variables) | done | `checks.vm-iso-uefi` |
 | Preflight: boot loader vs the firmware the installer booted with | done | unit tests |
 | Inventory, matching against the flake's `pixie` hints, approval/rejection, facter report into the repo (`git add`) | done (scriptable `controller pair`; TUI later) | `checks.vm-inventory` |

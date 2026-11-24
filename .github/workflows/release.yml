@@ -1,0 +1,75 @@
+# Builds the installer ISO for each published release and attaches it, with
+# its checksum and a build provenance attestation:
+#
+#   gh attestation verify nix-pixie-installer-*.iso --repo oddlama/nix-pixie
+#
+# proves that this workflow built the file from the release's tag. Run it by
+# hand to (re)build the ISOs of an existing release.
+name: Release ISOs
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the release to attach the ISOs to
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-iso-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  iso:
+    name: ISO (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write # attach files to the release
+      id-token: write # sign the attestation
+      attestations: write # store the attestation
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      SYSTEM: ${{ matrix.system }}
+    steps:
+      - name: Make room for the build
+        # The runners come with toolchains we don't use, and a system's
+        # closure plus its squashfs need more than the space left.
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@382a9ed9481c7c1f94f68b72ef105b3417c73877 # v32.1.0
+
+      - name: Build
+        run: nix build --print-build-logs ".#packages.$SYSTEM.installer-iso"
+
+      - name: Checksum
+        run: |
+          mkdir dist
+          cp result/iso/*.iso dist/
+          cd dist
+          for iso in *.iso; do sha256sum "$iso" > "$iso.sha256"; done
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.iso
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/* --clobber

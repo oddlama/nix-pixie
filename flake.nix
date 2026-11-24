@@ -221,6 +221,10 @@
             treefmt = {
               projectRootFile = "flake.nix";
               programs = {
+                # The release workflow: correctness, and the usual ways
+                # workflows leak tokens.
+                actionlint.enable = true;
+                zizmor.enable = true;
                 deadnix.enable = true;
                 nixfmt.enable = true;
                 statix.enable = true;

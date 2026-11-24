@@ -72,10 +72,16 @@ few things about your machines, which you expose as a `pixie` output.
      };
    };
    ```
-4. Build the installer and write it to a USB stick
+4. Get the installer and write it to a USB stick. Every
+   [release](https://github.com/oddlama/nix-pixie/releases) has ISOs for
+   x86_64 and aarch64 attached, built by GitHub Actions from the release's
+   tag. Check that, or build the ISO yourself:
    ```sh
-   nix build github:oddlama/nix-pixie#installer-iso
-   sudo cp result/iso/*.iso /dev/sdX # your USB stick
+   gh attestation verify nix-pixie-installer-*.iso --repo oddlama/nix-pixie
+   # or
+   nix build github:oddlama/nix-pixie#installer-iso # result/iso/*.iso
+
+   sudo cp nix-pixie-installer-*.iso /dev/sdX # your USB stick
    ```
 5. Optionally, set up hooks to automate the rest of your flow, see [Hooks](#hooks).
 
@@ -542,7 +548,7 @@ Protected:
 Not protected:
 
 - **Whoever sees the code before you use it** can pair with the target in your place, or pose as the target towards you. Treat it like a password until it is used.
-- **A tampered installer image** controls everything the target does and sees every secret you send it. Build the image yourself if in doubt.
+- **A tampered installer image** controls everything the target does and sees every secret you send it. Verify a downloaded image with `gh attestation verify`, or build it yourself.
 - **A target that lies about itself.** The inventory is what the machine claims to be, and MAC addresses or serial numbers that pre-select a machine are hints, not proof. This is why you approve it.
 - **A target behind NAT** can't be asked for its host key after the reboot. nix-pixie tells you which key to expect instead of waiting.
 - **`hostKey.mode = "none"`** leaves nothing to compare the first boot against
