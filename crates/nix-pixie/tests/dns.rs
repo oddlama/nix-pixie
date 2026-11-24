@@ -332,6 +332,15 @@ async fn after_a_network_change_nobody_waits_for_an_old_lookup() {
             .await;
         assert!(stuck.is_err());
     }
+    // The lookup runs on a thread of its own, which takes a moment to start
+    // on a busy machine. Both attempts share it.
+    tokio::time::timeout(TIMEOUT, async {
+        while asked.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the lookup never started");
     assert_eq!(asked.load(Ordering::SeqCst), 1);
 
     resolver.reset();
