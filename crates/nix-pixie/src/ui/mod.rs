@@ -23,7 +23,7 @@ pub mod render;
 
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write as _};
-use std::sync::{Mutex, MutexGuard, Once, OnceLock, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -77,6 +77,9 @@ struct Console {
     state: Mutex<State>,
     /// Woken when a line or the end of input arrives.
     answered: Notify,
+    /// Wakes the thread that draws the spinner and reads stdin, which
+    /// sleeps while it has nothing to do (always, in the agent).
+    work: Condvar,
 }
 
 /// What the console shows, and where the region is on the screen.
@@ -127,6 +130,9 @@ fn start_ticker() {
             .name("console".into())
             .spawn(|| {
                 loop {
+                    if let Some(console) = CONSOLE.get() {
+                        console.idle();
+                    }
                     std::thread::sleep(TICK);
                     if let Some(console) = CONSOLE.get() {
                         console.tick();
@@ -188,6 +194,21 @@ impl Console {
                 ..State::default()
             }),
             answered: Notify::new(),
+            work: Condvar::new(),
+        }
+    }
+
+    /// Whether the thread has anything to do: a region to animate or
+    /// guard, or somebody waiting for a line.
+    fn busy(&self, s: &State) -> bool {
+        s.input.waiting > 0 || (self.drawing(s) && s.drawn > 0)
+    }
+
+    /// Blocks the thread until it has something to do.
+    fn idle(&self) {
+        let mut s = self.lock();
+        while !self.busy(&s) {
+            s = self.work.wait(s).unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -232,6 +253,7 @@ impl Console {
         write(&out);
         s.drawn = lines.len();
         s.dirty = false;
+        self.work.notify_one();
     }
 
     /// Prints `text` into the scrollback: above the region, which moves down.
@@ -250,6 +272,7 @@ impl Console {
         write(&out);
         s.drawn = lines.len();
         s.dirty = false;
+        self.work.notify_one();
     }
 
     /// Clears the region from the screen, leaving the cursor where it began.
@@ -577,7 +600,9 @@ struct Waiting;
 
 impl Waiting {
     fn new() -> Self {
-        console().lock().input.waiting += 1;
+        let console = console();
+        console.lock().input.waiting += 1;
+        console.work.notify_one();
         Self
     }
 }
