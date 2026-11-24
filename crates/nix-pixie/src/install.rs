@@ -445,11 +445,15 @@ fn boot_notice(check: &Check, args: &InstallArgs) -> Vec<String> {
                 .into(),
         );
     }
-    let pace = format!(
-        "Checking for it every {}, for up to {}",
-        ui::span(args.boot_check_interval),
-        ui::span(args.boot_timeout)
-    );
+    let pace = if args.boot_check_interval < args.boot_timeout {
+        format!(
+            "Checking for it every {}, for up to {}",
+            ui::span(args.boot_check_interval),
+            ui::span(args.boot_timeout)
+        )
+    } else {
+        format!("Checking for it in {}", ui::span(args.boot_timeout))
+    };
     lines.push(if ui::interactive() {
         format!("{pace}. Press Enter once it is up to check right away.")
     } else {
