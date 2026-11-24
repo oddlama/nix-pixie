@@ -1,49 +1,33 @@
-[📦 Installation](#-installation) | [🧭 Usage](#-usage) | [🔐 Security](#-security) | [📐 Design](docs/design.md)
+[📦 Installation](#-installation) | [🧭 Usage](#-usage) | [🔐 Security](#-security)
 
 ## 🧚 nix-pixie
 
-nix-pixie takes a machine from an empty disk to a running NixOS system built
-from your flake. The machine itself only has to boot an installer image, which
-then shows a short code like `482913-acid-acorn-acre`. You type that code on
-your own machine and everything else happens from there: nix-pixie finds the
-target, shows you what it found, builds your `nixosConfiguration`, formats the
-disks with [disko](https://github.com/nix-community/disko), pushes the system
-onto them and reboots into it.
+nix-pixie is like
+[magic-wormhole](https://github.com/magic-wormhole/magic-wormhole) but for
+setting up NixOS machines, and you can integrate it into your existing
+configuration. You basically boot the ISO image from this repository, the new
+machine shows a pairing code like `482913-acid-acorn-acre`. On any other
+machine that has access to your config repo, you just execute the nix pixie
+controller and by entering the code it will automatically setup the target
+machine without any further interaction from your side.
 
-No SSH access to the target, no password to set and no IP address to find out.
-It works over a single cable between two laptops just as well as with a server
-that sits behind somebody else's NAT.
+It uses [iroh](https://github.com/n0-computer/iroh) and SPAKE2 to automatically
+find the target machine, so it works without SSH access, and even behind CG-NAT
+or a firewall. This can also automate all the things that traditionally require
+multiple steps, like secret rekeying, secure boot key enrollment, disk
+encryption password setup or anything else you need via hooks. Finally, it
+ensures that the target system is directly pushed to the disk, so this also works
+on target devices with low RAM.
 
-- 🔢 **One code is all you need**, and it doubles as the secret for the encrypted channel between the two machines
-- 🔍 **Finds the target by itself** on your network, over a direct cable without DHCP, or on another network through a relay
-- 🚪 **No open ports** on your machine since the controller only ever dials out, and with a relay the target doesn't need any either
-- 👀 **Nothing happens without you**: you see the target's hardware before approving it and the exact disks before they are erased
-- 🏗️ **Builds before it destroys**, so a typo in your configuration doesn't cost you a formatted disk
-- 💾 **Your disko layout**, with the disks pinned in your repo or chosen per install (ext4, btrfs, ZFS, LVM, mdadm, LUKS and a tmpfs root are tested)
-- 🚚 **Pushes the system straight onto the target's disks**, never through its RAM, so a 1 GiB machine can install a system larger than that
-- 🔑 **Host keys before the first boot**, so secrets can be rekeyed before the one and only build, and the key is verified once the machine is up
-- 🔐 **Encrypted disks** with keys that only ever exist in the target's RAM
-- 🪝 **Hooks** from your own flake at every step, because nix-pixie is a library and not a framework
+It is agnostic to the way you normally deploy machines and is specifically
+meant as a tool for initial deployments.
+
+- 🥚 **Solves the chicken-egg problem** of the initial setup: secrets required for host requires rekeying or out of band provisioning, both of which can be done with nix-pixie automatically
+- 🔢 **Single SPAKE2 code** to pair and setup a machine
+- 🔍 **Finds the target** via [iroh](https://github.com/n0-computer/iroh) on your network, over a direct cable without DHCP, or on another network through a relay
+- 🪝 **Automates multi-step setup** which can including formatting disks, transferring host keys, rekeying secrets, enrolling secure boot keys, running nixos-facter, ...
+- 🚚 **Straight to ~~jail~~ disk**, never pushes a system closure to RAM so you can directly install the final system configuration
 - ✈️ **Works airgapped**, as the target needs neither the internet nor a binary cache
-
-**⚠️ nix-pixie is young.** Everything described here is covered by NixOS VM
-tests which run real installs, but it hasn't seen a lot of real hardware yet.
-It erases disks for a living, so please read what it asks before you answer.
-
-#### Why?
-
-Installing a new machine always was a bit of a dance for me. Boot an installer,
-find a monitor and a keyboard to set a password or to figure out which IP it
-got, ssh in, partition, install, and then notice that the host key I need for
-the machine's secrets only exists after the first boot. So rekey and deploy
-again. [nixos-anywhere](https://github.com/nix-community/nixos-anywhere)
-already takes care of a lot of this and is great if you can ssh into the
-target, but I wanted something where the target needs nothing but a boot
-medium, where my own machine doesn't have to be reachable, and which I can
-bend around my secrets setup instead of the other way round.
-
-Was that worth building a whole tool for the handful of machines I set up per
-year? Probably not 🤡👍. But maybe it is useful for somebody else, too.
 
 ## 📦 Installation
 
@@ -86,6 +70,7 @@ as a `pixie` output.
    nix build github:oddlama/nix-pixie#installer-iso
    sudo cp result/iso/*.iso /dev/sdX # your USB stick
    ```
+5. Setup hooks to automate your setup flow. See [Hooks](#hooks).
 
 There is no binary cache yet, so the first `nix build` and `nix run` compile
 nix-pixie, which takes a few minutes. `nix flake check` will warn you about the
@@ -155,64 +140,8 @@ your normal user:
 $ nix run github:oddlama/nix-pixie -- controller install --machine web1 --code 482913-acid-acorn-acre
 ```
 
-Log lines scroll by at the top of your terminal, the steps of the install
-are listed below them, and below those is whatever nix-pixie wants to know
-from you right now:
-
-```
-  0.4s  INFO loaded the machines flake=/home/you/infra machines=3 seconds=0.41
-  3.0s  INFO found target target=0ce794e9b709437dd91b62ddddb6f81f558628c985e924080844938b9be677a5 label=nixos via="probe"
-  3.6s  INFO dialing target target=0ce794e9b709437dd91b62ddddb6f81f558628c985e924080844938b9be677a5 label=nixos addrs=[192.168.1.57:47011] relayed=false
-────────────────────────────────────────────────────────────────────────────────
- ▣ Check the flake                      2.6s  machine web1
- ▣ Pair with the target                 1.1s  nixos at 192.168.1.57:47011
- ? Approve the target                   4.0s
- □ Pull the host key
- □ Evaluate nixosConfigurations.web1
- □ Choose the disks
- □ Build nixosConfigurations.web1
- □ Format the disks
- □ Send the system
- □ Install the boot loader
- □ Unmount and reboot
- □ Wait for the first boot
-────────────────────────────────────────────────────────────────────────────────
-Paired with nixos (192.168.1.57:47011)
-  id        0ce794e9b709437dd91b62ddddb6f81f558628c985e924080844938b9be677a5
-  system    x86_64-linux, 16 threads, 62.7 GiB RAM, UEFI
-  hardware  ASRock B650M PG Riptide
-  nic       enp4s0 9c:6b:00:12:34:56 (up)
-  disk      nvme0n1 931.5 GiB nvme Samsung SSD 990 PRO 1TB [empty]
-  disk      sda 14.9 GiB usb SanDisk Cruzer [in use, not installable]
-  machine   web1 (chosen)
-Approve this machine? [y/N] █
-```
-
-Once you answered, the question moves up into the log, so you keep a record
-of what you approved, and the install goes on. A spinner shows the step that
-is running and what it is doing right now, like how far Nix is with building
-and copying. Hooks get your terminal to themselves while they run. At the
-end, the list stays as the last word:
-
-```
-────────────────────────────────────────────────────────────────────────────────
- ▣ Check the flake                      2.6s  machine web1
- ▣ Pair with the target                 1.1s  nixos at 192.168.1.57:47011
- ▣ Approve the target                   6.3s  web1
- ▣ Pull the host key                    0.1s  ssh-ed25519 …vOq8C3Y1sV4m
- ▣ Evaluate nixosConfigurations.web1    3.9s  x86_64-linux
- ▣ Choose the disks                     0.0s  main = nvme0n1
- ▣ Build nixosConfigurations.web1      2m41s  12 built · 840 copied · 1.9 GiB
- ▣ Format the disks                     7.2s  mounted at /mnt
- ▣ Send the system                     1m02s  1123 copied · 3.4 GiB into /mnt, zfs
- ▣ Install the boot loader              4.6s
- ▣ Unmount and reboot                   1.3s  rebooting
- ▣ Wait for the first boot             1m00s  up at 192.168.1.57, host key verified
-────────────────────────────────────────────────────────────────────────────────
-web1 is up, with the host key the install put there.
-```
-
-What happens in between:
+From here on the setup process should proceed automatically and leave you with
+a full setup machine. The steps happening in between are:
 
 1. **Pairing.** The controller looks for a target that shows this code, on your
    network and at a relay. Both sides then prove to each other that they know
@@ -250,8 +179,7 @@ What happens in between:
 
 ### Finding the target
 
-You don't tell nix-pixie where the target is, the code is enough. A target
-announces itself in several ways and the controller listens to all of them:
+A target announces itself in several ways and the controller automatically finds it:
 
 - **On the same network** through mDNS and broadcast probes. This works through
   the default NixOS firewall on your machine.
@@ -280,15 +208,12 @@ or none at all:
   for targets you can reach but which aren't on your network. This uses no
   relay either and needs UDP ports 47011 and 47012 to get to the target.
 
-Without internet, none of this is in your way: the code shows up right away
-and the relay is simply not used.
-
 <details>
 <summary>A direct cable and NetworkManager</summary>
 
-NetworkManager's default profile gives up on a cable without DHCP after 45
-seconds and takes the link-local address away again, over and over. Tell it
-that link-local is all there is:
+NetworkManager's default profile unfortunately gives up on a cable without DHCP after 45
+seconds and takes the link-local address away again (in a loop). You man need to tell it
+to stop doing that:
 
 ```sh
 nmcli connection modify "Wired connection 1" ipv4.method disabled ipv6.method link-local
@@ -298,15 +223,14 @@ nmcli connection modify "Wired connection 1" ipv4.method disabled ipv6.method li
 
 ### Disks
 
-The disks come from your configuration's own `disko.devices.disk`, there is no
-second list that could disagree with it. What you write as `device` decides
-how a disk is chosen:
+The disks come from your configuration's `disko.devices.disk`. The `device` attribute decides
+how that get mapped to nix-pixie:
 
 | `device` | Mode | What happens |
 | --- | --- | --- |
 | `nix-pixie.lib.pinnedDisk ./disks.json "main"` | pinned | You choose a disk on the first install. nix-pixie records its `/dev/disk/by-id/…` path in the machine's `disks.file` and uses it from then on. |
 | `"/dev/disk/by-pixie/main"` | agnostic | You choose a disk on every install, nothing is recorded. One configuration can install many machines. |
-| anything else | fixed | Must exist on the target. |
+| anything else | fixed | Must exist on the target and be known ahead of time. |
 
 ```nix
 # hosts/web1/default.nix, with `disks.file = "hosts/web1/disks.json"` from above
@@ -346,8 +270,8 @@ In all cases the key ends up where your configuration's
 reboot, the controller compares what the machine presents over SSH with what
 was installed. With `none` it can only tell you the new key.
 
-With [agenix-rekey](https://github.com/oddlama/agenix-rekey), the whole thing
-is two lines. The hook rekeys after the key was pulled and before the build:
+With [agenix-rekey](https://github.com/oddlama/agenix-rekey), this works by having
+a hook that rekeys after the key was pulled and before the build:
 
 ```nix
 # In the pixie config. Runs `agenix rekey --add-to-git` from your flake's
@@ -430,7 +354,7 @@ packages.disk-key = pkgs.writeShellApplication {
 
 The keys are sent over the encrypted channel, only ever written to RAM on the
 target and deleted as soon as disko is done. Options that would make disko ask
-on a terminal (`askPassword`, ZFS `keylocation = "prompt"`) are refused long
+on a terminal (`askPassword`, ZFS `keylocation = "prompt"`) are refused
 before anything is erased, with a hint on what to use instead. For ZFS that is
 to create the dataset with `keylocation = "file:///tmp/secret.key"` and to
 switch it back with `postCreateHook = "zfs set keylocation=prompt <dataset>"`.
@@ -498,7 +422,7 @@ Protected:
 Not protected:
 
 - **Whoever sees the code before you use it** can pair with the target in your place, or pose as the target towards you. Treat it like a password until it is used.
-- **A tampered installer image** controls everything the target does and sees every secret you send it. Build the image yourself.
+- **A tampered installer image** controls everything the target does and sees every secret you send it. Build the image yourself if in doubt.
 - **A target that lies about itself.** The inventory is what the machine claims to be, and MAC addresses or serial numbers that pre-select a machine are hints, not proof. This is why you approve it.
 - **A target behind NAT** can't be asked for its host key after the reboot. nix-pixie tells you which key to expect instead of waiting.
 - **`hostKey.mode = "none"`** leaves nothing to compare the first boot against
@@ -509,7 +433,7 @@ protocol and the reasoning behind all of this.
 
 ## 🔨 TODO
 
-There is still a lot I'd like to add.
+There is still a lot I am going to add.
 
 - A proper TUI for the controller and one for the target's screen
 - A binary cache
