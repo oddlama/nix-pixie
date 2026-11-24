@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use nix_pixie_proto::inventory::Inventory;
 use serde::Deserialize;
+use tracing::{debug, info};
 
 /// Must match `metadataVersion` in `nix/lib.nix`.
 const METADATA_VERSION: u32 = 1;
@@ -99,6 +100,7 @@ pub struct Suggestion {
 
 /// Evaluates `<flake>#pixie` with the user's `nix`.
 pub async fn load(flake: &str) -> Result<Metadata> {
+    let started = std::time::Instant::now();
     let attr = format!("{flake}#pixie");
     let output = tokio::process::Command::new("nix")
         .args(["eval", "--json", &attr])
@@ -114,7 +116,14 @@ pub async fn load(flake: &str) -> Result<Metadata> {
         }
         bail!("`nix eval {attr}` failed:\n{}", stderr.trim());
     }
-    parse(&output.stdout)
+    let metadata = parse(&output.stdout)?;
+    info!(
+        %flake,
+        machines = metadata.machines.len(),
+        seconds = started.elapsed().as_secs_f64(),
+        "loaded the machines"
+    );
+    Ok(metadata)
 }
 
 pub fn parse(json: &[u8]) -> Result<Metadata> {
@@ -213,10 +222,16 @@ pub async fn write_into_repo(root: &Path, path: &Path, contents: &[u8]) -> Resul
             .arg("add")
             .arg("--")
             .arg(path)
-            .status()
+            .output()
             .await
             .context("running `git add`")?;
-        anyhow::ensure!(added.success(), "`git add {}` failed", path.display());
+        anyhow::ensure!(
+            added.status.success(),
+            "`git add {}` failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&added.stderr).trim()
+        );
+        debug!(path = %path.display(), "git add");
     }
     Ok(())
 }

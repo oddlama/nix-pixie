@@ -1,5 +1,5 @@
-//! Controller commands. The TUI comes later; these are the scriptable
-//! building blocks it will use, and what the VM tests drive.
+//! Controller commands: pairing, approval, and the scriptable building
+//! blocks of an install. They talk to the operator through [`crate::ui`].
 //!
 //! The controller only ever dials out. It needs no open ports on the
 //! operator's machine.
@@ -26,6 +26,7 @@ use crate::metadata::{self, Metadata, Suggestion};
 use crate::net::{self, DialError, Relays, Route, Stream, sanitise};
 use crate::push;
 use crate::state::write_private;
+use crate::ui::{self, Tone};
 
 /// How long to collect a newly found target's addresses before dialing it.
 const SETTLE: Duration = Duration::from_millis(600);
@@ -86,17 +87,20 @@ pub async fn pair(args: PairArgs) -> Result<()> {
         _ => {}
     }
 
+    ui::steps(pair_steps(false, !args.push.is_empty()));
     let search = Search {
         identity: &args.identity,
         method: args.method,
         targets: &args.targets,
         relays: &args.relays,
     };
+    let step = ui::start_with("pair", search.looking(nameplate));
     let (endpoint, mut discovery) = search.start(nameplate).await?;
     let result = tokio::select! {
         r = async {
             let (conn, mut stream, peer) =
                 pair_with_target(&endpoint, &mut discovery, &code, nameplate, args.timeout).await?;
+            step.done(describe_peer(&conn, &peer));
             let result = review(&mut stream, &conn, &peer, flake.as_ref(), &args).await;
             net::finish(&mut stream).await;
             conn.close(VarInt::from_u32(0), b"done");
@@ -109,6 +113,25 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     result
 }
 
+/// The steps of `controller pair`: with the facter report once the
+/// approved machine turns out to want one, and with the push if asked for.
+fn pair_steps(facter: bool, push: bool) -> Vec<(String, String)> {
+    let mut steps = vec![
+        ("pair", "Pair with the target"),
+        ("approve", "Approve the target"),
+    ];
+    if facter {
+        steps.push(("facter", "Get the facter report"));
+    }
+    if push {
+        steps.push(("push", "Send the store paths"));
+    }
+    steps
+        .into_iter()
+        .map(|(key, label)| (key.to_string(), label.to_string()))
+        .collect()
+}
+
 /// Where and how the controller looks for the target showing a code.
 pub struct Search<'a> {
     pub identity: &'a Path,
@@ -119,6 +142,20 @@ pub struct Search<'a> {
 }
 
 impl Search<'_> {
+    /// Where it looks for the target showing `nameplate`, for the operator.
+    pub fn looking(&self, nameplate: u32) -> String {
+        if !self.targets.is_empty() {
+            return format!("asking {}", self.targets.join(", "));
+        }
+        let at_relay = self.relays.is_enabled()
+            && NameplateSpace::of(nameplate) == Some(NameplateSpace::Relay);
+        if at_relay {
+            format!("looking for {nameplate} on this network and at the relay")
+        } else {
+            format!("looking for {nameplate} on this network")
+        }
+    }
+
     /// Binds the controller's endpoint and starts looking for the target
     /// showing `nameplate`: at the given hosts, or else on the local network
     /// and, if the nameplate is one for relays, at its rendezvous.
@@ -234,18 +271,16 @@ pub async fn approve(
             [only] => Some(only.machine.clone()),
             _ => None,
         });
-    eprintln!(
-        "{}",
-        summary(
-            conn,
-            &label,
-            peer,
-            &inventory,
-            &suggestions,
-            machine.as_deref()
-        )
-    );
+    ui::show(summary(
+        conn,
+        &label,
+        peer,
+        &inventory,
+        &suggestions,
+        machine.as_deref(),
+    ));
     if need_machine && machine.is_none() {
+        ui::commit();
         reject(stream, "no machine chosen on the controller").await?;
         let known: Vec<&str> = metadata.map_or_else(Vec::new, |m| {
             m.machines.keys().map(String::as_str).collect()
@@ -255,7 +290,9 @@ pub async fn approve(
             known.join(", ")
         );
     }
-    if !(yes || confirm("Approve this machine? [y/N] ").await?) {
+    if yes {
+        ui::commit();
+    } else if !ui::confirm("Approve this machine? [y/N] ").await {
         reject(stream, "rejected by the operator").await?;
         bail!("rejected");
     }
@@ -296,6 +333,7 @@ async fn review(
     flake: Option<&(&str, Metadata)>,
     args: &PairArgs,
 ) -> Result<()> {
+    let step = ui::start("approve");
     let approved = approve(
         stream,
         conn,
@@ -312,6 +350,7 @@ async fn review(
         suggestions,
         machine,
     } = approved;
+    step.done(machine.clone().unwrap_or_default());
 
     let report_path = flake
         .zip(machine.as_ref())
@@ -319,14 +358,26 @@ async fn review(
             let path = metadata.machines.get(machine)?.facter.report_path.clone()?;
             Some((*flake, path))
         });
+    ui::steps(pair_steps(report_path.is_some(), !args.push.is_empty()));
     let facter = match report_path {
-        Some((flake, path)) => Some(fetch_facter_report(stream, flake, &path).await),
+        Some((flake, path)) => {
+            let step = ui::start("facter");
+            let result = fetch_facter_report(stream, flake, &path).await;
+            match &result {
+                Ok(path) => step.done(path.clone()),
+                Err(e) => step.skip(format!("{e:#}")),
+            }
+            Some(result)
+        }
         None => None,
     };
     let pushed = if args.push.is_empty() {
         None
     } else {
-        Some(push::push(conn, stream, &args.store_root, &args.push).await?)
+        let step = ui::start_with("push", format!("into {}", args.store_root));
+        let pushed = push::push(conn, stream, &args.store_root, &args.push).await?;
+        step.done(pushed.copied.what.clone());
+        Some(pushed)
     };
 
     let report = serde_json::json!({
@@ -344,14 +395,15 @@ async fn review(
             .and_then(|((_, metadata), machine)| metadata.machines.get(machine))
             .map(|m| m.configuration.clone()),
         "push": pushed.map(|p| serde_json::json!({
-            "root": args.store_root, "fstype": p.fstype, "paths": args.push, "seconds": p.seconds,
+            "root": args.store_root, "fstype": p.fstype, "paths": args.push, "seconds": p.copied.seconds,
         })),
         "facterReport": facter.map(|f| match f {
             Ok(path) => serde_json::json!({ "path": path }),
             Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
         }),
     });
-    println!("{report}");
+    ui::finish();
+    ui::print_result(&report.to_string());
     Ok(())
 }
 
@@ -390,19 +442,9 @@ pub async fn fetch_facter_report(
     Ok(report_path.to_string())
 }
 
-/// Reads a yes/no answer from stdin. End of input counts as no.
-pub async fn confirm(question: &str) -> Result<bool> {
-    use tokio::io::AsyncBufReadExt;
-    eprint!("{question}");
-    let mut answer = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
-        .read_line(&mut answer)
-        .await
-        .context("reading the answer")?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+/// The paired target, for the operator: its label and how we reach it.
+pub fn describe_peer(conn: &Connection, peer: &Peer) -> String {
+    format!("{} at {}", peer.label, describe_route(conn, peer))
 }
 
 /// How we talk to the paired target, for the operator: the address in use,
@@ -418,8 +460,9 @@ fn describe_route(conn: &Connection, peer: &Peer) -> String {
     }
 }
 
-/// What the operator sees before approving. Everything from the target is
-/// sanitised again here: the controller doesn't trust the target's cleanup.
+/// What the operator sees before approving, one line each. Everything from
+/// the target is sanitised again here: the controller doesn't trust the
+/// target's cleanup.
 fn summary(
     conn: &Connection,
     label: &str,
@@ -427,31 +470,29 @@ fn summary(
     inventory: &Inventory,
     suggestions: &[Suggestion],
     machine: Option<&str>,
-) -> String {
-    use std::fmt::Write;
+) -> Vec<String> {
     let clean = |s: &str| sanitise(s, 128);
     let opt = |s: &Option<String>| s.as_deref().map(clean);
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "\nPaired with {} ({})",
-        clean(label),
-        describe_route(conn, peer)
-    );
-    let _ = writeln!(out, "  id        {}", conn.remote_id());
+    let mut lines = vec![
+        format!(
+            "Paired with {} ({})",
+            clean(label),
+            describe_route(conn, peer)
+        ),
+        format!("  id        {}", conn.remote_id()),
+    ];
     let firmware = match (inventory.firmware.uefi, inventory.firmware.secure_boot) {
         (false, _) => "BIOS",
         (true, Some(true)) => "UEFI, Secure Boot on",
         (true, Some(false)) => "UEFI, Secure Boot off",
         (true, None) => "UEFI",
     };
-    let _ = writeln!(
-        out,
+    lines.push(format!(
         "  system    {}, {} threads, {} RAM, {firmware}",
         clean(&inventory.system),
         inventory.cpu.threads,
         human_size(inventory.memory_bytes)
-    );
+    ));
     let hardware: Vec<String> = [&inventory.dmi.vendor, &inventory.dmi.product]
         .into_iter()
         .filter_map(opt)
@@ -459,20 +500,20 @@ fn summary(
     if !hardware.is_empty() || inventory.dmi.serial.is_some() {
         let serial =
             opt(&inventory.dmi.serial).map_or_else(String::new, |s| format!(" (serial {s})"));
-        let _ = writeln!(out, "  hardware  {}{serial}", hardware.join(" "));
+        lines.push(format!("  hardware  {}{serial}", hardware.join(" ")));
     }
     for nic in &inventory.nics {
         let link = if nic.link_up { "up" } else { "down" };
-        let _ = writeln!(
-            out,
+        lines.push(format!(
             "  nic       {} {} ({link})",
             clean(&nic.name),
             clean(&nic.mac)
-        );
+        ));
     }
     for disk in &inventory.disks {
-        let _ = writeln!(out, "  disk      {}", describe_disk(disk));
+        lines.push(format!("  disk      {}", show_disk(disk)));
     }
+    let doubt = |text: &str| ui::paint(text, Tone::Warn);
     let line = match (machine, suggestions) {
         (Some(machine), []) => format!("{machine} (chosen)"),
         (Some(machine), _) => {
@@ -482,24 +523,47 @@ fn summary(
                 .flat_map(|s| s.reasons.iter().map(String::as_str))
                 .collect();
             if reasons.is_empty() {
-                format!("{machine} (chosen; the hints suggest otherwise)")
+                format!(
+                    "{machine} (chosen; {})",
+                    doubt("the hints suggest otherwise")
+                )
             } else {
                 format!("{machine} (matched: {})", reasons.join(", "))
             }
         }
-        (None, []) => "none matched".to_string(),
+        (None, []) => doubt("none matched"),
         (None, many) => {
             let names: Vec<&str> = many.iter().map(|s| s.machine.as_str()).collect();
-            format!("ambiguous: {}; pick one with --machine", names.join(", "))
+            doubt(&format!(
+                "ambiguous: {}; pick one with --machine",
+                names.join(", ")
+            ))
         }
     };
-    let _ = writeln!(out, "  machine   {line}");
-    out
+    lines.push(format!("  machine   {line}"));
+    lines
 }
 
 /// One line about `disk`: name, size, what it is, and what is on it.
 /// Sanitised: everything in it comes from the target.
 pub fn describe_disk(disk: &Disk) -> String {
+    let (what, state, _) = disk_parts(disk);
+    format!("{what} [{state}]")
+}
+
+/// [`describe_disk`] for the terminal: data on the disk stands out, a disk
+/// in use steps back.
+pub fn show_disk(disk: &Disk) -> String {
+    let (what, state, tone) = disk_parts(disk);
+    let state = format!("[{state}]");
+    match tone {
+        Some(tone) => format!("{what} {}", ui::paint(&state, tone)),
+        None => format!("{what} {state}"),
+    }
+}
+
+/// What a disk is, what is on it, and how that should look.
+fn disk_parts(disk: &Disk) -> (String, String, Option<Tone>) {
     let clean = |s: &str| sanitise(s, 128);
     let opt = |s: &Option<String>| s.as_deref().map(clean);
     let what = [opt(&disk.transport), opt(&disk.model)]
@@ -507,8 +571,8 @@ pub fn describe_disk(disk: &Disk) -> String {
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
-    let state = if !disk.installable() {
-        "in use, not installable".to_string()
+    let (state, tone) = if !disk.installable() {
+        ("in use, not installable".to_string(), Some(Tone::Dim))
     } else if disk.has_data() {
         let mut found: Vec<String> = disk.partition_table.iter().map(|t| clean(t)).collect();
         found.extend(disk.contents.iter().map(|c| {
@@ -523,15 +587,19 @@ pub fn describe_disk(disk: &Disk) -> String {
         } else {
             ""
         };
-        format!("HAS DATA: {}{earlier}", found.join(", "))
+        (
+            format!("HAS DATA: {}{earlier}", found.join(", ")),
+            Some(Tone::Warn),
+        )
     } else {
-        "empty".to_string()
+        ("empty".to_string(), None)
     };
-    format!(
-        "{} {} {what} [{state}]",
+    let what = format!(
+        "{} {} {what}",
         clean(&disk.name),
         human_size(disk.size_bytes)
-    )
+    );
+    (what.trim_end().to_string(), state, tone)
 }
 
 pub fn human_size(bytes: u64) -> String {
@@ -702,7 +770,7 @@ async fn pair_with_targets(
                         "addrs": peer.addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
                         "inventory": inventory,
                     });
-                    println!("{report}");
+                    ui::print_result(&report.to_string());
                     paired.push(conn);
                 }
                 Err(e) => {
@@ -723,9 +791,16 @@ async fn pair_with_targets(
 
 fn new_code(code_file: Option<&Path>) -> Result<Code> {
     let code = Code::generate(None)?;
-    eprintln!(
-        "\n    Controller code:  {code}\n\n    On the target: nix-pixie agent --controller-code {code}\n"
-    );
+    ui::note(&[
+        String::new(),
+        format!(
+            "    Controller code:  {}",
+            ui::paint(&code.to_string(), Tone::Bold)
+        ),
+        String::new(),
+        format!("    On the target: nix-pixie agent --controller-code {code}"),
+        String::new(),
+    ]);
     if let Some(path) = code_file {
         write_private(path, &code.to_string())?;
     }

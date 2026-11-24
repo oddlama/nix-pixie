@@ -7,7 +7,6 @@
 //! the target format its disks and receive the system.
 
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,7 +23,7 @@ use nix_pixie_proto::inventory::Disk;
 use tracing::{info, trace};
 use zeroize::Zeroizing;
 
-use crate::controller::{self, Approved, confirm, describe_disk};
+use crate::controller::{self, Approved, describe_disk, show_disk};
 use crate::discovery::{Method, Peer};
 use crate::hooks::{self, Step};
 use crate::hostkey::{self, PublicKey};
@@ -35,6 +34,7 @@ use crate::preflight;
 use crate::push;
 use crate::secrets;
 use crate::system::{Built, Configuration, Disko, Facts, Ssh};
+use crate::ui;
 
 /// For the agent's checks before formatting (a fresh lsblk).
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -92,31 +92,20 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         "target codes start with the number shown on the target, e.g. 482913-acid-acorn-acre",
     )?;
     let requested = parse_disk_args(&args.disks)?;
-    let metadata = metadata::load(&args.flake).await?;
+    ui::steps(step_list(&args, Known::default()));
     // Check what we can before pairing: a mistake shouldn't cost the code.
+    let flake = metadata::local_flake_dir(&args.flake)
+        .map_or_else(|| args.flake.clone(), |dir| dir.display().to_string());
+    let step = ui::start_with("check", flake);
+    let metadata = metadata::load(&args.flake).await?;
     let programs = if let Some(name) = &args.machine {
         let machine = machine(&metadata, &args.flake, name)?;
-        check_push(name, machine)?;
-        if let Some(report) = missing_facter_report(&args.flake, machine) {
-            // A configuration that reads its facter report can't evaluate
-            // before the first one arrives (after approval); check it then.
-            eprintln!(
-                "Not evaluating nixosConfigurations.{} before pairing: its facter report \
-                 ({report}) isn't there yet.",
-                machine.configuration
-            );
-        } else {
-            let disko = disko_of(&Configuration::new(&args.flake, &machine.configuration)?).await?;
-            plan::check_requested(&disko, machine.disks.file.is_some(), &requested)?;
-            let has_hooks = !machine.hooks.is_empty();
-            secrets::check_available(&secrets::needs(&disko.encryption)?, has_hooks)?;
-        }
-        if machine.disks.file.is_some() {
-            repo_root(&args.flake)?;
-        }
-        hooks::schedule(&machine.hooks)?;
-        Some(hooks::resolve(&args.flake, &machine.hooks).await?)
+        ui::steps(step_list(&args, Known::machine(machine)));
+        let programs = check_machine(&args, name, machine, &requested).await?;
+        step.done(format!("machine {name}"));
+        Some(programs)
     } else {
+        step.done(format!("{} machines", metadata.machines.len()));
         None
     };
 
@@ -126,6 +115,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         targets: &args.targets,
         relays: &args.relays,
     };
+    let step = ui::start_with("pair", search.looking(nameplate));
     let (endpoint, mut discovery) = search.start(nameplate).await?;
     let result = tokio::select! {
         r = async {
@@ -133,6 +123,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
                 &endpoint, &mut discovery, &code, nameplate, args.timeout,
             )
             .await?;
+            step.done(controller::describe_peer(&conn, &peer));
             let result = session(
                 &mut stream, &conn, &peer, &metadata, &args, requested, programs,
             )
@@ -163,8 +154,148 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         None => Ok(()),
     };
     report.insert("hooks".into(), hooks.report());
-    println!("{}", serde_json::Value::Object(report));
+    ui::finish();
+    ui::print_result(&serde_json::Value::Object(report).to_string());
     done
+}
+
+/// What decides which steps an install has, as far as it is known.
+#[derive(Debug, Default, Clone, Copy)]
+struct Known<'a> {
+    /// The machine being installed: its optional steps and its hooks.
+    machine: Option<&'a Machine>,
+    /// Whether the configuration has an SSH server to check after the first
+    /// boot, once it is evaluated.
+    ssh: Option<bool>,
+    /// Whether the layout reads disk keys.
+    keys: bool,
+}
+
+impl<'a> Known<'a> {
+    fn machine(machine: &'a Machine) -> Self {
+        Self {
+            machine: Some(machine),
+            ..Self::default()
+        }
+    }
+}
+
+/// The steps of the install, with each hook after the step it follows.
+/// Refined as more is known; steps that turn out not to apply after all
+/// (no address to check the first boot at) are skipped when that shows.
+fn step_list(args: &InstallArgs, known: Known<'_>) -> Vec<(String, String)> {
+    let machine = known.machine;
+    let schedule = machine
+        .and_then(|m| hooks::schedule(&m.hooks).ok())
+        .unwrap_or_default();
+    let configuration = machine.map_or_else(
+        || "the configuration".to_string(),
+        |m| format!("nixosConfigurations.{}", m.configuration),
+    );
+    let mut list = StepList {
+        steps: Vec::new(),
+        schedule: &schedule,
+    };
+    list.add("check", "Check the flake");
+    list.add("pair", "Pair with the target");
+    list.add("approve", "Approve the target");
+    list.hooks(Step::Approve);
+    if machine.is_some_and(|m| m.facter.report_path.is_some()) {
+        list.add("facter", "Get the facter report");
+    }
+    list.hooks(Step::Facter);
+    match machine.map(|m| m.host_key.mode) {
+        Some(HostKeyMode::Pull) => list.add("host-key", "Pull the host key"),
+        Some(HostKeyMode::Push) => list.add("host-key", "Push the host key"),
+        Some(HostKeyMode::None) | None => {}
+    }
+    list.hooks(Step::HostKey);
+    list.add("evaluate", &format!("Evaluate {configuration}"));
+    list.add("disks", "Choose the disks");
+    list.hooks(Step::Disks);
+    if known.keys {
+        list.add("keys", "Get the disk keys");
+    }
+    list.add("build", &format!("Build {configuration}"));
+    list.hooks(Step::Build);
+    list.add("format", "Format the disks");
+    list.hooks(Step::Format);
+    list.add("copy", "Send the system");
+    list.hooks(Step::Copy);
+    list.add("install", "Install the boot loader");
+    list.hooks(Step::Install);
+    let finish = match args.then {
+        Then::Reboot => Some("Unmount and reboot"),
+        Then::Poweroff => Some("Unmount and power off"),
+        Then::Stay => None,
+    };
+    if let Some(finish) = finish {
+        list.add("finish", finish);
+        list.hooks(Step::Finish);
+        if known.ssh != Some(false) {
+            list.add("boot", "Wait for the first boot");
+            list.hooks(Step::Boot);
+        }
+    }
+    list.steps
+}
+
+/// The list [`step_list`] builds: keys and labels for [`ui::steps`].
+struct StepList<'a> {
+    steps: Vec<(String, String)>,
+    schedule: &'a hooks::Schedule,
+}
+
+impl StepList<'_> {
+    fn add(&mut self, key: &str, label: &str) {
+        self.steps.push((key.to_string(), label.to_string()));
+    }
+
+    /// The hooks that run after `step`, whether or not it is in the list.
+    fn hooks(&mut self, step: Step) {
+        for hook in self.schedule.after(step) {
+            self.steps
+                .push((hooks::step_key(hook), format!("Run hook {hook}")));
+        }
+    }
+}
+
+/// Checks what can be checked about `machine` before pairing, and resolves
+/// and builds its hooks.
+async fn check_machine(
+    args: &InstallArgs,
+    name: &str,
+    machine: &Machine,
+    requested: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, PathBuf>> {
+    check_push(name, machine)?;
+    if let Some(report) = missing_facter_report(&args.flake, machine) {
+        // A configuration that reads its facter report can't evaluate
+        // before the first one arrives (after approval); check it then.
+        info!(
+            report,
+            "not evaluating nixosConfigurations.{} before pairing: its facter report isn't there \
+             yet",
+            machine.configuration
+        );
+    } else {
+        ui::progress(format!(
+            "evaluating nixosConfigurations.{}",
+            machine.configuration
+        ));
+        let disko = disko_of(&Configuration::new(&args.flake, &machine.configuration)?).await?;
+        plan::check_requested(&disko, machine.disks.file.is_some(), requested)?;
+        let has_hooks = !machine.hooks.is_empty();
+        secrets::check_available(&secrets::needs(&disko.encryption)?, has_hooks)?;
+    }
+    if machine.disks.file.is_some() {
+        repo_root(&args.flake)?;
+    }
+    hooks::schedule(&machine.hooks)?;
+    if !machine.hooks.is_empty() {
+        ui::progress("building the hooks");
+    }
+    hooks::resolve(&args.flake, &machine.hooks).await
 }
 
 /// Files that hooks after `step` wrote can't go anywhere: the target is gone.
@@ -215,14 +346,27 @@ impl Check {
                 return Some(self);
             }
             Some(Err(reason)) => {
-                eprintln!("\nNot waiting for {} to boot: {reason}.", self.machine);
+                let mut lines = vec![format!(
+                    "Not waiting for {} to boot: {reason}.",
+                    self.machine
+                )];
                 if let Some(key) = &self.expected {
-                    eprintln!("Its host key, to compare when you first connect: {key}");
+                    lines.push(format!(
+                        "Its host key, to compare when you first connect: {key}"
+                    ));
                     entry.insert("expected".into(), key.to_string().into());
                 }
-                let hooks = hooks.scheduled_after(Step::Boot);
-                if !hooks.is_empty() {
-                    eprintln!("Not running the hooks after `boot`: {}", hooks.join(", "));
+                let after = hooks.scheduled_after(Step::Boot);
+                if !after.is_empty() {
+                    lines.push(format!(
+                        "Not running the hooks after `boot`: {}",
+                        after.join(", ")
+                    ));
+                }
+                ui::show(lines);
+                ui::skip("boot", "no address to ask");
+                for hook in after {
+                    ui::skip(&hooks::step_key(hook), "no boot to wait for");
                 }
                 entry.insert("skipped".into(), reason.into());
             }
@@ -242,22 +386,25 @@ async fn verify(
     args: &InstallArgs,
     report: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
+    let step = ui::start("boot");
     let wait = args.boot_timeout.as_secs();
-    if args.then == Then::Poweroff {
-        eprintln!(
-            "\n{} is powered off. Remove the installer medium if needed and power it on; \
+    let mut lines = vec![if args.then == Then::Poweroff {
+        format!(
+            "{} is powered off. Remove the installer medium if needed and power it on; \
              waiting up to {wait} s for it.",
             check.machine
-        );
+        )
     } else {
-        eprintln!("\nWaiting up to {wait} s for {} to boot.", check.machine);
-    }
+        format!("Waiting up to {wait} s for {} to boot.", check.machine)
+    }];
     if check.encrypted {
-        eprintln!(
-            "Its disks are encrypted: it may ask for the passphrase on its console while booting; \
-             type it there."
+        lines.push(
+            "Its disks are encrypted: it may ask for the passphrase on its console while \
+             booting; type it there."
+                .into(),
         );
     }
+    ui::show(lines);
     let result = hostkey::wait_for(
         &check.addrs,
         check.port,
@@ -266,30 +413,41 @@ async fn verify(
         args.boot_timeout,
     )
     .await;
+    let verified = check.expected.is_some();
     let entry = match &result {
         Ok(seen) => {
-            let verified = check.expected.is_some();
-            if verified {
-                eprintln!(
+            ui::show(vec![if verified {
+                format!(
                     "{} is up, with the host key the install put there.",
                     check.machine
-                );
+                )
             } else {
-                eprintln!(
+                format!(
                     "{} is up. Its host key is new, so it can't be checked: {}",
                     check.machine, seen.key
-                );
-            }
+                )
+            }]);
             serde_json::json!({
                 "verified": verified,
                 "seen": seen.key.to_string(),
                 "address": seen.addr.to_string(),
             })
         }
-        Err(e) => serde_json::json!({ "verified": false, "error": format!("{e:#}") }),
+        Err(e) => {
+            // The error says what happened; the notice is stale.
+            ui::show(Vec::new());
+            serde_json::json!({ "verified": false, "error": format!("{e:#}") })
+        }
     };
     report.insert("hostKey".into(), entry);
-    result.map(|_| ())
+    let seen = result?;
+    let key = if verified {
+        "host key verified"
+    } else {
+        "new host key"
+    };
+    step.done(format!("up at {}, {key}", seen.addr));
+    Ok(())
 }
 
 /// The machine's facter report path, if it wants one and the repository
@@ -353,6 +511,7 @@ async fn prepare(
     mut requested: BTreeMap<String, String>,
     programs: Option<BTreeMap<String, PathBuf>>,
 ) -> Result<Plan> {
+    let step = ui::start("approve");
     let Approved {
         label,
         inventory,
@@ -370,6 +529,7 @@ async fn prepare(
     .await?;
     let name = name.context("approved without a machine")?;
     let machine = machine(metadata, &args.flake, &name)?;
+    ui::steps(step_list(args, Known::machine(machine)));
     check_push(&name, machine)?;
     let target = serde_json::json!({
         "id": conn.remote_id().to_string(),
@@ -377,11 +537,14 @@ async fn prepare(
         "inventory": inventory,
     });
     let mut hooks = start_hooks(args, &name, machine, target, programs).await?;
+    step.done(name.clone());
     hooks.after(Step::Approve).await?;
     if let Some(path) = &machine.facter.report_path {
+        let step = ui::start("facter");
         controller::fetch_facter_report(stream, &args.flake, path)
             .await
             .context("getting the facter report")?;
+        step.done(path.clone());
     }
     hooks.after(Step::Facter).await?;
     // Before building: the configuration (or a rekeying hook) may use it.
@@ -389,23 +552,15 @@ async fn prepare(
     hooks.context.host_key = pulled.as_ref().map(ToString::to_string);
     hooks.after(Step::HostKey).await?;
 
-    let configuration = Configuration::new(&args.flake, &machine.configuration)?;
-    let facts = configuration.facts().await?;
-    if facts.system != inventory.system {
-        bail!(
-            "nixosConfigurations.{} is for {}, but the target is {}",
-            machine.configuration,
-            facts.system,
-            sanitise(&inventory.system, 32)
-        );
-    }
-    preflight::check_boot(&facts.boot, &inventory.firmware, &machine.configuration)?;
-    let host_key = host_key_path(pulled, &facts, &machine.configuration)?;
-    let disko = facts
-        .disko
-        .with_context(|| no_disko(&machine.configuration))?;
-    let needs = secrets::needs(&disko.encryption)?;
-    secrets::check_available(&needs, !machine.hooks.is_empty())?;
+    let Evaluated {
+        configuration,
+        facts,
+        disko,
+        needs,
+        host_key,
+    } = evaluate(args, machine, &inventory, pulled).await?;
+
+    let step = ui::start("disks");
     let choices = choose_disks(
         &disko,
         machine.disks.file.is_some(),
@@ -420,14 +575,26 @@ async fn prepare(
     if let Some(file) = &machine.disks.file {
         record_pins(&configuration, &args.flake, file, &choices).await?;
     }
+    step.done(
+        choices
+            .iter()
+            .map(|c| format!("{} = {}", c.role, c.disk))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     hooks.context.disks = Some(serde_json::to_value(&choices)?);
     hooks.after(Step::Disks).await?;
 
     // Before the build, so it can run unattended.
+    let step = (!needs.is_empty()).then(|| ui::start("keys"));
     let key_files = secrets::gather(needs, hooks.take_disk_keys()).await?;
+    if let Some(step) = step {
+        step.done(format!("{} key file(s)", key_files.len()));
+    }
 
-    eprintln!("\nBuilding nixosConfigurations.{}", machine.configuration);
+    let step = ui::start("build");
     let built = configuration.build().await?;
+    step.done("");
     hooks.context.system = Some(built.toplevel.clone());
     hooks.after(Step::Build).await?;
     Ok(Plan {
@@ -442,6 +609,62 @@ async fn prepare(
         host_key,
         key_files,
         hooks,
+    })
+}
+
+/// What evaluating the approved machine's configuration settled.
+struct Evaluated {
+    configuration: Configuration,
+    facts: Facts,
+    disko: Disko,
+    /// The key files its layout reads while formatting.
+    needs: Vec<secrets::Need>,
+    /// Pull mode: the pulled key, and where the installed system wants it.
+    host_key: Option<(PublicKey, String)>,
+}
+
+/// Evaluates the approved machine's configuration and checks it against the
+/// target, refining the steps with what it says.
+async fn evaluate(
+    args: &InstallArgs,
+    machine: &Machine,
+    inventory: &nix_pixie_proto::inventory::Inventory,
+    pulled: Option<PublicKey>,
+) -> Result<Evaluated> {
+    let step = ui::start("evaluate");
+    let configuration = Configuration::new(&args.flake, &machine.configuration)?;
+    let mut facts = configuration.facts().await?;
+    if facts.system != inventory.system {
+        bail!(
+            "nixosConfigurations.{} is for {}, but the target is {}",
+            machine.configuration,
+            facts.system,
+            sanitise(&inventory.system, 32)
+        );
+    }
+    preflight::check_boot(&facts.boot, &inventory.firmware, &machine.configuration)?;
+    let host_key = host_key_path(pulled, &facts, &machine.configuration)?;
+    let disko = facts
+        .disko
+        .take()
+        .with_context(|| no_disko(&machine.configuration))?;
+    let needs = secrets::needs(&disko.encryption)?;
+    secrets::check_available(&needs, !machine.hooks.is_empty())?;
+    ui::steps(step_list(
+        args,
+        Known {
+            machine: Some(machine),
+            ssh: Some(facts.ssh.enable),
+            keys: !needs.is_empty(),
+        },
+    ));
+    step.done(facts.system.clone());
+    Ok(Evaluated {
+        configuration,
+        facts,
+        disko,
+        needs,
+        host_key,
     })
 }
 
@@ -511,38 +734,27 @@ async fn apply(
         mut hooks,
     } = plan;
     confirm_erase(&disks, &choices, args.yes, args.wipe).await?;
-
-    eprintln!("Sending the disko script");
-    push::copy(
+    format_disks(
+        stream,
         conn,
-        &StreamRequest::LiveStore,
-        std::slice::from_ref(&built.disko_script),
+        &choices,
+        &disko,
+        &built.disko_script,
+        key_files,
     )
-    .await
-    .context("pushing the disko script into the target's live store")?;
-    let labels = plan::created_names(&disko).into_iter().collect();
-    prepare_disks(stream, &choices, labels).await?;
-    eprintln!("Formatting");
-    run_disko(stream, &built.disko_script, key_files).await?;
+    .await?;
     let root = disko.root_mount_point;
     hooks.context.root = Some(root.clone());
     hooks.after(Step::Format).await?;
     place_files(stream, &root, &mut hooks).await?;
 
-    let fstype = push::prepare_disk_store(stream, &root).await?;
-    push::warn_if_relayed(conn);
-    eprintln!("Sending the system into {root} ({fstype})");
-    let seconds = push::copy(
-        conn,
-        &StreamRequest::Store { root: root.clone() },
-        std::slice::from_ref(&built.toplevel),
-    )
-    .await?;
+    let (fstype, copied) = send_system(stream, conn, &root, &built.toplevel).await?;
     hooks.after(Step::Copy).await?;
     place_files(stream, &root, &mut hooks).await?;
-    eprintln!("Installing the boot loader");
+    let step = ui::start("install");
     let (expected, key_path) = host_key.unzip();
     install_system(stream, &root, &built.toplevel, key_path).await?;
+    step.done("");
     hooks.after(Step::Install).await?;
     place_files(stream, &root, &mut hooks).await?;
 
@@ -555,12 +767,14 @@ async fn apply(
         &built.toplevel,
         &root,
         fstype,
-        seconds,
+        copied.seconds,
         args.then,
     )?;
     let shutdown = match args.then {
         Then::Stay => {
-            eprintln!("Installed; {root} stays mounted on the target.");
+            ui::show(vec![format!(
+                "Installed; {root} stays mounted on the target."
+            )]);
             return Ok(Installed {
                 report,
                 check: None,
@@ -576,7 +790,12 @@ async fn apply(
     } else {
         None
     };
+    let step = ui::start("finish");
     let live = finish(stream, &root, &disko.zpools, shutdown).await?;
+    step.done(match shutdown {
+        Shutdown::Reboot => "rebooting",
+        Shutdown::PowerOff => "powering off",
+    });
     hooks.context.root = None;
     hooks.after(Step::Finish).await?;
     no_files_left(&mut hooks, Step::Finish)?;
@@ -594,6 +813,59 @@ async fn apply(
         check,
         hooks,
     })
+}
+
+/// Formats the confirmed disks: sends the disko script, has the target
+/// check its disks once more, and runs disko there.
+async fn format_disks(
+    stream: &mut Stream,
+    conn: &Connection,
+    choices: &[Choice],
+    disko: &Disko,
+    script: &str,
+    key_files: Vec<KeyFile>,
+) -> Result<()> {
+    let step = ui::start_with("format", "sending the disko script");
+    push::copy(
+        conn,
+        &StreamRequest::LiveStore,
+        std::slice::from_ref(&script.to_string()),
+    )
+    .await
+    .context("pushing the disko script into the target's live store")?;
+    step.detail("checking the disks on the target");
+    let labels = plan::created_names(disko).into_iter().collect();
+    prepare_disks(stream, choices, labels).await?;
+    step.detail("running disko");
+    run_disko(stream, script, key_files).await?;
+    step.done(format!("mounted at {}", disko.root_mount_point));
+    Ok(())
+}
+
+/// Copies the system into the store under `root` on the target. Returns
+/// that store's filesystem type and what was copied.
+async fn send_system(
+    stream: &mut Stream,
+    conn: &Connection,
+    root: &str,
+    toplevel: &str,
+) -> Result<(String, push::Copied)> {
+    let fstype = push::prepare_disk_store(stream, root).await?;
+    let into = format!("into {root}, {fstype}");
+    let step = ui::start_with("copy", into.clone());
+    push::warn_if_relayed(conn);
+    let copied = push::copy(
+        conn,
+        &StreamRequest::Store { root: root.into() },
+        std::slice::from_ref(&toplevel.to_string()),
+    )
+    .await?;
+    step.done(if copied.what.is_empty() {
+        into
+    } else {
+        format!("{} {into}", copied.what)
+    });
+    Ok((fstype, copied))
 }
 
 /// The result so far, as printed at the end.
@@ -635,9 +907,9 @@ async fn place_files(stream: &mut Stream, root: &str, hooks: &mut hooks::Runner)
     if files.is_empty() {
         return Ok(());
     }
-    eprintln!(
-        "Putting {} file(s) from hooks into the installed system",
-        files.len()
+    info!(
+        files = files.len(),
+        "putting the hooks' files into the installed system"
     );
     write_frame(
         stream,
@@ -700,6 +972,7 @@ async fn host_key(
     pushed: Option<Zeroizing<Vec<u8>>>,
 ) -> Result<PublicKey> {
     let how = if pushed.is_some() { "pushed" } else { "pulled" };
+    let step = ui::start("host-key");
     let request = match pushed {
         Some(private) => ControllerMsg::ProvideHostKey {
             private: Secret(private),
@@ -728,6 +1001,7 @@ async fn host_key(
         metadata::write_into_repo(&root, &file, line.as_bytes()).await?;
         info!(%path, "recorded the host key");
     }
+    step.done(key.short());
     Ok(key)
 }
 
@@ -763,7 +1037,7 @@ async fn install_system(
     match follow(stream).await? {
         (TargetMsg::InstallDone, _) => Ok(()),
         (TargetMsg::InstallFailed { error }, tail) => {
-            eprintln!("{}", tail.lines(OUTPUT_TAIL_LINES));
+            ui::note(&[tail.lines(OUTPUT_TAIL_LINES)]);
             bail!("installing failed: {}", sanitise(&error, 300))
         }
         _ => bail!("unexpected message while installing"),
@@ -905,22 +1179,23 @@ async fn choose_disks(
             Resolution::Done(choices) => return Ok(choices),
             Resolution::Ask { role, candidates } => (role, candidates),
         };
-        let described: Vec<String> = candidates
+        let offered: Vec<&Disk> = candidates
             .iter()
             .filter_map(|name| present.iter().find(|d| &d.name == name))
-            .map(describe_disk)
             .collect();
-        if yes || !std::io::stdin().is_terminal() {
+        if yes || !ui::interactive() {
+            let described: Vec<String> = offered.iter().map(|d| describe_disk(d)).collect();
             bail!(
                 "choose the disk for {role} with --disk {role}=<disk>. Candidates:\n  {}",
                 described.join("\n  ")
             );
         }
-        eprintln!("\nWhich disk is {role}?");
-        for (i, line) in described.iter().enumerate() {
-            eprintln!("  {}) {line}", i + 1);
+        let mut lines = vec![format!("Which disk is {role}?")];
+        for (i, disk) in offered.iter().enumerate() {
+            lines.push(format!("  {}) {}", i + 1, show_disk(disk)));
         }
-        let answer = read_line("Number: ").await?;
+        ui::show(lines);
+        let answer = ui::ask("Number: ").await.unwrap_or_default();
         let pick = answer
             .trim()
             .parse::<usize>()
@@ -957,35 +1232,35 @@ async fn confirm_erase(disks: &[Disk], choices: &[Choice], yes: bool, wipe: bool
         .filter_map(|c| Some((c, disks.iter().find(|d| d.name == c.disk)?)))
         .collect();
     let with_data = chosen.iter().any(|(_, d)| d.has_data());
-    eprintln!("\nThis erases everything on:");
+    let mut lines = vec!["This erases everything on:".to_string()];
     for (choice, disk) in &chosen {
-        eprintln!("  {:<10} {}", choice.role, describe_disk(disk));
+        lines.push(format!("  {:<10} {}", choice.role, show_disk(disk)));
     }
-    if with_data {
+    ui::show(lines);
+    let (question, refusal) = if with_data {
         if wipe {
+            ui::commit();
             return Ok(());
         }
-        if yes || !std::io::stdin().is_terminal() {
+        if yes || !ui::interactive() {
+            ui::commit();
             bail!("there is data on these disks; pass --wipe to erase it");
         }
-        if !confirm("Erase these disks and the data on them? [y/N] ").await? {
-            bail!("not erasing");
+        (
+            "Erase these disks and the data on them? [y/N] ",
+            "not erasing",
+        )
+    } else {
+        if yes {
+            ui::commit();
+            return Ok(());
         }
-    } else if !(yes || confirm("Format these disks? [y/N] ").await?) {
-        bail!("not formatting");
+        ("Format these disks? [y/N] ", "not formatting")
+    };
+    if !ui::confirm(question).await {
+        bail!(refusal);
     }
     Ok(())
-}
-
-async fn read_line(prompt: &str) -> Result<String> {
-    use tokio::io::AsyncBufReadExt;
-    eprint!("{prompt}");
-    let mut line = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
-        .read_line(&mut line)
-        .await
-        .context("reading the answer")?;
-    Ok(line)
 }
 
 async fn prepare_disks(stream: &mut Stream, choices: &[Choice], labels: Vec<String>) -> Result<()> {
@@ -1023,7 +1298,7 @@ async fn run_disko(stream: &mut Stream, script: &str, key_files: Vec<KeyFile>) -
     match follow(stream).await? {
         (TargetMsg::DiskoDone, _) => Ok(()),
         (TargetMsg::DiskoFailed { error }, tail) => {
-            eprintln!("{}", tail.lines(OUTPUT_TAIL_LINES));
+            ui::note(&[tail.lines(OUTPUT_TAIL_LINES)]);
             bail!("formatting failed: {}", sanitise(&error, 300))
         }
         _ => bail!("unexpected message while formatting"),

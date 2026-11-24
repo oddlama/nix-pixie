@@ -90,3 +90,9 @@ fn judges_answers_while_the_target_reboots() {
         Verdict::Seen(new_key)
     );
 }
+
+#[test]
+fn short_keys_keep_their_end() {
+    let key = PublicKey::parse(A).unwrap();
+    assert_eq!(key.short(), "ssh-ed25519 …LVSO3OiU+MZo");
+}

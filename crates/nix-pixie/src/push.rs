@@ -18,12 +18,21 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::net::{self, Route, Stream, sanitise};
+use crate::nixlog;
 use crate::state::private_dir;
 
 /// What a finished push reports.
 pub struct PushReport {
     pub fstype: String,
+    pub copied: Copied,
+}
+
+/// What one `nix copy` to the target did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Copied {
     pub seconds: f64,
+    /// How much was copied, for the operator (empty if nothing was).
+    pub what: String,
 }
 
 /// Fails unless every path is valid in the local store, so a typo surfaces
@@ -58,8 +67,8 @@ pub async fn push(
     let fstype = prepare_disk_store(ctrl, root).await?;
     warn_if_relayed(conn);
     let request = StreamRequest::Store { root: root.into() };
-    let seconds = copy(conn, &request, paths).await?;
-    Ok(PushReport { fstype, seconds })
+    let copied = copy(conn, &request, paths).await?;
+    Ok(PushReport { fstype, copied })
 }
 
 /// Tells the operator if a copy is about to go through a relay. Relays are
@@ -67,9 +76,7 @@ pub async fn push(
 /// somebody else pays for the traffic.
 pub fn warn_if_relayed(conn: &Connection) {
     if let Route::Relayed(relay) = net::route(conn) {
-        eprintln!(
-            "No direct path to the target (yet): copying through the relay {relay}, which is slow."
-        );
+        warn!(%relay, "no direct path to the target (yet): copying through the relay, which is slow");
     }
 }
 
@@ -92,9 +99,9 @@ pub async fn prepare_disk_store(ctrl: &mut Stream, root: &str) -> Result<String>
     }
 }
 
-/// Runs `nix copy` for `paths` into the target store `request` names.
-/// Returns how long it took, in seconds.
-pub async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) -> Result<f64> {
+/// Runs `nix copy` for `paths` into the target store `request` names, with
+/// its progress on the running step.
+pub async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) -> Result<Copied> {
     // Private: the target's daemon runs as root and trusts whoever connects.
     let dir = private_dir()?;
     let socket = dir.join("store.sock");
@@ -104,9 +111,10 @@ pub async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) 
 
     info!(?request, ?paths, "pushing");
     let started = Instant::now();
-    let status = tokio::process::Command::new("nix")
-        // Paths the controller built itself carry no signatures, and the
-        // target trusts the paired, approved controller anyway.
+    let mut command = tokio::process::Command::new("nix");
+    // Paths the controller built itself carry no signatures, and the target
+    // trusts the paired, approved controller anyway.
+    command
         .args([
             "--extra-experimental-features",
             "nix-command",
@@ -115,19 +123,18 @@ pub async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) 
             "--to",
         ])
         .arg(format!("unix://{}", socket.display()))
-        .args(paths)
-        .status()
-        .await
-        .context("running `nix copy`");
+        .args(paths);
+    let output = nixlog::run(command).await.context("running `nix copy`");
     forwarder.abort();
     let _ = std::fs::remove_dir_all(&dir);
-    let status = status?;
-    if !status.success() {
-        bail!("`nix copy` to the target failed ({status})");
+    let output = output?;
+    if !output.status.success() {
+        bail!("`nix copy` to the target failed ({})", output.status);
     }
     let seconds = started.elapsed().as_secs_f64();
-    info!(seconds, "pushed");
-    Ok(seconds)
+    let what = output.progress.outcome();
+    info!(seconds, copied = what, "pushed");
+    Ok(Copied { seconds, what })
 }
 
 /// Connects every client of the local socket to a new stream of the kind

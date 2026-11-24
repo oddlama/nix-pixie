@@ -19,6 +19,7 @@ use tracing::warn;
 use zeroize::Zeroizing;
 
 use crate::system::Encryption;
+use crate::ui;
 
 /// ZFS refuses shorter passphrases.
 const ZFS_MIN_PASSPHRASE: usize = 8;
@@ -224,6 +225,8 @@ pub async fn gather(
         warn!(%path, "a hook provided a key the layout doesn't read; not sending it");
     }
     check_terminal(&missing)?;
+    // rpassword reads the terminal itself.
+    let _terminal = (!missing.is_empty()).then(ui::suspend);
     for need in missing {
         let file = tokio::task::spawn_blocking(move || ask(&need))
             .await

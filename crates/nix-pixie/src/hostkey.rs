@@ -47,6 +47,17 @@ impl PublicKey {
         Ok(Self { blob: blob.into() })
     }
 
+    /// The key, shortened to its last 12 characters for a glance:
+    /// `ssh-ed25519 …LVSO3OiU+MZo`.
+    pub fn short(&self) -> String {
+        let tail = self
+            .blob
+            .char_indices()
+            .nth_back(11)
+            .map_or("", |(i, _)| self.blob.get(i..).unwrap_or_default());
+        format!("{KIND} …{tail}")
+    }
+
     /// The line for a `.pub` file, with `comment` if it is a plain one.
     pub fn to_line(&self, comment: Option<&str>) -> String {
         let plain = |c: &str| {

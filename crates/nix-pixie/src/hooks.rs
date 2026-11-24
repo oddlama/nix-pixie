@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 use crate::metadata::Hook;
 use crate::nixlog;
 use crate::state::private_dir;
+use crate::ui;
 
 /// The install's own steps, in the order they happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -296,6 +297,11 @@ pub async fn resolve(
         .collect()
 }
 
+/// The key of a hook's entry in the list of steps.
+pub fn step_key(hook: &str) -> String {
+    format!("hook:{hook}")
+}
+
 /// What a hook learns about the install so far, in `$PIXIE_CONTEXT`.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -369,9 +375,14 @@ impl Runner {
             else {
                 bail!("hook {name} was not resolved");
             };
-            eprintln!("Running hook {name} (after {step})");
-            let outputs = run(&name, program, hook, step, &self.dir, &self.context).await?;
+            let running = ui::start_announced(&step_key(&name), format!("after {step}"));
+            let outputs = {
+                // The hook may need the terminal, e.g. for a YubiKey PIN.
+                let _terminal = ui::suspend();
+                run(&name, program, hook, step, &self.dir, &self.context).await?
+            };
             self.take_outputs(&name, step, outputs)?;
+            running.done("");
             let total: usize = self.pending.iter().map(|f| f.contents.len()).sum();
             if total > MAX_FILES_BYTES {
                 bail!(
