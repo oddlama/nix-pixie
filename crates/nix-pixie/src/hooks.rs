@@ -371,7 +371,7 @@ impl Runner {
     /// Runs the hooks that follow `step`. Files they write wait in
     /// [`Self::take_files`]. With a `target`, their programs can run there
     /// (`"$PIXIE" target exec`).
-    pub async fn after(&mut self, step: Step, mut target: Option<&mut Target<'_>>) -> Result<()> {
+    pub async fn after(&mut self, step: Step, target: Option<Target<'_>>) -> Result<()> {
         self.reached = Some(step);
         for name in self.schedule.after(step).to_vec() {
             let (Some(hook), Some(program)) = (self.hooks.get(&name), self.programs.get(&name))
@@ -386,16 +386,7 @@ impl Runner {
                 let outputs = {
                     // The hook may need the terminal, e.g. for a YubiKey PIN.
                     let _terminal = ui::suspend();
-                    run(
-                        &name,
-                        program,
-                        hook,
-                        step,
-                        dir,
-                        context,
-                        target.as_deref_mut(),
-                    )
-                    .await?
+                    run(&name, program, hook, step, dir, context, target).await?
                 };
                 running.done("");
                 Ok(outputs)
@@ -518,7 +509,7 @@ async fn run(
     step: Step,
     dir: &Path,
     context: &Context,
-    mut target: Option<&mut Target<'_>>,
+    target: Option<Target<'_>>,
 ) -> Result<Outputs> {
     let scratch = private_dir()?;
     let result = async {
@@ -569,7 +560,7 @@ async fn run(
                 status = child.wait() => break status.with_context(|| format!("running hook {name}"))?,
                 accepted = accept => {
                     let (request, _) = accepted.context("accepting a request of the hook")?;
-                    if let Some(target) = target.as_deref_mut() {
+                    if let Some(target) = target {
                         target::serve(request, target).await?;
                     }
                 }

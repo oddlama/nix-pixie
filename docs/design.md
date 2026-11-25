@@ -32,7 +32,8 @@ we build on them.
 | Hooks: declared per machine or globally, ordered as a DAG with the install's steps, resolved and built before pairing, files into the installed system; `lib.hooks.agenixRekey` | done | `checks.vm-install-hooks`, unit tests of the ordering, file collection and placement |
 | Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
 | Host keys: push mode (from a hook, stored on the target, checked after boot) | done | `checks.vm-install-luks-scripted` |
-| Long sessions across link-local flaps | verified that they don't survive one (the connection never recovers); the installer avoids the flaps | `checks.vm-link-local` |
+| Sessions outliving their connection (network gone for up to 10 minutes): reconnect, resume, every request carried out once | done | `checks.vm-push` (a push cut off for 35 s, and an interrupted controller that frees the target at once), `checks.vm-install-hooks` (a hook's program running through a 35 s cut); network namespaces by hand |
+| Long sessions across link-local flaps | the installer avoids the flaps; a session that loses its connection to one anyway resumes | `checks.vm-link-local` |
 | Targets on other networks (`--target HOST`, unicast probes) running the agent package on a stock NixOS live system (`nix run …#agent`) | done; this way the target must be reachable on UDP 47011/47012 | `checks.vm-remote` (target behind a router with its default firewall; plain NixOS, none of our modules) |
 | Targets nobody can connect to (NAT, closed firewall): found at a relay with only the code, then a direct path where one can be punched. n0's public relays by default, `--relay URL` for others, `--no-relay` for none | done for target-shown codes | `checks.vm-relay` (no open ports; first a whole install through the relay with no route at all, then one over a punched path, with the host key checked after boot); by hand through n0's relay between two NATed network namespaces |
 | Online guessing: rotation after 3 spent guesses, backing off 2 s doubling to 60 s | done | unit tests of the delay, `checks.vm-pairing` |
@@ -182,10 +183,17 @@ flake evaluation, hooks and secret decryption running as root.
   - **NetworkManager's default wired profile** fails the activation every 45 s
     when no DHCP lease arrives, and each time *deletes the link-local address*,
     flushes the neighbour table, and re-adds the address as tentative (usable
-    ~2 s later). Pairing survives it, a session doesn't: in
+    ~2 s later). Pairing survives it, a connection may not: in
     `checks.vm-link-local` the agent dropped its last path 19 s after a flap
     (`LastOpenPath`) and the connection timed out, although the address was
-    back after 2 s. Why iroh's path doesn't recover is open.
+    back after 2 s. Sessions now resume after that (see
+    [Losing the connection](#notes-on-the-flow)), so a flap costs about 30 s
+    rather than the install. Why iroh's path doesn't recover is still open.
+    At the flap the controller logged `sendmsg failed with Invalid argument`
+    and `halting segmentation offload`: noq sends without GSO from then on,
+    which is slower but not the cause. The same EINVAL in network
+    namespaces (the address deleted and re-added 70 ms later, as
+    NetworkManager does) left the push going.
   - **Router advertisements keep the profile up.** One RA completes the
     profile's IPv6 setup (`ipv4.may-fail` is on by default), and the device
     stays activated without DHCP. So the installer (`nixosModules.installer`)
@@ -533,10 +541,49 @@ target boots ─► network (DHCP | IPv4LL | IPv6LL) ─► DNS-SD ─► pair �
     enable sshd. The result is `hostKey` in the JSON; exit status 1 if the
     check fails. For targets found only at a relay, see
     [Relays](#relays-targets-nobody-can-connect-to).
-- **Persistence:** a session journal (no secrets) in
-  `$XDG_STATE_HOME/nix-pixie/sessions/`. A controller restart resumes. The
-  agent reconnects using the pinned keys, and store pushes are idempotent per
-  path.
+- **Losing the connection** (implemented: `crates/nix-pixie/src/link.rs` on
+  the controller, `session` in `agent.rs`, the handshake in
+  `nix-pixie-proto/src/ctrl.rs`). A connection that hears nothing for 30 s
+  (QUIC's idle timeout; iroh sends keep-alives every 5 s) is lost on both
+  sides. After approval that doesn't end the session:
+  - Every request but `Approve` and `Reject` gets exactly one final reply,
+    one at a time, and both sides count the replies. The target keeps its
+    last one.
+  - The controller dials the target again (where it was announced, and
+    where it was last reached) with ALPN `nix-pixie/resume/1` and sends
+    `Resume { answered }`. The target answers `Resumed { answered }` with
+    its own count, followed by its last reply if it is one ahead. With equal
+    counts the request never arrived, and the controller sends it again. So
+    no request runs twice (disko never formats twice) and none is lost. Any
+    other difference ends the session.
+  - Only the paired controller's endpoint id gets in, which iroh's handshake
+    proves, as for store streams. Everybody else is turned away (`busy`).
+  - The controller reconnects as soon as it notices: a request that fails
+    does it, and a background task does it while no request waits, so a
+    controller busy building for an hour doesn't leave the target waiting
+    for its next request. It tries for 10 minutes, pausing 1 s, doubling up
+    to 10 s.
+  - The target finishes what it runs (disko, `nixos-install`, a hook's
+    program). Output meanwhile is dropped; the reply is kept. A controller
+    that comes back while the target is still busy declares the old
+    connection dead (the target closes it, though it may not have noticed
+    yet), and the handshake waits until the request is done.
+  - Store copies run again on the new connection. Nix commits each path once
+    it has arrived whole, so they skip what arrived: a cut 60 s into a 100 s
+    push cost the path in flight, about 40 s of copying.
+  - The target waits 10 minutes, then shows a new code. A controller that
+    closes the connection itself, at the end, after an error or on Ctrl-C,
+    is gone for good, and the target is free at once: only timeouts and
+    resets count as lost. A controller that is killed or crashes keeps the
+    target waiting the 10 minutes. After `Finish` the target waits only the
+    30 s shutdown grace, in case the controller missed `Finished`.
+  - Before approval there is nothing to come back to: a pairing that breaks
+    pairs again, with a new code.
+- **Persistence** (not yet): a session journal (no secrets) in
+  `$XDG_STATE_HOME/nix-pixie/sessions/`, so that a controller restart
+  resumes too, with the handshake above. The agent would have to take back
+  a controller by its pinned key rather than the endpoint id of a process
+  that no longer exists.
 
 ### The operator's terminal
 
@@ -1084,7 +1131,9 @@ NixOS VM tests are the backbone. They cover:
   firmware then booting the disk (done: `checks.vm-iso-uefi`); Secure Boot
   still to do
 - pull-mode rekey (agenix-rekey fixture)
-- interrupted push + resume
+- interrupted push + resume (done: `checks.vm-push` cuts the network
+  during a push and interrupts a controller, `checks.vm-install-hooks`
+  cuts it while a hook's program runs on the target)
 
 Running them: `checks [PATTERN]` in the devshell builds the matching checks
 `JOBS` at a time (default 2). Evaluating a VM test takes about 1.4 GiB, and

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use iroh::endpoint::{Connection, VarInt};
-use iroh::{Endpoint, SecretKey};
+use iroh::endpoint::{Connection, ConnectionError, VarInt};
+use iroh::{Endpoint, EndpointId, SecretKey};
 use mdns_sd::ServiceEvent;
 use nix_pixie_proto::announce::{Announcement, Pairing};
 use nix_pixie_proto::code::{Code, NameplateSpace};
@@ -18,8 +18,9 @@ use nix_pixie_proto::ctrl::{
     ControllerMsg, DiskAssignment, KeyFile, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, Shutdown,
     StreamRequest, TargetMsg,
 };
-use nix_pixie_proto::frame::{read_frame, write_frame};
+use nix_pixie_proto::frame::{FrameError, read_frame, write_frame};
 use nix_pixie_proto::pair::Side;
+use nix_pixie_proto::{ALPN_CTRL, ALPN_RESUME};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -282,6 +283,11 @@ async fn accept_pairing(
             Err(_) => continue,
         };
         let peer = conn.remote_id();
+        if conn.alpn() != ALPN_CTRL {
+            // A controller coming back to a session that is over.
+            conn.close(VarInt::from_u32(1), b"no session");
+            continue;
+        }
         match net::accept_and_pair(endpoint, &conn, side, code).await {
             Ok(stream) => return Ok(Some((conn, stream))),
             Err(failure) => {
@@ -301,30 +307,80 @@ async fn accept_pairing(
 }
 
 /// After pairing: introduce ourselves, then serve this controller until it
-/// disconnects. Other controllers are refused meanwhile.
+/// disconnects. If the connection breaks after approval, wait for the same
+/// controller to come back and go on. Other controllers are refused
+/// meanwhile.
 async fn session(
     endpoint: &Endpoint,
     state: &StateDir,
     conn: &Connection,
-    mut stream: Stream,
+    stream: Stream,
 ) -> Result<()> {
     let controller = conn.remote_id();
     info!(%controller, "paired with controller");
     state.write("paired-controller", &controller.to_string())?;
     println!("\n    Paired with controller {controller}.\n");
 
-    // Separate tasks: reading a frame inside `select!` would lose data
-    // whenever another branch won.
-    let approved = Arc::new(AtomicBool::new(false));
-    let refuser = tokio::spawn(refuse_incoming(endpoint.clone()));
-    let streams = tokio::spawn(accept_streams(conn.clone(), approved.clone()));
-    let result = serve_controller(state, &mut stream, &approved).await;
-    streams.abort();
-    refuser.abort();
-    if let Ok(shutdown) = &result {
+    let mut session = Session::default();
+    let (comebacks, mut returns) = tokio::sync::mpsc::channel(4);
+    let acceptor = tokio::spawn(accept_resumes(endpoint.clone(), controller, comebacks));
+    let (mut conn, mut stream) = (conn.clone(), stream);
+    let mut introduce = true;
+    let result = loop {
+        // Separate tasks: reading a frame inside `select!` would lose data
+        // whenever another branch won.
+        let streams = tokio::spawn(accept_streams(conn.clone(), session.approved.clone()));
+        let (end, early) = serve(
+            state,
+            &conn,
+            &mut stream,
+            &mut session,
+            introduce,
+            &mut returns,
+        )
+        .await;
+        streams.abort();
+        introduce = false;
+        let error = match end {
+            Ok(None) => break Ok(()),
+            Ok(Some(error)) => error,
+            Err(e) => break Err(e),
+        };
+        // Before approval there is nothing to come back to. After `Finish`
+        // the install is done: the controller may only have missed that.
+        if !session.approved.load(Ordering::Relaxed) {
+            warn!(%controller, "lost the controller ({error:#})");
+            break Ok(());
+        }
+        let wait = if session.shutdown.is_some() {
+            SHUTDOWN_GRACE
+        } else {
+            RESUME_WAIT
+        };
+        if early.is_some() {
+            info!(%controller, "the controller lost the connection ({error:#}) and came back");
+        } else {
+            warn!(%controller, "lost the controller ({error:#}); waiting for it to come back");
+            println!(
+                "\n    Lost the controller. Waiting up to {} for it to come back...\n",
+                humantime(wait)
+            );
+        }
+        let Some((back, resumed)) = wait_for_resume(early, &mut returns, &session, wait).await
+        else {
+            warn!(%controller, "the controller didn't come back; ending the session");
+            println!("\n    The controller didn't come back.\n");
+            break Ok(());
+        };
+        info!(%controller, answered = session.answered, "the controller is back");
+        println!("\n    The controller is back.\n");
+        (conn, stream) = (back, resumed);
+    };
+    acceptor.abort();
+    if result.is_ok() {
         // After `Finished` the controller leaves at once; don't wait for one
         // that vanished without saying so.
-        let wait = if shutdown.is_some() {
+        let wait = if session.shutdown.is_some() {
             SHUTDOWN_GRACE
         } else {
             Duration::MAX
@@ -337,10 +393,168 @@ async fn session(
     }
     state.remove("paired-controller");
     state.remove("approved");
-    if let Some(how) = result? {
+    result?;
+    if let Some(how) = session.shutdown {
         shut_down(how).await?;
     }
     Ok(())
+}
+
+/// What a session keeps across connections to its controller.
+#[derive(Default)]
+struct Session {
+    approved: Arc<AtomicBool>,
+    /// Checked (and linked) by `PrepareDisks`, for `RunDisko`.
+    prepared: Option<Vec<DiskAssignment>>,
+    /// Set by a successful `Finish`.
+    shutdown: Option<Shutdown>,
+    /// Requests answered so far, and the last reply: a controller that
+    /// comes back gets it again if it never saw it.
+    answered: u64,
+    last: Option<TargetMsg>,
+}
+
+/// How long a target waits for its controller to come back after their
+/// connection broke. The controller reconnects as soon as it notices, even
+/// while it is busy with something else, so this only has to cover the
+/// network being away: a cable replugged, a laptop woken up. A controller
+/// that crashed or was killed never comes back, and keeps the target from
+/// pairing with another one until then.
+const RESUME_WAIT: Duration = Duration::from_mins(10);
+
+/// Serves the controller on `conn` until it hangs up (`None`) or the
+/// connection is lost (the error). If the controller comes back meanwhile,
+/// it lost the connection itself: it is closed here, and the returning
+/// connection is the second value. A request in progress finishes either
+/// way.
+async fn serve(
+    state: &StateDir,
+    conn: &Connection,
+    stream: &mut Stream,
+    session: &mut Session,
+    introduce: bool,
+    returns: &mut tokio::sync::mpsc::Receiver<Connection>,
+) -> (Result<Option<anyhow::Error>>, Option<Connection>) {
+    let serving = serve_controller(state, stream, session, introduce);
+    tokio::pin!(serving);
+    let (mut early, mut listening) = (None, true);
+    let end = loop {
+        tokio::select! {
+            end = &mut serving => break end,
+            back = returns.recv(), if listening => {
+                listening = false;
+                if let Some(back) = back {
+                    conn.close(VarInt::from_u32(2), b"replaced");
+                    early = Some(back);
+                }
+            }
+        }
+    };
+    let end = end.map(|end| end.and_then(|error| is_lost(conn).then_some(error)));
+    (end, early)
+}
+
+/// Whether `conn` broke rather than being closed by the controller: the
+/// controller closes it at the end of a session, or when it is interrupted.
+fn is_lost(conn: &Connection) -> bool {
+    conn.close_reason()
+        .is_some_and(|reason| !matches!(reason, ConnectionError::ApplicationClosed(_)))
+}
+
+/// Hands the session's controller's connections to resume it over
+/// `returns`, and turns everyone else away.
+async fn accept_resumes(
+    endpoint: Endpoint,
+    controller: EndpointId,
+    returns: tokio::sync::mpsc::Sender<Connection>,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let returns = returns.clone();
+        tokio::spawn(async move {
+            let Ok(Ok(conn)) = tokio::time::timeout(net::CONNECT_TIMEOUT, incoming).await else {
+                return;
+            };
+            if conn.remote_id() == controller && conn.alpn() == ALPN_RESUME {
+                let _ = returns.send(conn).await;
+            } else {
+                conn.close(VarInt::from_u32(1), b"busy");
+            }
+        });
+    }
+}
+
+/// Waits up to `wait` for the controller to come back (unless it already
+/// did, `early`), and resumes the session with it.
+async fn wait_for_resume(
+    early: Option<Connection>,
+    returns: &mut tokio::sync::mpsc::Receiver<Connection>,
+    session: &Session,
+    wait: Duration,
+) -> Option<(Connection, Stream)> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut early = early;
+    loop {
+        let conn = match early.take() {
+            Some(conn) => conn,
+            None => tokio::time::timeout_at(deadline, returns.recv())
+                .await
+                .ok()??,
+        };
+        match resume(&conn, session).await {
+            Ok(stream) => return Some((conn, stream)),
+            Err(e) => {
+                warn!("the controller came back, but: {e:#}");
+                conn.close(VarInt::from_u32(1), b"resume failed");
+            }
+        }
+    }
+}
+
+/// The resume handshake (see `nix_pixie_proto::ctrl`): tells the controller
+/// how many requests have their reply, and replays the last one if the
+/// controller didn't get it.
+async fn resume(conn: &Connection, session: &Session) -> Result<Stream> {
+    let (send, recv) = tokio::time::timeout(net::CONNECT_TIMEOUT, conn.accept_bi())
+        .await
+        .context("timed out waiting for the control stream")??;
+    let mut stream = tokio::io::join(recv, send);
+    let ControllerMsg::Resume { answered } = tokio::time::timeout(
+        net::CONNECT_TIMEOUT,
+        read_frame(&mut stream, MAX_CONTROLLER_FRAME),
+    )
+    .await
+    .context("timed out waiting for the controller to resume")??
+    else {
+        bail!("the controller didn't start with Resume");
+    };
+    write_frame(
+        &mut stream,
+        &TargetMsg::Resumed {
+            answered: session.answered,
+        },
+    )
+    .await?;
+    if answered.checked_add(1) == Some(session.answered)
+        && let Some(last) = &session.last
+    {
+        write_frame(&mut stream, last).await?;
+    } else if answered != session.answered {
+        bail!(
+            "the controller has {answered} replies, but {} were sent",
+            session.answered
+        );
+    }
+    Ok(stream)
+}
+
+/// "10 minutes", "30 seconds".
+fn humantime(wait: Duration) -> String {
+    let secs = wait.as_secs();
+    if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{} minutes", secs / 60)
+    } else {
+        format!("{secs} seconds")
+    }
 }
 
 /// Reboots into the installed system or powers off.
@@ -390,36 +604,35 @@ async fn accept_streams(conn: Connection, approved: Arc<AtomicBool>) {
     }
 }
 
-async fn refuse_incoming(endpoint: Endpoint) {
-    while let Some(incoming) = endpoint.accept().await {
-        incoming.refuse();
-    }
-}
-
-/// Answers the paired controller's requests until it disconnects or rejects
-/// us. Disconnecting is the normal end of a session; after `Finish`, it is
-/// the signal to shut down as returned.
+/// Answers the paired controller's requests until it disconnects, rejects
+/// us, or reading or writing fails (the error: whether that means the
+/// connection broke is up to the connection). Disconnecting is the normal
+/// end of a session; after `Finish`, it is the signal to shut down.
+/// `introduce`: start with the hello and the inventory (not after resuming).
 async fn serve_controller(
     state: &StateDir,
     stream: &mut Stream,
-    approved: &AtomicBool,
-) -> Result<Option<Shutdown>> {
-    let label = net::hostname();
-    write_frame(stream, &TargetMsg::Hello { label }).await?;
-    let inventory = inventory::collect(&disko::formatted(state)).await;
-    write_frame(stream, &TargetMsg::Inventory(Box::new(inventory))).await?;
-
-    // Checked (and linked) by `PrepareDisks`, for `RunDisko`.
-    let mut prepared: Option<Vec<DiskAssignment>> = None;
-    // Set by a successful `Finish`.
-    let mut shutdown: Option<Shutdown> = None;
+    session: &mut Session,
+    introduce: bool,
+) -> Result<Option<anyhow::Error>> {
+    if introduce {
+        let label = net::hostname();
+        write_frame(stream, &TargetMsg::Hello { label }).await?;
+        let inventory = inventory::collect(&disko::formatted(state)).await;
+        write_frame(stream, &TargetMsg::Inventory(Box::new(inventory))).await?;
+    }
     loop {
-        let Ok(message) = read_frame::<_, ControllerMsg>(stream, MAX_CONTROLLER_FRAME).await else {
-            return Ok(shutdown);
+        let message = match read_frame::<_, ControllerMsg>(stream, MAX_CONTROLLER_FRAME).await {
+            Ok(message) => message,
+            Err(FrameError::Io(e)) => return Ok(Some(e.into())),
+            Err(e) => {
+                warn!("the controller broke the protocol: {e}");
+                return Ok(None);
+            }
         };
         let reply = match message {
             ControllerMsg::Approve { machine } => {
-                approve(state, approved, machine)?;
+                approve(state, &session.approved, machine)?;
                 continue;
             }
             ControllerMsg::Reject { reason } => {
@@ -428,8 +641,13 @@ async fn serve_controller(
                 println!("\n    Rejected by the controller: {reason}\n");
                 return Ok(None);
             }
+            // Only first on a new connection.
+            ControllerMsg::Resume { .. } => {
+                warn!("the controller sent Resume in the middle of a session");
+                return Ok(None);
+            }
             // Everything else needs approval first.
-            message if !approved.load(Ordering::Relaxed) => match refusal(&message) {
+            message if !session.approved.load(Ordering::Relaxed) => match refusal(&message) {
                 Some(reply) => reply,
                 None => continue,
             },
@@ -439,26 +657,11 @@ async fn serve_controller(
             },
             ControllerMsg::PrepareStore { root } => prepare_store(&root),
             ControllerMsg::PrepareDisks { disks, labels } => {
-                prepared = None;
-                match disko::prepare(&disks, &labels, &disko::formatted(state)).await {
-                    Ok(()) => {
-                        let names: Vec<String> = disks
-                            .iter()
-                            .map(|d| format!("{} ({})", d.device, d.role))
-                            .collect();
-                        info!(disks = ?names, "disks ready to format");
-                        println!("\n    About to format: {}\n", names.join(", "));
-                        prepared = Some(disks);
-                        TargetMsg::DisksReady
-                    }
-                    Err(reason) => {
-                        warn!(%reason, "refusing to format");
-                        TargetMsg::DisksRefused { reason }
-                    }
-                }
+                session.prepared = None;
+                prepare_disks(state, disks, &labels, &mut session.prepared).await
             }
             ControllerMsg::RunDisko { script, key_files } => {
-                run_disko(state, stream, &script, &key_files, prepared.take()).await?
+                run_disko(state, stream, &script, &key_files, session.prepared.take()).await?
             }
             ControllerMsg::GenerateHostKey => generate_host_key(state).await,
             ControllerMsg::ProvideHostKey { private } => {
@@ -492,12 +695,46 @@ async fn serve_controller(
             ControllerMsg::Finish { root, zpools, then } => {
                 let reply = finish(&root, &zpools).await;
                 if matches!(reply, TargetMsg::Finished { .. }) {
-                    shutdown = Some(then);
+                    session.shutdown = Some(then);
                 }
                 reply
             }
         };
-        write_frame(stream, &reply).await?;
+        // Kept before it is sent: if sending fails, the controller comes
+        // back for it.
+        session.answered += 1;
+        session.last = Some(reply.clone());
+        if let Err(e) = write_frame(stream, &reply).await {
+            return Ok(Some(match e {
+                FrameError::Io(e) => e.into(),
+                e => e.into(),
+            }));
+        }
+    }
+}
+
+/// Checks the disks the controller chose, and keeps them for `RunDisko`.
+async fn prepare_disks(
+    state: &StateDir,
+    disks: Vec<DiskAssignment>,
+    labels: &[String],
+    prepared: &mut Option<Vec<DiskAssignment>>,
+) -> TargetMsg {
+    match disko::prepare(&disks, labels, &disko::formatted(state)).await {
+        Ok(()) => {
+            let names: Vec<String> = disks
+                .iter()
+                .map(|d| format!("{} ({})", d.device, d.role))
+                .collect();
+            info!(disks = ?names, "disks ready to format");
+            println!("\n    About to format: {}\n", names.join(", "));
+            *prepared = Some(disks);
+            TargetMsg::DisksReady
+        }
+        Err(reason) => {
+            warn!(%reason, "refusing to format");
+            TargetMsg::DisksRefused { reason }
+        }
     }
 }
 
@@ -518,7 +755,9 @@ fn approve(state: &StateDir, approved: &AtomicBool, machine: Option<String>) -> 
 fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
     let reason = "not approved yet".to_string();
     match message {
-        ControllerMsg::Approve { .. } | ControllerMsg::Reject { .. } => None,
+        ControllerMsg::Approve { .. }
+        | ControllerMsg::Reject { .. }
+        | ControllerMsg::Resume { .. } => None,
         ControllerMsg::RequestFacterReport => Some(TargetMsg::FacterFailed { error: reason }),
         ControllerMsg::PrepareStore { .. } => Some(TargetMsg::StoreRefused { reason }),
         ControllerMsg::PrepareDisks { .. } => Some(TargetMsg::DisksRefused { reason }),

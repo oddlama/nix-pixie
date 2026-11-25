@@ -26,6 +26,9 @@ pub const DEFAULT_PORT: u16 = 47_011;
 
 /// iroh ALPN for control messages, starting with pairing.
 pub const ALPN_CTRL: &[u8] = b"nix-pixie/ctrl/1";
+/// iroh ALPN of a controller coming back to a session after its
+/// connection broke. Its first frame is [`ctrl::ControllerMsg::Resume`].
+pub const ALPN_RESUME: &[u8] = b"nix-pixie/resume/1";
 /// iroh ALPN of a target's rendezvous endpoint (see [`rendezvous`]).
 pub const ALPN_RENDEZVOUS: &[u8] = b"nix-pixie/rendezvous/1";
 /// iroh ALPN for the byte stream forwarded to the target's store daemon.

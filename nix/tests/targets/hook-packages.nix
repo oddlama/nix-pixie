@@ -53,6 +53,11 @@ in
     "$PIXIE" target exec --chroot -- ${pkgs.coreutils}/bin/mkdir -p /var/lib/pixie
     "$PIXIE" target exec --chroot -- ${pkgs.coreutils}/bin/touch /var/lib/pixie/from-hook
   '';
+  # Runs on the target while the test cuts the network for longer than a
+  # silent connection lasts. Its reply arrives once the session resumed.
+  outage = hook "outage" ''
+    "$PIXIE" target exec -- ${pkgs.coreutils}/bin/sleep 50.5
+  '';
   # Fails the first time, like a hook whose password was mistyped.
   flaky = hook "flaky" ''
     if [ ! -e /tmp/flaky-tried ]; then

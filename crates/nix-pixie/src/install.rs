@@ -12,13 +12,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use iroh::endpoint::{Connection, VarInt};
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::ctrl::{
-    ControllerMsg, DiskAssignment, KeyFile, MAX_TARGET_FRAME, Secret, Shutdown, StreamRequest,
-    TargetMsg,
+    ControllerMsg, DiskAssignment, KeyFile, Secret, Shutdown, StreamRequest, TargetMsg,
 };
-use nix_pixie_proto::frame::{read_frame, write_frame};
 use nix_pixie_proto::inventory::Disk;
 use tracing::{debug, info, trace};
 use zeroize::Zeroizing;
@@ -27,8 +24,9 @@ use crate::controller::{self, Approved, describe_disk, show_disk};
 use crate::discovery::{Method, Peer};
 use crate::hooks::{self, Step};
 use crate::hostkey::{self, PublicKey};
+use crate::link::Link;
 use crate::metadata::{self, HostKeyMode, Machine, Metadata};
-use crate::net::{self, Relays, Route, Stream, sanitise};
+use crate::net::{self, Relays, Route, sanitise};
 use crate::plan::{self, Choice, Resolution};
 use crate::preflight;
 use crate::push;
@@ -122,18 +120,15 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     let (endpoint, mut discovery) = search.start(nameplate).await?;
     let result = tokio::select! {
         r = async {
-            let (conn, mut stream, peer) = controller::pair_with_target(
+            let (conn, stream, peer) = controller::pair_with_target(
                 &endpoint, &mut discovery, &code, nameplate, args.timeout,
             )
             .await?;
             step.done(controller::describe_peer(&conn, &peer));
-            let result = session(
-                &mut stream, &conn, &peer, &metadata, &args, requested, programs,
-            )
-            .await;
+            let link = Link::new(&endpoint, &peer, conn, stream);
+            let result = session(&link, &peer, &metadata, &args, requested, programs).await;
             // Closing is what lets the target shut down.
-            net::finish(&mut stream).await;
-            conn.close(VarInt::from_u32(0), b"done");
+            link.close().await;
             result
         } => r,
         () = crate::shutdown_signal() => Err(anyhow!("interrupted")),
@@ -308,16 +303,10 @@ async fn check_machine(
 async fn hooks_after(
     hooks: &mut hooks::Runner,
     step: Step,
-    stream: &mut Stream,
-    conn: &Connection,
+    link: &Link,
     installed: Option<&str>,
 ) -> Result<()> {
-    let mut target = Target {
-        stream,
-        conn,
-        installed,
-    };
-    hooks.after(step, Some(&mut target)).await
+    hooks.after(step, Some(Target { link, installed })).await
 }
 
 /// Files that hooks after `step` wrote can't go anywhere: the target is gone.
@@ -574,16 +563,15 @@ fn check_push(name: &str, machine: &Machine) -> Result<()> {
 /// Everything after pairing: first deciding and building, which touches
 /// nothing on the target's disks, then applying.
 async fn session(
-    stream: &mut Stream,
-    conn: &Connection,
+    link: &Link,
     peer: &Peer,
     metadata: &Metadata,
     args: &InstallArgs,
     requested: BTreeMap<String, String>,
     programs: Option<BTreeMap<String, PathBuf>>,
 ) -> Result<Installed> {
-    let plan = prepare(stream, conn, peer, metadata, args, requested, programs).await?;
-    apply(stream, conn, peer, args, plan).await
+    let plan = prepare(link, peer, metadata, args, requested, programs).await?;
+    apply(link, peer, args, plan).await
 }
 
 /// Everything decided and built before anything is erased.
@@ -605,8 +593,7 @@ struct Plan {
 
 /// Approval, the facter report and host key, the disk plan, the build.
 async fn prepare(
-    stream: &mut Stream,
-    conn: &Connection,
+    link: &Link,
     peer: &Peer,
     metadata: &Metadata,
     args: &InstallArgs,
@@ -620,8 +607,7 @@ async fn prepare(
         machine: name,
         ..
     } = controller::approve(
-        stream,
-        conn,
+        link,
         peer,
         Some(metadata),
         args.machine.as_deref(),
@@ -634,25 +620,25 @@ async fn prepare(
     ui::steps(step_list(args, Known::machine(machine)));
     check_push(&name, machine)?;
     let target = serde_json::json!({
-        "id": conn.remote_id().to_string(),
+        "id": link.target().to_string(),
         "label": label,
         "inventory": inventory,
     });
     let mut hooks = start_hooks(args, &name, machine, target, programs).await?;
     step.done(name.clone());
-    hooks_after(&mut hooks, Step::Approve, stream, conn, None).await?;
+    hooks_after(&mut hooks, Step::Approve, link, None).await?;
     if let Some(path) = &machine.facter.report_path {
         let step = ui::start("facter");
-        controller::fetch_facter_report(stream, &args.flake, path)
+        controller::fetch_facter_report(link, &args.flake, path)
             .await
             .context("getting the facter report")?;
         step.done(path.clone());
     }
-    hooks_after(&mut hooks, Step::Facter, stream, conn, None).await?;
+    hooks_after(&mut hooks, Step::Facter, link, None).await?;
     // Before building: the configuration (or a rekeying hook) may use it.
-    let pulled = machine_host_key(stream, &args.flake, &name, machine, &mut hooks).await?;
+    let pulled = machine_host_key(link, &args.flake, &name, machine, &mut hooks).await?;
     hooks.context.host_key = pulled.as_ref().map(ToString::to_string);
-    hooks_after(&mut hooks, Step::HostKey, stream, conn, None).await?;
+    hooks_after(&mut hooks, Step::HostKey, link, None).await?;
 
     // A configuration that doesn't evaluate can be fixed meanwhile.
     let Evaluated {
@@ -690,7 +676,7 @@ async fn prepare(
             .join(", "),
     );
     hooks.context.disks = Some(serde_json::to_value(&choices)?);
-    hooks_after(&mut hooks, Step::Disks, stream, conn, None).await?;
+    hooks_after(&mut hooks, Step::Disks, link, None).await?;
 
     // Before the build, so it can run unattended.
     let step = (!needs.is_empty()).then(|| ui::start("keys"));
@@ -701,7 +687,7 @@ async fn prepare(
 
     let built = build(&configuration, &planned_facts(&facts, &choices)).await?;
     hooks.context.system = Some(built.toplevel.clone());
-    hooks_after(&mut hooks, Step::Build, stream, conn, None).await?;
+    hooks_after(&mut hooks, Step::Build, link, None).await?;
     Ok(Plan {
         label,
         name,
@@ -868,13 +854,7 @@ fn host_key_path(
 
 /// From the confirmation to erase on: format, send the system, install,
 /// and leave the target ready to boot.
-async fn apply(
-    stream: &mut Stream,
-    conn: &Connection,
-    peer: &Peer,
-    args: &InstallArgs,
-    plan: Plan,
-) -> Result<Installed> {
+async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Result<Installed> {
     let Plan {
         label,
         name,
@@ -889,32 +869,24 @@ async fn apply(
         mut hooks,
     } = plan;
     confirm_erase(&disks, &choices, args.yes, args.wipe).await?;
-    format_disks(
-        stream,
-        conn,
-        &choices,
-        &disko,
-        &built.disko_script,
-        key_files,
-    )
-    .await?;
+    format_disks(link, &choices, &disko, &built.disko_script, key_files).await?;
     let root = disko.root_mount_point;
     hooks.context.root = Some(root.clone());
-    hooks_after(&mut hooks, Step::Format, stream, conn, None).await?;
-    place_files(stream, &root, &mut hooks).await?;
+    hooks_after(&mut hooks, Step::Format, link, None).await?;
+    place_files(link, &root, &mut hooks).await?;
 
-    let (fstype, copied) = send_system(stream, conn, &root, &built.toplevel).await?;
-    hooks_after(&mut hooks, Step::Copy, stream, conn, None).await?;
-    place_files(stream, &root, &mut hooks).await?;
+    let (fstype, copied) = send_system(link, &root, &built.toplevel).await?;
+    hooks_after(&mut hooks, Step::Copy, link, None).await?;
+    place_files(link, &root, &mut hooks).await?;
     let step = ui::start("install");
     let (expected, key_path) = host_key.unzip();
-    install_system(stream, &root, &built.toplevel, key_path).await?;
+    install_system(link, &root, &built.toplevel, key_path).await?;
     step.done("");
-    hooks_after(&mut hooks, Step::Install, stream, conn, Some(&root)).await?;
-    place_files(stream, &root, &mut hooks).await?;
+    hooks_after(&mut hooks, Step::Install, link, Some(&root)).await?;
+    place_files(link, &root, &mut hooks).await?;
 
     let mut report = report(
-        conn,
+        link,
         label,
         &name,
         configuration,
@@ -941,12 +913,12 @@ async fn apply(
     };
     // Asked while the target still answers.
     let ssh_at = if ssh.enable {
-        Some(ssh_addrs(stream, conn, peer).await?)
+        Some(ssh_addrs(link, peer).await?)
     } else {
         None
     };
     let step = ui::start("finish");
-    let live = finish(stream, &root, &disko.zpools, shutdown).await?;
+    let live = finish(link, &root, &disko.zpools, shutdown).await?;
     step.done(match shutdown {
         Shutdown::Reboot => "rebooting",
         Shutdown::PowerOff => "powering off",
@@ -973,16 +945,15 @@ async fn apply(
 /// Formats the confirmed disks: sends the disko script, has the target
 /// check its disks once more, and runs disko there.
 async fn format_disks(
-    stream: &mut Stream,
-    conn: &Connection,
+    link: &Link,
     choices: &[Choice],
     disko: &Disko,
     script: &str,
     key_files: Vec<KeyFile>,
 ) -> Result<()> {
     let step = ui::start_with("format", "sending the disko script");
-    push::copy(
-        conn,
+    push::send(
+        link,
         &StreamRequest::LiveStore,
         std::slice::from_ref(&script.to_string()),
     )
@@ -990,27 +961,22 @@ async fn format_disks(
     .context("pushing the disko script into the target's live store")?;
     step.detail("checking the disks on the target");
     let labels = plan::created_names(disko).into_iter().collect();
-    prepare_disks(stream, choices, labels).await?;
+    prepare_disks(link, choices, labels).await?;
     step.detail("running disko");
-    run_disko(stream, script, key_files).await?;
+    run_disko(link, script, key_files).await?;
     step.done(format!("mounted at {}", disko.root_mount_point));
     Ok(())
 }
 
 /// Copies the system into the store under `root` on the target. Returns
 /// that store's filesystem type and what was copied.
-async fn send_system(
-    stream: &mut Stream,
-    conn: &Connection,
-    root: &str,
-    toplevel: &str,
-) -> Result<(String, push::Copied)> {
-    let fstype = push::prepare_disk_store(stream, root).await?;
+async fn send_system(link: &Link, root: &str, toplevel: &str) -> Result<(String, push::Copied)> {
+    let fstype = push::prepare_disk_store(link, root).await?;
     let into = format!("into {root}, {fstype}");
     let step = ui::start_with("copy", into.clone());
-    push::warn_if_relayed(conn);
-    let copied = push::copy(
-        conn,
+    push::warn_if_relayed(&link.connection());
+    let copied = push::send(
+        link,
         &StreamRequest::Store { root: root.into() },
         std::slice::from_ref(&toplevel.to_string()),
     )
@@ -1026,7 +992,7 @@ async fn send_system(
 /// The result so far, as printed at the end.
 #[allow(clippy::too_many_arguments, reason = "the result's fields, named")]
 fn report(
-    conn: &Connection,
+    link: &Link,
     label: String,
     name: &str,
     configuration: String,
@@ -1039,7 +1005,7 @@ fn report(
 ) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut report = serde_json::Map::new();
     for (key, value) in [
-        ("target", conn.remote_id().to_string().into()),
+        ("target", link.target().to_string().into()),
         ("label", label.into()),
         ("machine", name.into()),
         ("configuration", configuration.into()),
@@ -1048,7 +1014,7 @@ fn report(
         ("root", root.into()),
         ("fstype", fstype.into()),
         ("pushSeconds", seconds.into()),
-        ("route", net::route(conn).kind().into()),
+        ("route", net::route(&link.connection()).kind().into()),
         ("then", format!("{then:?}").to_ascii_lowercase().into()),
     ] {
         report.insert(key.into(), value);
@@ -1057,7 +1023,7 @@ fn report(
 }
 
 /// Puts the files hooks wrote so far into the installed system.
-async fn place_files(stream: &mut Stream, root: &str, hooks: &mut hooks::Runner) -> Result<()> {
+async fn place_files(link: &Link, root: &str, hooks: &mut hooks::Runner) -> Result<()> {
     let files = hooks.take_files();
     if files.is_empty() {
         return Ok(());
@@ -1066,17 +1032,13 @@ async fn place_files(stream: &mut Stream, root: &str, hooks: &mut hooks::Runner)
         files = files.len(),
         "putting the hooks' files into the installed system"
     );
-    write_frame(
-        stream,
-        &ControllerMsg::PlaceFiles {
-            root: root.into(),
-            files,
-        },
-    )
-    .await?;
-    let reply = tokio::time::timeout(PREPARE_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
-        .await
-        .context("timed out waiting for the target to place the files")??;
+    let request = ControllerMsg::PlaceFiles {
+        root: root.into(),
+        files,
+    };
+    let reply = link
+        .request(&request, PREPARE_TIMEOUT, "the target to place the files")
+        .await?;
     match reply {
         TargetMsg::FilesPlaced => Ok(()),
         TargetMsg::FilesRefused { reason } => {
@@ -1093,7 +1055,7 @@ async fn place_files(stream: &mut Stream, root: &str, hooks: &mut hooks::Runner)
 /// The machine's host key, by its `hostKey.mode`: none, generated on the
 /// target (pull), or from a hook (push).
 async fn machine_host_key(
-    stream: &mut Stream,
+    link: &Link,
     flake: &str,
     name: &str,
     machine: &Machine,
@@ -1102,9 +1064,9 @@ async fn machine_host_key(
     let pushed = hooks.take_host_key();
     Ok(match (machine.host_key.mode, pushed) {
         (HostKeyMode::None, None) => None,
-        (HostKeyMode::Pull, None) => Some(host_key(stream, flake, name, machine, None).await?),
+        (HostKeyMode::Pull, None) => Some(host_key(link, flake, name, machine, None).await?),
         (HostKeyMode::Push, Some(private)) => {
-            Some(host_key(stream, flake, name, machine, Some(private)).await?)
+            Some(host_key(link, flake, name, machine, Some(private)).await?)
         }
         (HostKeyMode::Push, None) => bail!(
             "hostKey.mode = \"push\", but no hook wrote $PIXIE_OUT/host-key before `host-key`"
@@ -1120,7 +1082,7 @@ async fn machine_host_key(
 /// a hook. Records its public half in the repository if the machine says
 /// where.
 async fn host_key(
-    stream: &mut Stream,
+    link: &Link,
     flake: &str,
     name: &str,
     machine: &Machine,
@@ -1134,10 +1096,9 @@ async fn host_key(
         },
         None => ControllerMsg::GenerateHostKey,
     };
-    write_frame(stream, &request).await?;
-    let reply = tokio::time::timeout(PREPARE_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
-        .await
-        .context("timed out waiting for the target's host key")??;
+    let reply = link
+        .request(&request, PREPARE_TIMEOUT, "the target's host key")
+        .await?;
     let key = match reply {
         TargetMsg::HostKey { public } => {
             PublicKey::parse(&public).context("the target's host key")?
@@ -1152,44 +1113,41 @@ async fn host_key(
     if let Some(path) = &machine.host_key.public_key_path {
         let root = repo_root(flake)?;
         let file = metadata::repo_path(&root, path)?;
-        let line = key.to_line(Some(&format!("root@{name}")));
-        metadata::write_into_repo(&root, &file, line.as_bytes()).await?;
+        let entry = key.to_line(Some(&format!("root@{name}")));
+        metadata::write_into_repo(&root, &file, entry.as_bytes()).await?;
         info!(%path, "recorded the host key");
     }
     step.done(key.short());
     Ok(key)
 }
 
-/// Reads `Output` frames until the reply that ends them.
-async fn follow(stream: &mut Stream) -> Result<(TargetMsg, Tail)> {
+/// Sends a request whose reply follows `Output` frames, and keeps the end
+/// of that output.
+async fn follow(link: &Link, request: &ControllerMsg) -> Result<(TargetMsg, Tail)> {
     let mut tail = Tail::default();
-    loop {
-        match read_frame(stream, MAX_TARGET_FRAME).await? {
-            TargetMsg::Output { chunk } => {
+    let reply = link
+        .request_with_output(request, async |frame| {
+            if let TargetMsg::Output { chunk } = frame {
                 trace!(bytes = chunk.len(), "output");
                 tail.push(&chunk);
             }
-            reply => return Ok((reply, tail)),
-        }
-    }
+        })
+        .await?;
+    Ok((reply, tail))
 }
 
 async fn install_system(
-    stream: &mut Stream,
+    link: &Link,
     root: &str,
     system: &str,
     host_key_path: Option<String>,
 ) -> Result<()> {
-    write_frame(
-        stream,
-        &ControllerMsg::Install {
-            root: root.into(),
-            system: system.into(),
-            host_key_path,
-        },
-    )
-    .await?;
-    match follow(stream).await? {
+    let request = ControllerMsg::Install {
+        root: root.into(),
+        system: system.into(),
+        host_key_path,
+    };
+    match follow(link, &request).await? {
         (TargetMsg::InstallDone, _) => Ok(()),
         (TargetMsg::InstallFailed { error }, tail) => {
             ui::note(&[tail.lines(OUTPUT_TAIL_LINES)]);
@@ -1206,21 +1164,17 @@ async fn install_system(
 /// was found. One found only at a relay has no address we know to be its
 /// own: a direct path to it may end at a NAT, and whatever answers SSH at a
 /// NAT's address is another machine. So the target is asked.
-async fn ssh_addrs(
-    stream: &mut Stream,
-    conn: &Connection,
-    peer: &Peer,
-) -> Result<Result<Vec<SocketAddr>, String>> {
+async fn ssh_addrs(link: &Link, peer: &Peer) -> Result<Result<Vec<SocketAddr>, String>> {
     if !peer.addrs.is_empty() {
         return Ok(Ok(peer.addrs.iter().copied().collect()));
     }
-    let Route::Direct(addr) = net::route(conn) else {
+    let Route::Direct(addr) = net::route(&link.connection()) else {
         return Ok(Err(
             "it was only reached through a relay, so there is no address to ask for its host key"
                 .into(),
         ));
     };
-    let own = own_addresses(stream).await?;
+    let own = own_addresses(link).await?;
     Ok(if net::is_own(addr, &own) {
         Ok(vec![addr])
     } else {
@@ -1233,11 +1187,14 @@ async fn ssh_addrs(
 }
 
 /// The addresses of the target's network interfaces.
-async fn own_addresses(stream: &mut Stream) -> Result<Vec<IpAddr>> {
-    write_frame(stream, &ControllerMsg::RequestAddresses).await?;
-    let reply = tokio::time::timeout(ADDRESSES_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
-        .await
-        .context("timed out waiting for the target's addresses")??;
+async fn own_addresses(link: &Link) -> Result<Vec<IpAddr>> {
+    let reply = link
+        .request(
+            &ControllerMsg::RequestAddresses,
+            ADDRESSES_TIMEOUT,
+            "the target's addresses",
+        )
+        .await?;
     match reply {
         TargetMsg::Addresses { addrs } => Ok(addrs),
         _ => bail!("unexpected reply to asking for the target's addresses"),
@@ -1246,23 +1203,19 @@ async fn own_addresses(stream: &mut Stream) -> Result<Vec<IpAddr>> {
 
 /// Unmounts and exports on the target. Returns the installer's own host key.
 async fn finish(
-    stream: &mut Stream,
+    link: &Link,
     root: &str,
     zpools: &[String],
     then: Shutdown,
 ) -> Result<Option<PublicKey>> {
-    write_frame(
-        stream,
-        &ControllerMsg::Finish {
-            root: root.into(),
-            zpools: zpools.to_vec(),
-            then,
-        },
-    )
-    .await?;
-    let reply = tokio::time::timeout(FINISH_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
-        .await
-        .context("timed out waiting for the target to unmount")??;
+    let request = ControllerMsg::Finish {
+        root: root.into(),
+        zpools: zpools.to_vec(),
+        then,
+    };
+    let reply = link
+        .request(&request, FINISH_TIMEOUT, "the target to unmount")
+        .await?;
     match reply {
         TargetMsg::Finished { live_host_key } => {
             Ok(live_host_key.and_then(|key| PublicKey::parse(&key).ok()))
@@ -1418,7 +1371,7 @@ async fn confirm_erase(disks: &[Disk], choices: &[Choice], yes: bool, wipe: bool
     Ok(())
 }
 
-async fn prepare_disks(stream: &mut Stream, choices: &[Choice], labels: Vec<String>) -> Result<()> {
+async fn prepare_disks(link: &Link, choices: &[Choice], labels: Vec<String>) -> Result<()> {
     let disks = choices
         .iter()
         .map(|c| DiskAssignment {
@@ -1427,10 +1380,10 @@ async fn prepare_disks(stream: &mut Stream, choices: &[Choice], labels: Vec<Stri
             link: c.link,
         })
         .collect();
-    write_frame(stream, &ControllerMsg::PrepareDisks { disks, labels }).await?;
-    let reply = tokio::time::timeout(PREPARE_TIMEOUT, read_frame(stream, MAX_TARGET_FRAME))
-        .await
-        .context("timed out waiting for the target to check its disks")??;
+    let request = ControllerMsg::PrepareDisks { disks, labels };
+    let reply = link
+        .request(&request, PREPARE_TIMEOUT, "the target to check its disks")
+        .await?;
     match reply {
         TargetMsg::DisksReady => Ok(()),
         TargetMsg::DisksRefused { reason } => {
@@ -1441,16 +1394,12 @@ async fn prepare_disks(stream: &mut Stream, choices: &[Choice], labels: Vec<Stri
 }
 
 /// Runs disko on the target. Its output is kept, and shown if it fails.
-async fn run_disko(stream: &mut Stream, script: &str, key_files: Vec<KeyFile>) -> Result<()> {
-    write_frame(
-        stream,
-        &ControllerMsg::RunDisko {
-            script: script.into(),
-            key_files,
-        },
-    )
-    .await?;
-    match follow(stream).await? {
+async fn run_disko(link: &Link, script: &str, key_files: Vec<KeyFile>) -> Result<()> {
+    let request = ControllerMsg::RunDisko {
+        script: script.into(),
+        key_files,
+    };
+    match follow(link, &request).await? {
         (TargetMsg::DiskoDone, _) => Ok(()),
         (TargetMsg::DiskoFailed { error }, tail) => {
             ui::note(&[tail.lines(OUTPUT_TAIL_LINES)]);

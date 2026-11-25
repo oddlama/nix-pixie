@@ -33,6 +33,24 @@
 //! After `Finished`, the target reboots or powers off as soon as the
 //! controller closes the connection.
 //!
+//! Every request but `Approve` and `Reject` gets exactly one final reply
+//! (after any `Output` or `ExecOutput` frames), one at a time, and both
+//! sides count the replies. If the connection breaks after `Approve`, the
+//! target finishes what it was doing, keeps its last reply, and waits for
+//! the same controller to come back on a new connection (ALPN
+//! [`crate::ALPN_RESUME`]):
+//!
+//! ```text
+//! target                         controller
+//!                           <-   Resume { answered: n }
+//! Resumed { answered: m }   ->
+//! (its last reply, if m = n + 1)
+//! ```
+//!
+//! With `m = n` the target never got the request the controller waits for
+//! (if any), so the controller sends it again. A request is never carried
+//! out twice.
+//!
 //! The controller may open more bi-streams after `Approve`, one per Nix
 //! daemon connection, each starting with a [`StreamRequest`] frame. The
 //! target runs `nix daemon --stdio` for it: serving the live system's store
@@ -120,6 +138,10 @@ pub enum TargetMsg {
     ExecExited { code: Option<i32> },
     /// Why the program could not run.
     ExecFailed { error: String },
+    /// The session goes on after `Resume`: how many requests the target
+    /// has answered. If that is one more than the controller has replies
+    /// for, the last reply follows.
+    Resumed { answered: u64 },
 }
 
 /// Messages the controller sends to the target.
@@ -195,6 +217,9 @@ pub enum ControllerMsg {
         args: Vec<String>,
         root: Option<String>,
     },
+    /// First frame after the controller came back (ALPN
+    /// [`crate::ALPN_RESUME`]): how many replies it has got.
+    Resume { answered: u64 },
 }
 
 /// Secret bytes: wiped from memory when dropped, never shown by `Debug`.

@@ -54,6 +54,7 @@ pkgs.testers.runNixOSTest {
     { nodes, ... }:
     ''
       import json
+      import time
 
       def code():
           target.wait_for_file("/run/nix-pixie/code")
@@ -110,6 +111,53 @@ pkgs.testers.runNixOSTest {
           assert restarts == "0", f"the agent was restarted {restarts} times (out of memory?)"
           peak = int(target.succeed("systemctl show -P MemoryPeak nix-pixie-agent").strip())
           print(f"agent memory peak: {peak / 2**20:.0f} MiB (limit 192 MiB, pushed 512+ MiB)")
+          next_code(current)
+
+      def push_in_background(unit, current, root):
+          # Throttled, so the push takes long enough to get in its way.
+          controller.succeed("tc qdisc add dev eth1 root tbf rate 100mbit burst 64kb latency 500ms")
+          controller.succeed(
+              f"systemd-run --unit={unit} --uid=alice -E HOME=/home/alice -E PATH=/run/current-system/sw/bin"
+              + f" -p StandardOutput=file:/tmp/{unit}.json -p StandardError=file:/tmp/{unit}.log"
+              + f" nix-pixie controller pair --code {current} --yes --push ${blob} --store-root {root}"
+          )
+          controller.wait_until_succeeds(f"grep -q pushing /tmp/{unit}.log", timeout=120)
+          time.sleep(5)
+
+      def finished(unit):
+          controller.wait_until_succeeds(f"systemctl show -P SubState {unit} | grep -qx -e exited -e failed -e dead", timeout=600)
+          controller.succeed("tc qdisc del dev eth1 root")
+          return controller.succeed(f"systemctl show -P Result {unit}").strip()
+
+      with subtest("an interrupted controller lets the target pair again at once"):
+          target.succeed("rm -rf /mnt/nix")
+          current = code()
+          push_in_background("interrupted", current, "/mnt")
+          controller.succeed("systemctl kill -s INT interrupted")
+          assert finished("interrupted") != "success"
+          # Closed on purpose, not lost: the target doesn't wait for it.
+          target.wait_until_succeeds(f"test -s /run/nix-pixie/code && test \"$(cat /run/nix-pixie/code)\" != {current}", timeout=30)
+          target.fail("journalctl -u nix-pixie-agent | grep -q 'waiting for it to come back'")
+
+      with subtest("a push outlives the network going away for longer than a connection does"):
+          target.succeed("rm -rf /mnt/nix")
+          current = code()
+          push_in_background("outage", current, "/mnt")
+          # Nothing gets through either way for longer than a silent
+          # connection lasts (30 s).
+          for machine in [controller, target]:
+              machine.succeed("tc qdisc replace dev eth1 root netem loss 100%")
+          time.sleep(35)
+          target.succeed("tc qdisc del dev eth1 root")
+          controller.succeed("tc qdisc replace dev eth1 root tbf rate 100mbit burst 64kb latency 500ms")
+          result = finished("outage")
+          output = controller.succeed("cat /tmp/outage.log")
+          print(output)
+          assert result == "success", result
+          assert "reconnected; the session goes on" in output, output
+          assert "trying again on the new connection" in output, output
+          target.succeed("journalctl -u nix-pixie-agent | grep -q 'the controller is back'")
+          target.succeed("nix-store --store /mnt --check-validity ${blob}")
           next_code(current)
 
       with subtest("a whole NixOS system: many small paths"):

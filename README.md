@@ -220,6 +220,13 @@ between are:
   and Nix prints its own output, which is what you want in a log file or CI.
   `NO_COLOR` turns off colours, and `RUST_LOG=nix_pixie=debug` shows more of
   what happens.
+- **Interruptions:** if the network goes away in the middle, say a cable comes
+  loose or the laptop goes to sleep, both sides notice within 30 seconds. The
+  controller then keeps trying to reach the target for 10 minutes, and the
+  target waits as long. Once they are back in touch, the install goes on where
+  it was: whatever the target was doing has finished meanwhile, and a copy that
+  was cut off starts over, skipping what already arrived. If you stop the
+  controller with Ctrl-C, the target shows a new code right away.
 - **Just looking:** `nix-pixie controller pair --code …` only pairs and prints
   the inventory, which is handy to see what a machine has before you write its
   configuration.
@@ -259,8 +266,9 @@ or none at all:
 <summary>A direct cable and NetworkManager</summary>
 
 NetworkManager's default profile waits for DHCP on a cable, gives up after 45
-seconds and takes the link-local address away for a moment, again and again,
-which breaks a running install. Our installer prevents this by itself: on a
+seconds and takes the link-local address away for a moment, again and again.
+Each time, a running install can lose its connection and has to wait for it to
+come back. Our installer prevents this by itself: on a
 cable where nobody hands out addresses or advertises a router, it sends router
 advertisements (as no router, and without any prefix), and that is all
 NetworkManager needs to keep the link up.
@@ -600,7 +608,7 @@ There is still a lot I am going to add.
 - PXE boot, so the target doesn't even need a USB stick
 - kexec into the installer from any running Linux
 - Secure Boot, including enrolling lanzaboote keys during the install
-- Resuming an interrupted install
+- Resuming an install after the controller itself was stopped
 - Installing a batch of machines in one go, with a single code that the controller shows
 
 ## ❤️ Contributing

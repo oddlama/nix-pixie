@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::Connection;
-use nix_pixie_proto::ctrl::{ControllerMsg, MAX_TARGET_FRAME, StreamRequest, TargetMsg};
-use nix_pixie_proto::frame::{read_frame, write_frame};
+use nix_pixie_proto::ctrl::{ControllerMsg, StreamRequest, TargetMsg};
+use nix_pixie_proto::frame::write_frame;
 use tokio::net::UnixListener;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::net::{self, Route, Stream, sanitise};
+use crate::link::Link;
+use crate::net::{self, Route, sanitise};
 use crate::state::private_dir;
 use crate::{nix, nixlog};
 
@@ -57,17 +58,12 @@ pub async fn check_local_paths(paths: &[String]) -> Result<()> {
 }
 
 /// Copies `paths` (with their closures) into the store under `root` on the
-/// target. `ctrl` is the session's control stream.
-pub async fn push(
-    conn: &Connection,
-    ctrl: &mut Stream,
-    root: &str,
-    paths: &[String],
-) -> Result<PushReport> {
-    let fstype = prepare_disk_store(ctrl, root).await?;
-    warn_if_relayed(conn);
+/// target.
+pub async fn push(link: &Link, root: &str, paths: &[String]) -> Result<PushReport> {
+    let fstype = prepare_disk_store(link, root).await?;
+    warn_if_relayed(&link.connection());
     let request = StreamRequest::Store { root: root.into() };
-    let copied = copy(conn, &request, paths).await?;
+    let copied = send(link, &request, paths).await?;
     Ok(PushReport { fstype, copied })
 }
 
@@ -82,11 +78,15 @@ pub fn warn_if_relayed(conn: &Connection) {
 
 /// Asks the target to check that the store under `root` is on a disk.
 /// Returns that disk's filesystem type.
-pub async fn prepare_disk_store(ctrl: &mut Stream, root: &str) -> Result<String> {
-    write_frame(ctrl, &ControllerMsg::PrepareStore { root: root.into() }).await?;
-    let reply = tokio::time::timeout(Duration::from_secs(30), read_frame(ctrl, MAX_TARGET_FRAME))
-        .await
-        .context("timed out waiting for the target to prepare its store")??;
+pub async fn prepare_disk_store(link: &Link, root: &str) -> Result<String> {
+    let request = ControllerMsg::PrepareStore { root: root.into() };
+    let reply = link
+        .request(
+            &request,
+            Duration::from_secs(30),
+            "the target to prepare its store",
+        )
+        .await?;
     match reply {
         TargetMsg::StoreReady { fstype } => Ok(sanitise(&fstype, 32)),
         TargetMsg::StoreRefused { reason } => {
@@ -99,9 +99,17 @@ pub async fn prepare_disk_store(ctrl: &mut Stream, root: &str) -> Result<String>
     }
 }
 
-/// Runs `nix copy` for `paths` into the target store `request` names, with
-/// its progress on the running step.
-pub async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) -> Result<Copied> {
+/// Copies `paths` into the target store `request` names, with the progress
+/// on the running step. If the connection is lost meanwhile, the copy
+/// starts over once it is back, skipping what arrived.
+pub async fn send(link: &Link, request: &StreamRequest, paths: &[String]) -> Result<Copied> {
+    link.on_connection(async |conn| copy(conn, request, paths).await)
+        .await
+}
+
+/// Runs `nix copy` for `paths` into the target store `request` names, over
+/// `conn`.
+async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) -> Result<Copied> {
     // Private: the target's daemon runs as root and trusts whoever connects.
     let dir = private_dir()?;
     let socket = dir.join("store.sock");

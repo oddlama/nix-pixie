@@ -37,7 +37,7 @@ pub async fn run(
     forward(stream, stdout, stderr, |_, chunk| TargetMsg::Output {
         chunk,
     })
-    .await?;
+    .await;
     let status = child
         .wait()
         .await
@@ -74,7 +74,7 @@ pub async fn exec(mut command: Command, stream: &mut Stream) -> Result<TargetMsg
     forward(stream, stdout, stderr, |stderr, chunk| {
         TargetMsg::ExecOutput { stderr, chunk }
     })
-    .await?;
+    .await;
     let status = child.wait().await.context("waiting for a hook's program")?;
     info!(%status, "hook's program finished");
     Ok(TargetMsg::ExecExited {
@@ -83,13 +83,16 @@ pub async fn exec(mut command: Command, stream: &mut Stream) -> Result<TargetMsg
 }
 
 /// Sends both pipes' data as frames until both are closed. `frame` makes
-/// one from a chunk and whether it is from stderr.
+/// one from a chunk and whether it is from stderr. If the connection
+/// breaks, the program goes on and its output is dropped: the controller
+/// comes back for the result, which nobody should have to redo.
 async fn forward(
     stream: &mut Stream,
     mut stdout: impl AsyncRead + Unpin,
     mut stderr: impl AsyncRead + Unpin,
     frame: impl Fn(bool, Vec<u8>) -> TargetMsg,
-) -> Result<()> {
+) {
+    let mut connected = true;
     let mut out_buf = vec![0; 16 * 1024];
     let mut err_buf = vec![0; 16 * 1024];
     let (mut out_open, mut err_open) = (true, true);
@@ -99,7 +102,7 @@ async fn forward(
         let (n, from_stdout) = tokio::select! {
             r = stdout.read(&mut out_buf), if out_open => (r.unwrap_or(0), true),
             r = stderr.read(&mut err_buf), if err_open => (r.unwrap_or(0), false),
-            else => return Ok(()),
+            else => return,
         };
         if n == 0 {
             if from_stdout {
@@ -112,6 +115,12 @@ async fn forward(
         trace!(bytes = n, "output");
         let buf = if from_stdout { &out_buf } else { &err_buf };
         let chunk = buf.get(..n).unwrap_or_default().to_vec();
-        write_frame(stream, &frame(!from_stdout, chunk)).await?;
+        if connected
+            && write_frame(stream, &frame(!from_stdout, chunk))
+                .await
+                .is_err()
+        {
+            connected = false;
+        }
     }
 }

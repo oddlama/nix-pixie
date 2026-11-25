@@ -22,6 +22,7 @@ pub mod hostkey;
 pub mod identity;
 pub mod install;
 pub mod inventory;
+pub mod link;
 pub mod mdns;
 pub mod metadata;
 pub mod net;

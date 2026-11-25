@@ -17,9 +17,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use iroh::endpoint::{BindOpts, Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, TransportAddr};
-use nix_pixie_proto::ALPN_CTRL;
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::pair::{PairError, PairFailure, PairParams, Role, Side, pair};
+use nix_pixie_proto::{ALPN_CTRL, ALPN_RESUME};
 use tokio::io::Join;
 
 use crate::discovery::Peer;
@@ -104,7 +104,7 @@ impl std::fmt::Display for Relays {
 pub async fn bind(secret: SecretKey, port: u16, relays: &Relays) -> Result<Endpoint> {
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
-        .alpns(vec![ALPN_CTRL.to_vec()])
+        .alpns(vec![ALPN_CTRL.to_vec(), ALPN_RESUME.to_vec()])
         .relay_mode(relays.mode())
         .dns_resolver(dns::resolver())
         .clear_ip_transports()

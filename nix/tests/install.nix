@@ -103,6 +103,20 @@ let
     wait_for_output(${builtins.toJSON spec.retry})
         controller.succeed("echo 1<>/tmp/enter")
   '';
+  # Python, at the indentation of a subtest's body: while `spec.outage` runs
+  # on the target, nothing gets through either way for longer than a silent
+  # connection lasts (30 s). It comes back while the command still runs.
+  cutNetwork = lib.optionalString (spec ? outage) ''
+    target.wait_until_succeeds(${builtins.toJSON "pgrep -f '${spec.outage}'"}, timeout=600)
+        for machine in [controller, target]:
+            machine.succeed("tc qdisc add dev eth1 root netem loss 100%")
+        time.sleep(35)
+        for machine in [controller, target]:
+            machine.succeed("tc qdisc del dev eth1 root")
+        wait_for_output("reconnected; the session goes on")
+        # The target kept the reply the controller missed, and sent it again.
+        target.wait_until_succeeds("journalctl -u nix-pixie-agent | grep -q 'the controller is back'", timeout=60)
+  '';
   # A live console redraws itself: its end, without colours, is enough.
   printOutput = if live then "print(console_end(output))" else "print(output)";
   # Python, at the indentation of a subtest's body.
@@ -168,6 +182,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     import json
     import re
+    import time
 
     def without_escapes(output):
         return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output)
@@ -210,6 +225,7 @@ pkgs.testers.runNixOSTest {
             assert result == "success", f"the install failed ({result}):\n{install_output()}"
 
         ${retryAnswer}
+        ${cutNetwork}
         # The step with where it goes: on a live console, the list shows the
         # step from the start.
         wait_for_output("Send the system.*into /")

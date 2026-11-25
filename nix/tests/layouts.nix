@@ -14,6 +14,8 @@
 # - live: the controller runs on a terminal (with TERM set), so its console
 #   is live, and the first boot is checked once the test presses Enter.
 # - retry: on a live console, a question to answer with Enter when it shows.
+# - outage: a command line on the target (a pgrep pattern) during which the
+#   network goes away for longer than a silent connection lasts.
 # - checks: Python run against the booted `installed` machine.
 {
   ext4 = {
@@ -127,12 +129,14 @@
     disks = [ "main" ];
     live = true;
     retry = "Run hook flaky again";
+    outage = "slee[p] 50.5";
     packages = "hook-packages.nix";
     hooks = ''
       {
         stamp = { command = "stamp"; after = [ "host-key" ]; before = [ "build" ]; };
         flaky = { command = "flaky"; after = [ "approve" ]; };
         on-target = { command = "on-target"; after = [ "format" ]; };
+        outage = { command = "outage"; after = [ "format" ]; };
         in-system = { command = "in-system"; after = [ "install" ]; };
         secret = { command = "secret"; after = [ "disks" ]; };
         booted = { command = "booted"; after = [ "boot" ]; };
@@ -162,11 +166,14 @@
           "stamp": ("host-key", True),
           "secret": ("disks", True),
           "on-target": ("format", True),
+          "outage": ("format", True),
           "in-system": ("install", True),
           "booted": ("boot", True),
       }, ran
       # Written by a program the hook ran inside the installed system.
       installed.succeed("test -e /var/lib/pixie/from-hook")
+      # The session outlived its connection (see `outage`).
+      assert "reconnected; the session goes on" in output, output
       # It failed once, and ran again after the question.
       assert "flaky: failing on purpose" in output, output
       # The live console left the steps as the last word, all done.

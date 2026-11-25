@@ -10,8 +10,7 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
-use iroh::endpoint::Connection;
-use nix_pixie_proto::ctrl::{ControllerMsg, MAX_TARGET_FRAME, StreamRequest, TargetMsg};
+use nix_pixie_proto::ctrl::{ControllerMsg, StreamRequest, TargetMsg};
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -19,7 +18,8 @@ use tokio::net::UnixStream;
 use tracing::{debug, info};
 
 use crate::exec;
-use crate::net::{Stream, sanitise};
+use crate::link::Link;
+use crate::net::sanitise;
 use crate::push;
 
 /// Where a hook finds the controller's socket.
@@ -55,9 +55,9 @@ pub enum Event {
 }
 
 /// The paired target, for hooks' programs while there is one.
+#[derive(Clone, Copy)]
 pub struct Target<'a> {
-    pub stream: &'a mut Stream,
-    pub conn: &'a Connection,
+    pub link: &'a Link,
     /// Where the installed system is mounted, once it is installed: for
     /// `--chroot`.
     pub installed: Option<&'a str>,
@@ -115,7 +115,7 @@ pub async fn exec(program: String, args: Vec<String>, chroot: bool) -> Result<Ex
 /// the program runs there, its output and exit code come back. A request
 /// that can't be served is answered with why; errors are only returned if
 /// the session with the target broke.
-pub async fn serve(mut hook: UnixStream, target: &mut Target<'_>) -> Result<()> {
+pub async fn serve(mut hook: UnixStream, target: Target<'_>) -> Result<()> {
     let request: Request = match read_frame(&mut hook, MAX_FRAME).await {
         Ok(request) => request,
         Err(e) => {
@@ -137,7 +137,7 @@ pub async fn serve(mut hook: UnixStream, target: &mut Target<'_>) -> Result<()> 
             .await;
         }
     };
-    if let Err(error) = push_program(target.conn, &request.program, root.as_deref()).await {
+    if let Err(error) = push_program(target.link, &request.program, root.as_deref()).await {
         let error = format!("{error:#}");
         return answer(&mut hook, Event::Failed { error }).await;
     }
@@ -147,38 +147,41 @@ pub async fn serve(mut hook: UnixStream, target: &mut Target<'_>) -> Result<()> 
         args: request.args,
         root,
     };
-    write_frame(target.stream, &message).await?;
     // Read to the end even if the hook is gone, to keep the session in step.
     let mut listening = true;
-    loop {
-        let event = match read_frame(target.stream, MAX_TARGET_FRAME).await? {
-            TargetMsg::ExecOutput { stderr, chunk } => Event::Output { stderr, chunk },
-            TargetMsg::ExecExited { code } => Event::Exited { code },
-            TargetMsg::ExecFailed { error } => Event::Failed {
-                error: sanitise(&error, 600),
-            },
-            _ => bail!("unexpected message while a hook's program ran"),
-        };
-        let done = !matches!(event, Event::Output { .. });
-        if listening && write_frame(&mut hook, &event).await.is_err() {
-            listening = false;
-        }
-        if done {
-            return Ok(());
-        }
-    }
+    let reply = target
+        .link
+        .request_with_output(&message, async |frame| {
+            if let TargetMsg::ExecOutput { stderr, chunk } = frame
+                && listening
+                && write_frame(&mut hook, &Event::Output { stderr, chunk })
+                    .await
+                    .is_err()
+            {
+                listening = false;
+            }
+        })
+        .await?;
+    let event = match reply {
+        TargetMsg::ExecExited { code } => Event::Exited { code },
+        TargetMsg::ExecFailed { error } => Event::Failed {
+            error: sanitise(&error, 600),
+        },
+        _ => bail!("unexpected reply to running a hook's program"),
+    };
+    answer(&mut hook, event).await
 }
 
 /// Copies the store path `program` is in, with its closure, to where the
 /// target runs it: its live store, or the store under `root`.
-async fn push_program(conn: &Connection, program: &str, root: Option<&str>) -> Result<()> {
+async fn push_program(link: &Link, program: &str, root: Option<&str>) -> Result<()> {
     let path = exec::store_path(program).map_err(|e| anyhow!(e))?;
     push::check_local_paths(&[path.to_string()]).await?;
     let request = match root {
         None => StreamRequest::LiveStore,
         Some(root) => StreamRequest::Store { root: root.into() },
     };
-    push::copy(conn, &request, &[path.to_string()])
+    push::send(link, &request, &[path.to_string()])
         .await
         .with_context(|| format!("copying {path} to the target"))?;
     Ok(())

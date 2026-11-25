@@ -13,8 +13,8 @@ use iroh::endpoint::{Connection, VarInt};
 use iroh::{Endpoint, EndpointId, TransportAddr};
 use nix_pixie_proto::announce::Pairing;
 use nix_pixie_proto::code::{Code, NameplateSpace};
-use nix_pixie_proto::ctrl::{ControllerMsg, MAX_FACTER_FRAME, MAX_TARGET_FRAME, TargetMsg};
-use nix_pixie_proto::frame::{read_frame, write_frame};
+use nix_pixie_proto::ctrl::{ControllerMsg, MAX_TARGET_FRAME, TargetMsg};
+use nix_pixie_proto::frame::read_frame;
 use nix_pixie_proto::inventory::{Disk, Inventory};
 use nix_pixie_proto::pair::{PairError, Side};
 use tracing::{info, warn};
@@ -22,6 +22,7 @@ use tracing::{info, warn};
 use crate::agent::MAX_FAILURES;
 use crate::discovery::{self, Discovery, Method, Peer};
 use crate::identity;
+use crate::link::Link;
 use crate::metadata::{self, Metadata, Suggestion};
 use crate::net::{self, DialError, Relays, Route, Stream, sanitise};
 use crate::push;
@@ -98,12 +99,12 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     let (endpoint, mut discovery) = search.start(nameplate).await?;
     let result = tokio::select! {
         r = async {
-            let (conn, mut stream, peer) =
+            let (conn, stream, peer) =
                 pair_with_target(&endpoint, &mut discovery, &code, nameplate, args.timeout).await?;
             step.done(describe_peer(&conn, &peer));
-            let result = review(&mut stream, &conn, &peer, flake.as_ref(), &args).await;
-            net::finish(&mut stream).await;
-            conn.close(VarInt::from_u32(0), b"done");
+            let link = Link::new(&endpoint, &peer, conn, stream);
+            let result = review(&link, &peer, flake.as_ref(), &args).await;
+            link.close().await;
             result
         } => r,
         () = crate::shutdown_signal() => Err(anyhow!("interrupted")),
@@ -225,7 +226,7 @@ pub async fn pair_with_target(
 
 /// Reads the target's hello and inventory, the first two messages after
 /// pairing.
-async fn introduction(stream: &mut Stream) -> Result<(String, Inventory)> {
+pub(crate) async fn introduction(stream: &mut Stream) -> Result<(String, Inventory)> {
     let read = async {
         let TargetMsg::Hello { label } = read_frame(stream, MAX_TARGET_FRAME).await? else {
             bail!("the target did not start with a hello");
@@ -255,15 +256,14 @@ pub struct Approved {
 /// `chosen`, or the only one whose hints match. With `need_machine`, a
 /// target without one is rejected.
 pub async fn approve(
-    stream: &mut Stream,
-    conn: &Connection,
+    link: &Link,
     peer: &Peer,
     metadata: Option<&Metadata>,
     chosen: Option<&str>,
     yes: bool,
     need_machine: bool,
 ) -> Result<Approved> {
-    let (label, inventory) = introduction(stream).await?;
+    let (label, inventory) = link.introduction().await?;
     let suggestions = metadata.map_or_else(Vec::new, |m| m.suggest(&inventory));
     let machine = chosen
         .map(str::to_string)
@@ -272,7 +272,7 @@ pub async fn approve(
             _ => None,
         });
     ui::show(summary(
-        conn,
+        &link.connection(),
         &label,
         peer,
         &inventory,
@@ -281,7 +281,7 @@ pub async fn approve(
     ));
     if need_machine && machine.is_none() {
         ui::commit();
-        reject(stream, "no machine chosen on the controller").await?;
+        reject(link, "no machine chosen on the controller").await?;
         let known: Vec<&str> = metadata.map_or_else(Vec::new, |m| {
             m.machines.keys().map(String::as_str).collect()
         });
@@ -293,17 +293,14 @@ pub async fn approve(
     if yes {
         ui::commit();
     } else if !ui::confirm("Approve this machine? [y/N] ").await {
-        reject(stream, "rejected by the operator").await?;
+        reject(link, "rejected by the operator").await?;
         bail!("rejected");
     }
-    write_frame(
-        stream,
-        &ControllerMsg::Approve {
-            machine: machine.clone(),
-        },
-    )
+    link.tell(&ControllerMsg::Approve {
+        machine: machine.clone(),
+    })
     .await?;
-    info!(target = %conn.remote_id(), ?machine, "approved");
+    info!(target = %link.target(), ?machine, "approved");
     Ok(Approved {
         label,
         inventory,
@@ -313,30 +310,24 @@ pub async fn approve(
 }
 
 /// Tells the target it was rejected; it goes back to pairing.
-async fn reject(stream: &mut Stream, reason: &str) -> Result<()> {
-    write_frame(
-        stream,
-        &ControllerMsg::Reject {
-            reason: reason.into(),
-        },
-    )
-    .await?;
-    Ok(())
+async fn reject(link: &Link, reason: &str) -> Result<()> {
+    link.tell(&ControllerMsg::Reject {
+        reason: reason.into(),
+    })
+    .await
 }
 
 /// After pairing: approval, the facter report if the chosen machine wants
 /// one, the optional push, and the result as JSON.
 async fn review(
-    stream: &mut Stream,
-    conn: &Connection,
+    link: &Link,
     peer: &Peer,
     flake: Option<&(&str, Metadata)>,
     args: &PairArgs,
 ) -> Result<()> {
     let step = ui::start("approve");
     let approved = approve(
-        stream,
-        conn,
+        link,
         peer,
         flake.map(|(_, m)| m),
         args.machine.as_deref(),
@@ -362,7 +353,7 @@ async fn review(
     let facter = match report_path {
         Some((flake, path)) => {
             let step = ui::start("facter");
-            let result = fetch_facter_report(stream, flake, &path).await;
+            let result = fetch_facter_report(link, flake, &path).await;
             match &result {
                 Ok(path) => step.done(path.clone()),
                 Err(e) => step.skip(format!("{e:#}")),
@@ -375,16 +366,16 @@ async fn review(
         None
     } else {
         let step = ui::start_with("push", format!("into {}", args.store_root));
-        let pushed = push::push(conn, stream, &args.store_root, &args.push).await?;
+        let pushed = push::push(link, &args.store_root, &args.push).await?;
         step.done(pushed.copied.what.clone());
         Some(pushed)
     };
 
     let report = serde_json::json!({
-        "target": conn.remote_id().to_string(),
+        "target": link.target().to_string(),
         "label": label,
         "addrs": peer.addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "route": net::route(conn).kind(),
+        "route": net::route(&link.connection()).kind(),
         "inventory": inventory,
         "suggestions": suggestions.iter().map(|s| serde_json::json!({
             "machine": s.machine, "reasons": s.reasons,
@@ -409,19 +400,18 @@ async fn review(
 
 /// Asks the target for a facter report and writes it into the flake's
 /// repository. Returns the path, relative to the flake.
-pub async fn fetch_facter_report(
-    stream: &mut Stream,
-    flake: &str,
-    report_path: &str,
-) -> Result<String> {
+pub async fn fetch_facter_report(link: &Link, flake: &str, report_path: &str) -> Result<String> {
     let root = metadata::local_flake_dir(flake).with_context(|| {
         format!("{flake} is not a local checkout, so the report can't be written")
     })?;
     let path = metadata::repo_path(&root, report_path)?;
-    write_frame(stream, &ControllerMsg::RequestFacterReport).await?;
-    let reply = tokio::time::timeout(FACTER_TIMEOUT, read_frame(stream, MAX_FACTER_FRAME))
-        .await
-        .context("timed out waiting for the facter report")??;
+    let reply = link
+        .request(
+            &ControllerMsg::RequestFacterReport,
+            FACTER_TIMEOUT,
+            "the facter report",
+        )
+        .await?;
     let json = match reply {
         TargetMsg::FacterReport { json } => json,
         TargetMsg::FacterFailed { error } => {
