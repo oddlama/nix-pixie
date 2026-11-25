@@ -182,7 +182,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     import json
     import re
-    import time
+    ${lib.optionalString (spec ? outage) "import time"}
 
     def without_escapes(output):
         return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output)
