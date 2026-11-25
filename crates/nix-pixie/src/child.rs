@@ -1,5 +1,6 @@
 //! Running a program on the target with its output going to the controller
-//! as `Output` frames while it runs: disko and `nixos-install`.
+//! while it runs: disko and `nixos-install` as `Output` frames, programs of
+//! hooks as `ExecOutput` frames.
 
 use std::process::Stdio;
 
@@ -33,7 +34,10 @@ pub async fn run(
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Ok(Err(format!("{what}'s output is not connected")));
     };
-    forward(stream, stdout, stderr).await?;
+    forward(stream, stdout, stderr, |_, chunk| TargetMsg::Output {
+        chunk,
+    })
+    .await?;
     let status = child
         .wait()
         .await
@@ -46,11 +50,45 @@ pub async fn run(
     })
 }
 
-/// Sends both pipes' data as `Output` frames until both are closed.
+/// Runs a hook's program (see [`crate::exec`]), its stdout and stderr
+/// going as `ExecOutput` frames. Returns the frame that ends it.
+pub async fn exec(mut command: Command, stream: &mut Stream) -> Result<TargetMsg> {
+    let mut child = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return Ok(TargetMsg::ExecFailed {
+                error: format!("starting it: {e}"),
+            });
+        }
+    };
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Ok(TargetMsg::ExecFailed {
+            error: "its output is not connected".into(),
+        });
+    };
+    forward(stream, stdout, stderr, |stderr, chunk| {
+        TargetMsg::ExecOutput { stderr, chunk }
+    })
+    .await?;
+    let status = child.wait().await.context("waiting for a hook's program")?;
+    info!(%status, "hook's program finished");
+    Ok(TargetMsg::ExecExited {
+        code: status.code(),
+    })
+}
+
+/// Sends both pipes' data as frames until both are closed. `frame` makes
+/// one from a chunk and whether it is from stderr.
 async fn forward(
     stream: &mut Stream,
     mut stdout: impl AsyncRead + Unpin,
     mut stderr: impl AsyncRead + Unpin,
+    frame: impl Fn(bool, Vec<u8>) -> TargetMsg,
 ) -> Result<()> {
     let mut out_buf = vec![0; 16 * 1024];
     let mut err_buf = vec![0; 16 * 1024];
@@ -74,6 +112,6 @@ async fn forward(
         trace!(bytes = n, "output");
         let buf = if from_stdout { &out_buf } else { &err_buf };
         let chunk = buf.get(..n).unwrap_or_default().to_vec();
-        write_frame(stream, &TargetMsg::Output { chunk }).await?;
+        write_frame(stream, &frame(!from_stdout, chunk)).await?;
     }
 }

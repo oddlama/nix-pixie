@@ -23,6 +23,9 @@
 //! FilesPlaced | FilesRefused ->
 //!                           <-   RequestAddresses           (if found at a relay)
 //! Addresses                 ->
+//!                           <-   Exec { program, args, root } (for hooks)
+//! ExecOutput*               ->
+//! ExecExited | ExecFailed   ->
 //!                           <-   Finish { root, zpools, then }
 //! Finished | FinishFailed   ->
 //! ```
@@ -109,6 +112,14 @@ pub enum TargetMsg {
     FilesRefused { reason: String },
     /// The addresses of the target's own network interfaces, as requested.
     Addresses { addrs: Vec<IpAddr> },
+    /// Output of the program `Exec` runs, as it comes: from its stderr, or
+    /// else its stdout.
+    ExecOutput { stderr: bool, chunk: Vec<u8> },
+    /// The program `Exec` ran is done: its exit code, `None` if a signal
+    /// ended it.
+    ExecExited { code: Option<i32> },
+    /// Why the program could not run.
+    ExecFailed { error: String },
 }
 
 /// Messages the controller sends to the target.
@@ -174,6 +185,16 @@ pub enum ControllerMsg {
     /// address its connection goes to: that is the target itself, or a NAT
     /// in front of it. Only after `Approve`.
     RequestAddresses,
+    /// Run `program`, a file in the Nix store the controller pushed it into,
+    /// with `args`: without a shell, without input, and with nothing of the
+    /// installer's environment, so it needs nothing but its closure. With
+    /// `root`, inside the system installed there (as `nixos-enter` does),
+    /// whose store has the program. For hooks; only after `Approve`.
+    Exec {
+        program: String,
+        args: Vec<String>,
+        root: Option<String>,
+    },
 }
 
 /// Secret bytes: wiped from memory when dropped, never shown by `Debug`.

@@ -451,6 +451,28 @@ attached, so it can ask for a YubiKey touch.
 - **`$PIXIE_OUT/disk-keys/<path>`** is a key that disko will read at `<path>`
   on the target, see below.
 - **`$PIXIE_OUT/host-key`** is the private host key in push mode.
+- **`"$PIXIE" target exec -- PROGRAM ARGS...`** runs a program on the target,
+  from `approve` until `finish`, with `--chroot` inside the installed system
+  (from `install` on). Its output and exit code come back to your hook, as if
+  it ran locally.
+
+Programs on the target must be files in the Nix store, like
+`${pkgs.sbctl}/bin/sbctl`. nix-pixie copies them there with their closure and
+runs them without a shell, without input and with nothing of the installer's
+environment (`PATH` leads nowhere). So a program behaves the same on every
+target, and whatever it needs comes with it:
+
+```nix
+packages.on-target = pkgs.writeShellApplication {
+  name = "on-target";
+  text = ''
+    # On the installer: the firmware's Secure Boot state
+    "$PIXIE" target exec -- ${pkgs.sbctl}/bin/sbctl status
+    # Inside the installed system (a hook after `install`)
+    "$PIXIE" target exec --chroot -- ${pkgs.coreutils}/bin/install -d -m 700 /var/lib/backup
+  '';
+};
+```
 
 All hooks are built once before any of them runs (with `--machine` even before
 pairing), so a hook can't change what the others do.
@@ -579,7 +601,6 @@ There is still a lot I am going to add.
 - kexec into the installer from any running Linux
 - Secure Boot, including enrolling lanzaboote keys during the install
 - Resuming an interrupted install
-- Running commands on the target from hooks (`systemd-cryptenroll` and friends)
 - Installing a batch of machines in one go, with a single code that the controller shows
 
 ## ❤️ Contributing

@@ -1,13 +1,14 @@
 //! The command line: argument definitions and dispatch to the roles.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::net::Relays;
-use crate::{agent, controller, discovery, identity, install};
+use crate::{agent, controller, discovery, identity, install, target};
 
 /// The command line.
 #[derive(Debug, Parser)]
@@ -69,6 +70,31 @@ pub enum Command {
     },
     /// Serve DHCP and PXE for the installer image (needs root).
     Netboot,
+    /// For hooks: the target of the install the hook belongs to.
+    Target {
+        #[command(subcommand)]
+        command: TargetCommand,
+    },
+}
+
+/// What hooks can do on the target.
+#[derive(Debug, Subcommand)]
+pub enum TargetCommand {
+    /// Run PROGRAM, a file in the Nix store (e.g. ${pkgs.sbctl}/bin/sbctl),
+    /// on the target: the controller copies it there with its closure and
+    /// runs it without a shell, input or the installer's environment.
+    /// Exits like it, with its output on stdout and stderr. For hooks, as
+    /// `"$PIXIE" target exec -- PROGRAM ARGS...`, from `approve` until
+    /// `finish`.
+    Exec {
+        /// Inside the installed system (as nixos-enter does), from hooks
+        /// after `install`.
+        #[arg(long)]
+        chroot: bool,
+        /// The program, then its arguments.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 /// What the controller can do.
@@ -185,13 +211,13 @@ pub enum ControllerCommand {
     },
 }
 
-/// Runs the command `cli` describes.
+/// Runs the command `cli` describes, and says how to exit.
 ///
 /// # Errors
 ///
 /// Whatever the command fails with.
-pub async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+pub async fn run(cli: Cli) -> Result<ExitCode> {
+    let result = match cli.command {
         Command::Controller { identity, command } => {
             let identity = match identity {
                 Some(path) => path,
@@ -214,7 +240,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Command::Netboot => bail!("netboot is not implemented yet"),
-    }
+        Command::Target {
+            command: TargetCommand::Exec { chroot, command },
+        } => {
+            let mut command = command.into_iter();
+            let program = command.next().unwrap_or_default();
+            return target::exec(program, command.collect(), chroot).await;
+        }
+    };
+    result.map(|()| ExitCode::SUCCESS)
 }
 
 async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result<()> {

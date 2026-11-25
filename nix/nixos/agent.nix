@@ -82,7 +82,8 @@ in
       # Formatting: disko's scripts call modprobe (dm-snapshot for LVM,
       # md_mod for mdadm) and expect it on the PATH.
       # Install: ssh-keygen for pulled host keys, nixos-install, and zpool
-      # to export pools before the first boot.
+      # to export pools before the first boot. Hooks' programs in the
+      # installed system: nixos-enter.
       path = [
         pkgs.util-linux
         pkgs.nixos-facter
@@ -90,6 +91,7 @@ in
         pkgs.kmod
         pkgs.openssh
         pkgs.nixos-install
+        pkgs.nixos-enter
       ]
       ++ lib.optional (config.boot.supportedFilesystems.zfs or false) config.boot.zfs.package;
       serviceConfig = {

@@ -894,10 +894,24 @@ the repository, at points of the install.
   leaves agenix-rekey's own default (a dummy key it warns about), so the
   configuration evaluates and builds before, like `lib.pinnedDisk` for
   disks.
+- **Programs on the target** (`"$PIXIE" target exec [--chroot] -- PROGRAM
+  ARGS…`, from `approve` until `finish`): `$PIXIE` is the controller's own
+  binary, so the two always match. While a hook runs, the controller listens
+  on a socket in the hook's private directory (`$PIXIE_TARGET`). For each
+  request it checks that the program is a file in the Nix store, copies its
+  store path with the closure to the target (the live store, or with
+  `--chroot` the store under the mounted root, which only exists from
+  `install` on), and sends `Exec` on the control stream. The target runs it
+  without a shell, without input and with only `HOME`, `LANG` and a `PATH`
+  that leads nowhere, so nothing but the closure counts and the installer's
+  tools can't leak in: the same program behaves the same on every target.
+  With `--chroot` it runs through `nixos-enter` (mounts, activation for
+  `/etc`) and the installed system's own `env -i`. stdout and stderr come
+  back as separate frames and the exit code as the hook's command's own, so
+  hooks use it like a local command. No nix-grpc-store needed: the Nix
+  daemon protocol over a QUIC stream that pushes the system does this too.
 - **Not yet:**
-  - helpers on the hooks' PATH: `nix-pixie target exec [--chroot] -- …` (run
-    a command on the target, e.g. `systemd-cryptenroll`, `sbctl
-    enroll-keys`) and `nix-pixie wait "…"` (wait mode with a notification)
+  - `nix-pixie wait "…"` (wait mode with a notification)
   - a `result.json` (e.g. asking for a rebuild)
   - more presets: facter, sops
 

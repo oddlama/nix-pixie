@@ -34,6 +34,7 @@ use crate::preflight;
 use crate::push;
 use crate::secrets;
 use crate::system::{Built, Configuration, Disko, Facts, Ssh};
+use crate::target::Target;
 use crate::ui;
 
 /// For the agent's checks before formatting (a fresh lsblk).
@@ -148,7 +149,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         Some(check) => tokio::select! {
             r = async {
                 verify(check, &args, &mut report).await?;
-                hooks.after(Step::Boot).await?;
+                hooks.after(Step::Boot, None).await?;
                 no_files_left(&mut hooks, Step::Boot)
             } => r,
             () = crate::shutdown_signal() => Err(anyhow!("interrupted")),
@@ -300,6 +301,23 @@ async fn check_machine(
         ui::progress("building the hooks");
     }
     hooks::resolve(&args.flake, &machine.hooks).await
+}
+
+/// Runs the hooks after `step`, which can run programs on the target.
+/// `installed`: where the installed system is mounted, once it is installed.
+async fn hooks_after(
+    hooks: &mut hooks::Runner,
+    step: Step,
+    stream: &mut Stream,
+    conn: &Connection,
+    installed: Option<&str>,
+) -> Result<()> {
+    let mut target = Target {
+        stream,
+        conn,
+        installed,
+    };
+    hooks.after(step, Some(&mut target)).await
 }
 
 /// Files that hooks after `step` wrote can't go anywhere: the target is gone.
@@ -622,7 +640,7 @@ async fn prepare(
     });
     let mut hooks = start_hooks(args, &name, machine, target, programs).await?;
     step.done(name.clone());
-    hooks.after(Step::Approve).await?;
+    hooks_after(&mut hooks, Step::Approve, stream, conn, None).await?;
     if let Some(path) = &machine.facter.report_path {
         let step = ui::start("facter");
         controller::fetch_facter_report(stream, &args.flake, path)
@@ -630,11 +648,11 @@ async fn prepare(
             .context("getting the facter report")?;
         step.done(path.clone());
     }
-    hooks.after(Step::Facter).await?;
+    hooks_after(&mut hooks, Step::Facter, stream, conn, None).await?;
     // Before building: the configuration (or a rekeying hook) may use it.
     let pulled = machine_host_key(stream, &args.flake, &name, machine, &mut hooks).await?;
     hooks.context.host_key = pulled.as_ref().map(ToString::to_string);
-    hooks.after(Step::HostKey).await?;
+    hooks_after(&mut hooks, Step::HostKey, stream, conn, None).await?;
 
     // A configuration that doesn't evaluate can be fixed meanwhile.
     let Evaluated {
@@ -672,7 +690,7 @@ async fn prepare(
             .join(", "),
     );
     hooks.context.disks = Some(serde_json::to_value(&choices)?);
-    hooks.after(Step::Disks).await?;
+    hooks_after(&mut hooks, Step::Disks, stream, conn, None).await?;
 
     // Before the build, so it can run unattended.
     let step = (!needs.is_empty()).then(|| ui::start("keys"));
@@ -683,7 +701,7 @@ async fn prepare(
 
     let built = build(&configuration, &planned_facts(&facts, &choices)).await?;
     hooks.context.system = Some(built.toplevel.clone());
-    hooks.after(Step::Build).await?;
+    hooks_after(&mut hooks, Step::Build, stream, conn, None).await?;
     Ok(Plan {
         label,
         name,
@@ -882,17 +900,17 @@ async fn apply(
     .await?;
     let root = disko.root_mount_point;
     hooks.context.root = Some(root.clone());
-    hooks.after(Step::Format).await?;
+    hooks_after(&mut hooks, Step::Format, stream, conn, None).await?;
     place_files(stream, &root, &mut hooks).await?;
 
     let (fstype, copied) = send_system(stream, conn, &root, &built.toplevel).await?;
-    hooks.after(Step::Copy).await?;
+    hooks_after(&mut hooks, Step::Copy, stream, conn, None).await?;
     place_files(stream, &root, &mut hooks).await?;
     let step = ui::start("install");
     let (expected, key_path) = host_key.unzip();
     install_system(stream, &root, &built.toplevel, key_path).await?;
     step.done("");
-    hooks.after(Step::Install).await?;
+    hooks_after(&mut hooks, Step::Install, stream, conn, Some(&root)).await?;
     place_files(stream, &root, &mut hooks).await?;
 
     let mut report = report(
@@ -934,7 +952,7 @@ async fn apply(
         Shutdown::PowerOff => "powering off",
     });
     hooks.context.root = None;
-    hooks.after(Step::Finish).await?;
+    hooks.after(Step::Finish, None).await?;
     no_files_left(&mut hooks, Step::Finish)?;
     let check = Check {
         addrs: Vec::new(),

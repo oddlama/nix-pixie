@@ -16,6 +16,7 @@ pub mod controller;
 pub mod discovery;
 pub mod disko;
 pub mod dns;
+pub mod exec;
 pub mod hooks;
 pub mod hostkey;
 pub mod identity;
@@ -36,6 +37,7 @@ pub mod secrets;
 pub mod state;
 pub mod store;
 pub mod system;
+pub mod target;
 pub mod ui;
 
 use tokio::signal::unix::{SignalKind, signal};

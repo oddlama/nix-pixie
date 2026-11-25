@@ -24,7 +24,9 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+use crate::child;
 use crate::disko;
+use crate::exec;
 use crate::inventory;
 use crate::mdns::{self, Mdns};
 use crate::net::{self, Relays, Stream};
@@ -482,6 +484,11 @@ async fn serve_controller(
                     TargetMsg::FilesRefused { reason }
                 }
             },
+            ControllerMsg::Exec {
+                program,
+                args,
+                root,
+            } => exec(stream, &program, &args, root.as_deref()).await?,
             ControllerMsg::Finish { root, zpools, then } => {
                 let reply = finish(&root, &zpools).await;
                 if matches!(reply, TargetMsg::Finished { .. }) {
@@ -522,9 +529,37 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::Install { .. } => Some(TargetMsg::InstallFailed { error: reason }),
         ControllerMsg::Finish { .. } => Some(TargetMsg::FinishFailed { error: reason }),
         ControllerMsg::PlaceFiles { .. } => Some(TargetMsg::FilesRefused { reason }),
+        ControllerMsg::Exec { .. } => Some(TargetMsg::ExecFailed { error: reason }),
         // None, rather than a message just for refusing this.
         ControllerMsg::RequestAddresses => Some(TargetMsg::Addresses { addrs: Vec::new() }),
     }
+}
+
+/// Runs a hook's program, which the controller pushed here (see
+/// [`crate::exec`]).
+async fn exec(
+    stream: &mut Stream,
+    program: &str,
+    args: &[String],
+    root: Option<&str>,
+) -> Result<TargetMsg> {
+    let command = match exec::command(program, args, root) {
+        Ok(command) => command,
+        Err(error) => {
+            warn!(
+                error = net::sanitise(&error, 600),
+                "not running a hook's program"
+            );
+            return Ok(TargetMsg::ExecFailed { error });
+        }
+    };
+    info!(
+        program = net::sanitise(program, 512),
+        args = args.len(),
+        ?root,
+        "running a hook's program"
+    );
+    child::exec(command, stream).await
 }
 
 async fn facter_report(state: &StateDir) -> TargetMsg {

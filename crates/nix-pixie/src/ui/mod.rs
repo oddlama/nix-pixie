@@ -488,10 +488,14 @@ impl Drop for Running {
 }
 
 /// What the running step is doing right now, for code that doesn't hold
-/// its [`Running`]. Cheap, like [`Running::detail`].
+/// its [`Running`]. Cheap, like [`Running::detail`]. Ignored while the
+/// terminal is handed over: a hook's own `nix copy` isn't its step's news.
 pub fn progress(text: impl Into<String>) {
     let console = console();
     let mut s = console.lock();
+    if s.suspended > 0 {
+        return;
+    }
     if let Some(step) = s
         .steps
         .iter_mut()

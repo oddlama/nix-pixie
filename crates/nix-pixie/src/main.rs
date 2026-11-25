@@ -2,6 +2,7 @@
 //! installs the tracing subscriber writing through it, and hands over to
 //! [`nix_pixie::cli::run`].
 
+use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -22,7 +23,7 @@ impl FormatTime for Elapsed {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     let console = ui::init();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "warn,nix_pixie=info".into());

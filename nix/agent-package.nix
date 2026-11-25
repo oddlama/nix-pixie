@@ -18,6 +18,7 @@
   kmod,
   openssh,
   nixos-install,
+  nixos-enter,
   nixos-facter,
 }:
 writeShellApplication {
@@ -33,6 +34,7 @@ writeShellApplication {
         kmod
         openssh
         nixos-install
+        nixos-enter
         nixos-facter
       ]
     }"

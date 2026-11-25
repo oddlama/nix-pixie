@@ -132,6 +132,8 @@
       {
         stamp = { command = "stamp"; after = [ "host-key" ]; before = [ "build" ]; };
         flaky = { command = "flaky"; after = [ "approve" ]; };
+        on-target = { command = "on-target"; after = [ "format" ]; };
+        in-system = { command = "in-system"; after = [ "install" ]; };
         secret = { command = "secret"; after = [ "disks" ]; };
         booted = { command = "booted"; after = [ "boot" ]; };
       }
@@ -155,17 +157,27 @@
       assert seen["secret"]["disks"][0]["disk"] == "vdb" and seen["secret"]["root"] is None, seen["secret"]
       assert seen["booted"]["step"] == "boot" and seen["booted"]["system"].startswith("/nix/store/"), seen["booted"]
       ran = {h["name"]: (h["after"], h["ran"]) for h in report["hooks"]}
-      assert ran == {"flaky": ("approve", True), "stamp": ("host-key", True), "secret": ("disks", True), "booted": ("boot", True)}, ran
+      assert ran == {
+          "flaky": ("approve", True),
+          "stamp": ("host-key", True),
+          "secret": ("disks", True),
+          "on-target": ("format", True),
+          "in-system": ("install", True),
+          "booted": ("boot", True),
+      }, ran
+      # Written by a program the hook ran inside the installed system.
+      installed.succeed("test -e /var/lib/pixie/from-hook")
       # It failed once, and ran again after the question.
       assert "flaky: failing on purpose" in output, output
       # The live console left the steps as the last word, all done.
       shown = without_escapes(output)
       steps = shown[shown.rindex("Check the flake"):]
       for step in ["Run hook flaky", "Run hook stamp", "Build nixosConfigurations.web1", "Run hook booted", "Wait for the first boot"]:
-          assert re.search(r"▣ " + re.escape(step), steps), steps
+          assert re.search(r"▣ " + re.escape(step), steps), steps[-3000:]
       # Details are cut at the terminal's width (80 columns here).
-      assert "✗" not in steps and "up at 192.168.1.3, host key" in steps, steps
-      assert "checking whether web1 is up" in shown, shown
+      assert "✗" not in steps and "up at 192.168.1.3, host key" in steps, steps[-3000:]
+      logs = [line for line in shown.splitlines() if " INFO " in line or " WARN " in line]
+      assert any("checking whether web1 is up" in line for line in logs), "\n".join(logs[-40:])
     '';
   };
 
