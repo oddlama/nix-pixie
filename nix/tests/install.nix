@@ -97,6 +97,12 @@ let
             print(console_end(install_output()))
             raise
   '';
+  # Python, at the indentation of a subtest's body: answers the question
+  # to try a failed step again.
+  retryAnswer = lib.optionalString (spec ? retry) ''
+    wait_for_output(${builtins.toJSON spec.retry})
+        controller.succeed("echo 1<>/tmp/enter")
+  '';
   # A live console redraws itself: its end, without colours, is enough.
   printOutput = if live then "print(console_end(output))" else "print(output)";
   # Python, at the indentation of a subtest's body.
@@ -203,6 +209,7 @@ pkgs.testers.runNixOSTest {
             result = controller.succeed("systemctl show -P Result pixie-install").strip()
             assert result == "success", f"the install failed ({result}):\n{install_output()}"
 
+        ${retryAnswer}
         # The step with where it goes: on a live console, the list shows the
         # step from the start.
         wait_for_output("Send the system.*into /")

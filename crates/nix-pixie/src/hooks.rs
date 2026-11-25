@@ -375,14 +375,21 @@ impl Runner {
             else {
                 bail!("hook {name} was not resolved");
             };
-            let running = ui::start_announced(&step_key(&name), format!("after {step}"));
-            let outputs = {
-                // The hook may need the terminal, e.g. for a YubiKey PIN.
-                let _terminal = ui::suspend();
-                run(&name, program, hook, step, &self.dir, &self.context).await?
-            };
+            let (dir, context) = (&self.dir, &self.context);
+            // A wrong PIN or a timeout shouldn't cost the install: each try
+            // starts from scratch, with an empty $PIXIE_OUT.
+            let outputs = ui::retrying(&format!("Run hook {name}"), async || {
+                let running = ui::start_announced(&step_key(&name), format!("after {step}"));
+                let outputs = {
+                    // The hook may need the terminal, e.g. for a YubiKey PIN.
+                    let _terminal = ui::suspend();
+                    run(&name, program, hook, step, dir, context).await?
+                };
+                running.done("");
+                Ok(outputs)
+            })
+            .await?;
             self.take_outputs(&name, step, outputs)?;
-            running.done("");
             let total: usize = self.pending.iter().map(|f| f.contents.len()).sum();
             if total > MAX_FILES_BYTES {
                 bail!(

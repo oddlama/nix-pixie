@@ -453,8 +453,15 @@ attached, so it can ask for a YubiKey touch.
 - **`$PIXIE_OUT/host-key`** is the private host key in push mode.
 
 All hooks are built once before any of them runs (with `--machine` even before
-pairing), so a hook can't change what the others do. A hook that fails aborts
-the install.
+pairing), so a hook can't change what the others do.
+
+When a hook fails, say after a mistyped YubiKey PIN, you are asked whether to
+run it again, with a fresh `$PIXIE_OUT`. The same goes for evaluating and
+building your configuration, so you can fix a typo or a missing `git add` in
+another terminal without pairing again. Only a fix that changes what the
+install was planned for (the disks, the boot loader, the platform or the SSH
+server) needs a fresh start. Without a terminal, the first failure aborts the
+install.
 
 ### Encrypted disks
 

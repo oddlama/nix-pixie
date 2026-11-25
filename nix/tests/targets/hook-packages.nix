@@ -34,6 +34,14 @@ in
   '';
   # After the installed system answered.
   booted = hook "booted" "";
+  # Fails the first time, like a hook whose password was mistyped.
+  flaky = hook "flaky" ''
+    if [ ! -e /tmp/flaky-tried ]; then
+      touch /tmp/flaky-tried
+      echo "flaky: failing on purpose" >&2
+      exit 1
+    fi
+  '';
 
   # Push mode: the host key. A throwaway key, committed for the tests only.
   push-key = hook "push-key" ''

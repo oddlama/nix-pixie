@@ -636,13 +636,18 @@ async fn prepare(
     hooks.context.host_key = pulled.as_ref().map(ToString::to_string);
     hooks.after(Step::HostKey).await?;
 
+    // A configuration that doesn't evaluate can be fixed meanwhile.
     let Evaluated {
         configuration,
         facts,
         disko,
         needs,
         host_key,
-    } = evaluate(args, machine, &inventory, pulled).await?;
+    } = ui::retrying(
+        &format!("Evaluate nixosConfigurations.{}", machine.configuration),
+        async || evaluate(args, machine, &inventory, pulled.clone()).await,
+    )
+    .await?;
 
     let step = ui::start("disks");
     let choices = choose_disks(
@@ -676,9 +681,7 @@ async fn prepare(
         step.done(format!("{} key file(s)", key_files.len()));
     }
 
-    let step = ui::start("build");
-    let built = configuration.build().await?;
-    step.done("");
+    let built = build(&configuration, &planned_facts(&facts, &choices)).await?;
     hooks.context.system = Some(built.toplevel.clone());
     hooks.after(Step::Build).await?;
     Ok(Plan {
@@ -694,6 +697,55 @@ async fn prepare(
         key_files,
         hooks,
     })
+}
+
+/// Builds the system and the disko script. A failed build can be fixed
+/// meanwhile and tried again, as long as the fix leaves alone what the
+/// install was `planned` for.
+async fn build(configuration: &Configuration, planned: &Facts) -> Result<Built> {
+    let mut again = false;
+    ui::retrying(
+        &format!("Build nixosConfigurations.{}", configuration.name()),
+        async || {
+            if again {
+                check_unchanged(configuration, planned).await?;
+            }
+            again = true;
+            let step = ui::start("build");
+            let built = configuration.build().await?;
+            step.done("");
+            Ok(built)
+        },
+    )
+    .await
+}
+
+/// The facts the install was planned with: as evaluated, with the disks
+/// that were pinned since then.
+pub fn planned_facts(facts: &Facts, choices: &[Choice]) -> Facts {
+    let mut planned = facts.clone();
+    if let Some(disko) = &mut planned.disko {
+        for choice in choices {
+            if let (Some(pin), Some(disk)) = (&choice.pin, disko.disks.get_mut(&choice.name)) {
+                disk.device = Some(pin.clone());
+            }
+        }
+    }
+    planned
+}
+
+/// Before building again: the configuration may have changed since the
+/// failed build (that's the point), but not in what the install was
+/// planned for.
+async fn check_unchanged(configuration: &Configuration, planned: &Facts) -> Result<()> {
+    if configuration.facts().await? != *planned {
+        bail!(
+            "nixosConfigurations.{} changed in what the install was planned for (its disks, \
+             boot loader, platform or SSH server); pair again to start over",
+            configuration.name()
+        );
+    }
+    Ok(())
 }
 
 /// What evaluating the approved machine's configuration settled.
@@ -717,7 +769,7 @@ async fn evaluate(
 ) -> Result<Evaluated> {
     let step = ui::start("evaluate");
     let configuration = Configuration::new(&args.flake, &machine.configuration)?;
-    let mut facts = configuration.facts().await?;
+    let facts = configuration.facts().await?;
     if facts.system != inventory.system {
         bail!(
             "nixosConfigurations.{} is for {}, but the target is {}",
@@ -730,7 +782,7 @@ async fn evaluate(
     let host_key = host_key_path(pulled, &facts, &machine.configuration)?;
     let disko = facts
         .disko
-        .take()
+        .clone()
         .with_context(|| no_disko(&machine.configuration))?;
     plan::check_links(&disko, machine.disks.file.is_some(), &machine.configuration)?;
     let needs = secrets::needs(&disko.encryption)?;

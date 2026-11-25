@@ -871,7 +871,14 @@ the repository, at points of the install.
     The agent refuses paths that leave the root, also through symlinked
     directories inside it (NixOS's `/etc/static`).
   - Both live in a private directory, removed after each run.
-  - A non-zero exit aborts the install. The JSON result lists every hook,
+  - A non-zero exit asks the operator whether to run the hook again, with
+    fresh outputs (a mistyped PIN, a YubiKey that timed out); without a
+    terminal, or when they say no, it aborts the install. Evaluating and
+    building the configuration are offered again the same way, so it can be
+    fixed in another terminal while the target waits. Before building again
+    the controller evaluates the configuration's facts anew and refuses if
+    anything the install was planned with changed (disks, with the pins
+    recorded since; boot loader; platform; SSH server). The JSON result lists every hook,
     its step and whether it ran (`--then stay` and systems without sshd
     never reach `finish`/`boot`).
 - **Secret hygiene:** hook output never goes through a Nix build (which

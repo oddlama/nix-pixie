@@ -13,6 +13,7 @@
 # - bootPrompt: how the installed system asks for it on its console.
 # - live: the controller runs on a terminal (with TERM set), so its console
 #   is live, and the first boot is checked once the test presses Enter.
+# - retry: on a live console, a question to answer with Enter when it shows.
 # - checks: Python run against the booted `installed` machine.
 {
   ext4 = {
@@ -125,10 +126,12 @@
   hooks = {
     disks = [ "main" ];
     live = true;
+    retry = "Run hook flaky again";
     packages = "hook-packages.nix";
     hooks = ''
       {
         stamp = { command = "stamp"; after = [ "host-key" ]; before = [ "build" ]; };
+        flaky = { command = "flaky"; after = [ "approve" ]; };
         secret = { command = "secret"; after = [ "disks" ]; };
         booted = { command = "booted"; after = [ "boot" ]; };
       }
@@ -152,11 +155,13 @@
       assert seen["secret"]["disks"][0]["disk"] == "vdb" and seen["secret"]["root"] is None, seen["secret"]
       assert seen["booted"]["step"] == "boot" and seen["booted"]["system"].startswith("/nix/store/"), seen["booted"]
       ran = {h["name"]: (h["after"], h["ran"]) for h in report["hooks"]}
-      assert ran == {"stamp": ("host-key", True), "secret": ("disks", True), "booted": ("boot", True)}, ran
+      assert ran == {"flaky": ("approve", True), "stamp": ("host-key", True), "secret": ("disks", True), "booted": ("boot", True)}, ran
+      # It failed once, and ran again after the question.
+      assert "flaky: failing on purpose" in output, output
       # The live console left the steps as the last word, all done.
       shown = without_escapes(output)
       steps = shown[shown.rindex("Check the flake"):]
-      for step in ["Run hook stamp", "Build nixosConfigurations.web1", "Run hook booted", "Wait for the first boot"]:
+      for step in ["Run hook flaky", "Run hook stamp", "Build nixosConfigurations.web1", "Run hook booted", "Wait for the first boot"]:
           assert re.search(r"▣ " + re.escape(step), steps), steps
       # Details are cut at the terminal's width (80 columns here).
       assert "✗" not in steps and "up at 192.168.1.3, host key" in steps, steps

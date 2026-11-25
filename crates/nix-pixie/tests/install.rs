@@ -49,3 +49,53 @@ fn tail_is_bounded() {
     assert_eq!(tail.lines(1), "end");
     assert!(tail.lines(2).len() < 70 * 1024);
 }
+
+#[test]
+fn a_rebuild_compares_against_the_disks_as_pinned() {
+    use nix_pixie::install::planned_facts;
+    use nix_pixie::plan::Choice;
+    use nix_pixie::system::{Boot, Disko, DiskoDisk, Encryption, Facts, Ssh};
+    let disk = |device: &str| DiskoDisk {
+        device: Some(device.into()),
+        part_labels: vec![],
+    };
+    let facts = Facts {
+        system: "x86_64-linux".into(),
+        disko: Some(Disko {
+            root_mount_point: "/mnt".into(),
+            disks: [
+                ("main".to_string(), disk("/dev/disk/by-pixie/main")),
+                ("data".to_string(), disk("/dev/disk/by-id/nvme-data")),
+            ]
+            .into(),
+            zpools: vec![],
+            by_pixie_links: false,
+            encryption: Encryption::default(),
+        }),
+        boot: Boot::default(),
+        ssh: Ssh {
+            enable: true,
+            ports: vec![22],
+            host_key_path: None,
+        },
+    };
+    let choices = [Choice {
+        name: "main".into(),
+        role: "main".into(),
+        disk: "nvme0n1".into(),
+        pin: Some("/dev/disk/by-id/nvme-main".into()),
+        link: false,
+    }];
+    let planned = planned_facts(&facts, &choices);
+    let disks = &planned.disko.as_ref().unwrap().disks;
+    // Recorded before the first build: what a rebuild evaluates to.
+    assert_eq!(
+        disks["main"].device.as_deref(),
+        Some("/dev/disk/by-id/nvme-main")
+    );
+    assert_eq!(
+        disks["data"].device.as_deref(),
+        Some("/dev/disk/by-id/nvme-data")
+    );
+    assert_eq!(planned.ssh, facts.ssh);
+}

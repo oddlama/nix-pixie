@@ -585,9 +585,43 @@ pub async fn ask(question: &str) -> Option<String> {
 /// Asks a yes/no `question`. Anything but `y` or `yes` is no, so is the end
 /// of input.
 pub async fn confirm(question: &str) -> bool {
+    yes_or_no(question, false).await
+}
+
+/// Asks a yes/no `question` whose empty answer is `default`. Anything but
+/// `y`, `yes`, `n` and `no` is no, so is the end of input.
+pub async fn yes_or_no(question: &str, default: bool) -> bool {
     ask(question)
         .await
-        .is_some_and(|answer| matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+        .is_some_and(|answer| match answer.trim().to_ascii_lowercase().as_str() {
+            "" => default,
+            "y" | "yes" => true,
+            _ => false,
+        })
+}
+
+/// Runs `attempt` until it succeeds. On a terminal the operator is told why
+/// it failed and asked whether to try `what` again, e.g. after typing a
+/// wrong password into a hook, or fixing the configuration in another
+/// terminal. Without one, the first failure is final.
+pub async fn retrying<T>(
+    what: &str,
+    mut attempt: impl AsyncFnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    loop {
+        let error = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !interactive() || input_ended() {
+            return Err(error);
+        }
+        show(vec![paint(&format!("{error:#}"), Tone::Bad)]);
+        if !yes_or_no(&format!("{what} again? [Y/n] "), true).await {
+            return Err(error);
+        }
+        tracing::info!(error = format!("{error:#}"), "trying again: {what}");
+    }
 }
 
 /// Whether stdin ended for good: nothing will answer any more.
