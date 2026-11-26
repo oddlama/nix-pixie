@@ -87,6 +87,52 @@ pub struct Disks {
     /// Pinned mode: where the chosen disks are recorded, relative to the
     /// flake. `None`: whatever the disko config names.
     pub file: Option<String>,
+    /// Which disk a role takes when nobody says, by role.
+    #[serde(default)]
+    pub rules: BTreeMap<String, crate::plan::DiskRule>,
+}
+
+/// The placeholder in per-device paths for the install's id.
+pub const ID: &str = "{id}";
+
+/// Checks an install's id (`--id`, or a hook's `$PIXIE_OUT/id`): it goes
+/// into paths in the repository.
+///
+/// # Errors
+///
+/// If it is anything but 1 to 64 letters, digits, `.`, `_` and `-`, or
+/// starts with a `.`.
+pub fn check_id(id: &str) -> Result<()> {
+    let plain = (1..=64).contains(&id.len())
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !plain {
+        bail!(
+            "{id:?} is not an id: 1 to 64 letters, digits, `.`, `_` and `-`, not starting with `.`"
+        );
+    }
+    Ok(())
+}
+
+/// `path` (the machine's `option`) with `{id}` replaced by the install's
+/// id.
+///
+/// # Errors
+///
+/// If the path uses `{id}` and there is no id.
+pub fn with_id(path: &str, id: Option<&str>, option: &str) -> Result<String> {
+    if !path.contains(ID) {
+        return Ok(path.to_string());
+    }
+    let id = id.with_context(|| {
+        format!(
+            "{option} ({path}) uses {ID}, but this install has no id: pass --id, or have a hook \
+             write it to $PIXIE_OUT/id before it is needed"
+        )
+    })?;
+    Ok(path.replace(ID, id))
 }
 
 /// What to assume about the machine's firmware, where the installer can't

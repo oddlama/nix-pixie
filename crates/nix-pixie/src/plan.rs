@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use nix_pixie_proto::inventory::Disk;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::disko::is_plain_name;
 use crate::net::sanitise;
@@ -237,15 +237,91 @@ pub fn find<'a>(disks: &'a [Disk], spec: &str) -> Result<&'a Disk> {
     }
 }
 
+/// Which disk a role takes when nobody says (a machine's
+/// `disks.rules.<role>`): the only free disk that matches. For many
+/// devices of one configuration, which can't each have a `disks.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskRule {
+    /// Any of these transports (`nvme`, `sata`, `usb`, `mmc`, ...).
+    pub transport: Option<Vec<String>>,
+    /// The model contains this, in any case.
+    pub model: Option<String>,
+    /// Bytes.
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    pub removable: Option<bool>,
+}
+
+impl DiskRule {
+    /// Whether `disk` matches.
+    pub fn matches(&self, disk: &Disk) -> bool {
+        let transport = self.transport.as_ref().is_none_or(|wanted| {
+            disk.transport
+                .as_ref()
+                .is_some_and(|t| wanted.iter().any(|w| w.eq_ignore_ascii_case(t)))
+        });
+        let model = self.model.as_ref().is_none_or(|wanted| {
+            disk.model
+                .as_ref()
+                .is_some_and(|m| m.to_lowercase().contains(&wanted.to_lowercase()))
+        });
+        transport
+            && model
+            && self.min_size.is_none_or(|min| disk.size_bytes >= min)
+            && self.max_size.is_none_or(|max| disk.size_bytes <= max)
+            && self.removable.is_none_or(|r| disk.removable == r)
+    }
+
+    /// The rule, for the operator.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(transport) = &self.transport {
+            parts.push(format!("transport {}", transport.join(" or ")));
+        }
+        if let Some(model) = &self.model {
+            parts.push(format!("model containing {model:?}"));
+        }
+        if let Some(min) = self.min_size {
+            parts.push(format!("at least {min} bytes"));
+        }
+        if let Some(max) = self.max_size {
+            parts.push(format!("at most {max} bytes"));
+        }
+        if let Some(removable) = self.removable {
+            parts.push(
+                if removable {
+                    "removable"
+                } else {
+                    "not removable"
+                }
+                .into(),
+            );
+        }
+        if parts.is_empty() {
+            "any disk".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
 /// Assigns a disk to every slot: fixed devices first, then the operator's
 /// `requested` disks (by role), then pinned disks keep their recorded disk,
-/// and a last slot with a single free disk left gets that one. Anything
-/// still open is [`Resolution::Ask`].
+/// then roles with a rule take the one free disk that matches it, and a
+/// last slot with a single free disk left gets that one. Anything still
+/// open is [`Resolution::Ask`].
 pub fn resolve(
     slots: &[Slot],
     disks: &[Disk],
     requested: &BTreeMap<String, String>,
+    rules: &BTreeMap<String, DiskRule>,
 ) -> Result<Resolution> {
+    for role in rules.keys() {
+        if !slots.iter().any(|s| &s.role == role) {
+            bail!("disks.rules.{role}: no such role");
+        }
+    }
     for role in requested.keys() {
         match slots.iter().find(|s| &s.role == role) {
             None => bail!("--disk {role}=...: no such role"),
@@ -290,6 +366,8 @@ pub fn resolve(
             })?;
         }
     }
+
+    by_rules(slots, disks, rules, &mut assigned)?;
 
     let open: Vec<&Slot> = slots
         .iter()
@@ -340,6 +418,50 @@ pub fn resolve(
         })
         .collect::<Result<_>>()
         .map(Resolution::Done)
+}
+
+/// Gives each open slot with a rule the one free disk that matches it.
+fn by_rules(
+    slots: &[Slot],
+    disks: &[Disk],
+    rules: &BTreeMap<String, DiskRule>,
+    assigned: &mut Assigned,
+) -> Result<()> {
+    for slot in slots {
+        let Some(rule) = rules.get(&slot.role) else {
+            continue;
+        };
+        if assigned.chosen.contains_key(&slot.name) {
+            continue;
+        }
+        let matching: Vec<&Disk> = disks
+            .iter()
+            .filter(|d| d.installable() && !assigned.taken.contains_key(&d.name) && rule.matches(d))
+            .collect();
+        match matching.as_slice() {
+            [disk] => assigned.take(slot, disk)?,
+            [] => bail!(
+                "no free disk matches the rule for {} ({}); choose one with --disk {}=...",
+                slot.role,
+                rule.describe(),
+                slot.role
+            ),
+            several => bail!(
+                "{} disks match the rule for {} ({}): {}; make the rule stricter, or choose with \
+                 --disk {}=...",
+                several.len(),
+                slot.role,
+                rule.describe(),
+                several
+                    .iter()
+                    .map(|d| d.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                slot.role
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Disks given out so far.

@@ -214,6 +214,12 @@ pub enum ControllerCommand {
         /// Flake with the `pixie` output and the configurations.
         #[arg(long, default_value = ".")]
         flake: String,
+        /// Which of many devices installed from one machine this is, e.g. a
+        /// serial number or an id from an inventory: `{id}` in the machine's
+        /// paths (hostKey.publicKeyPath, facter.reportPath), and `id` for
+        /// hooks. A hook can give it instead, in `$PIXIE_OUT/id`.
+        #[arg(long)]
+        id: Option<String>,
         /// Install this machine (default: the one whose hints match).
         #[arg(long)]
         machine: Option<String>,
@@ -413,6 +419,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
         ControllerCommand::Install {
             code,
             controller_code_file,
+            id,
             flake,
             machine,
             disks,
@@ -430,6 +437,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
                 identity,
                 code,
                 controller_code_file,
+                id,
                 timeout: Duration::from_secs(timeout),
                 method: discovery,
                 flake,

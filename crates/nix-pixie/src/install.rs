@@ -54,6 +54,9 @@ pub struct InstallArgs {
     pub code: Option<String>,
     /// A controller's code to pair with instead.
     pub controller_code_file: Option<PathBuf>,
+    /// Which of many devices of one configuration this is: for `{id}` in
+    /// the machine's paths, and for hooks.
+    pub id: Option<String>,
     pub timeout: Duration,
     pub method: Method,
     /// Flake with the `pixie` output and the configurations.
@@ -93,6 +96,9 @@ pub enum Then {
 /// Pairs with the target showing the code, and installs the machine onto it.
 pub async fn install(args: InstallArgs) -> Result<()> {
     exit::reached(exit::Phase::Checking);
+    if let Some(id) = &args.id {
+        metadata::check_id(id)?;
+    }
     // A typo in a given code fails at once.
     if let Some(code) = &args.code {
         controller::target_code(code)?;
@@ -284,7 +290,7 @@ async fn check_machine(
     requested: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, PathBuf>> {
     check_push(name, machine)?;
-    if let Some(report) = missing_facter_report(&args.flake, machine) {
+    if let Some(report) = missing_facter_report(&args.flake, machine, args.id.as_deref()) {
         // A configuration that reads its facter report can't evaluate
         // before the first one arrives (after approval); check it then.
         info!(
@@ -305,7 +311,13 @@ async fn check_machine(
         let has_hooks = !machine.hooks.is_empty();
         secrets::check_available(&secrets::needs(&disko.encryption)?, has_hooks)?;
     }
-    if machine.disks.file.is_some() {
+    if let Some(file) = &machine.disks.file {
+        if file.contains(metadata::ID) {
+            bail!(
+                "disks.file ({file}) can't depend on the id: the configuration reads one file. \
+                 For many devices, choose their disks with disks.rules"
+            );
+        }
         repo_root(&args.flake)?;
     }
     hooks::schedule(&machine.hooks)?;
@@ -576,10 +588,14 @@ async fn wait_until(next: Instant, enter: &mut bool, step: &ui::Running, checks:
 
 /// The machine's facter report path, if it wants one and the repository
 /// doesn't have it yet (a first install).
-fn missing_facter_report<'a>(flake: &str, machine: &'a Machine) -> Option<&'a str> {
+fn missing_facter_report(flake: &str, machine: &Machine, id: Option<&str>) -> Option<String> {
     let report = machine.facter.report_path.as_deref()?;
+    // Without the id yet, it can't be told: as if it were missing.
+    let Ok(report) = metadata::with_id(report, id, "facter.reportPath") else {
+        return Some(report.to_string());
+    };
     let root = metadata::local_flake_dir(flake)?;
-    (!root.join(report).exists()).then_some(report)
+    (!root.join(&report).exists()).then_some(report)
 }
 
 /// Push mode needs a hook to provide the key.
@@ -662,11 +678,12 @@ async fn prepare(
     step.done(name.clone());
     hooks_after(&mut hooks, Step::Approve, link, None).await?;
     if let Some(path) = &machine.facter.report_path {
+        let path = metadata::with_id(path, hooks.context.id.as_deref(), "facter.reportPath")?;
         let step = ui::start("facter");
-        controller::fetch_facter_report(link, &args.flake, path)
+        controller::fetch_facter_report(link, &args.flake, &path)
             .await
             .context("getting the facter report")?;
-        step.done(path.clone());
+        step.done(path);
     }
     hooks_after(&mut hooks, Step::Facter, link, None).await?;
     // Before building: the configuration (or a rekeying hook) may use it.
@@ -688,14 +705,7 @@ async fn prepare(
     .await?;
 
     let step = ui::start("disks");
-    let choices = choose_disks(
-        &disko,
-        machine.disks.file.is_some(),
-        &inventory.disks,
-        &mut requested,
-        args.yes,
-    )
-    .await?;
+    let choices = choose_disks(&disko, machine, &inventory.disks, &mut requested, args.yes).await?;
     let formatting = choices.iter().map(|c| c.disk.as_str()).collect();
     plan::check_name_clashes(&plan::created_names(&disko), &formatting, &inventory.disks)
         .map_err(|reason| anyhow!(reason))?;
@@ -867,6 +877,7 @@ async fn start_hooks(
             configuration: machine.configuration.clone(),
             flake: args.flake.clone(),
             target,
+            id: args.id.clone(),
             ..hooks::Context::default()
         },
     )
@@ -934,6 +945,9 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
         copied.seconds,
         args.then,
     )?;
+    if let Some(id) = &hooks.context.id {
+        report.insert("id".into(), id.clone().into());
+    }
     let shutdown = match args.then {
         Then::Stay => {
             ui::show(vec![format!(
@@ -1101,11 +1115,13 @@ async fn machine_host_key(
     hooks: &mut hooks::Runner,
 ) -> Result<Option<PublicKey>> {
     let pushed = hooks.take_host_key();
+    let id = hooks.context.id.clone();
+    let id = id.as_deref();
     Ok(match (machine.host_key.mode, pushed) {
         (HostKeyMode::None, None) => None,
-        (HostKeyMode::Pull, None) => Some(host_key(link, flake, name, machine, None).await?),
+        (HostKeyMode::Pull, None) => Some(host_key(link, flake, name, machine, id, None).await?),
         (HostKeyMode::Push, Some(private)) => {
-            Some(host_key(link, flake, name, machine, Some(private)).await?)
+            Some(host_key(link, flake, name, machine, id, Some(private)).await?)
         }
         (HostKeyMode::Push, None) => bail!(
             "hostKey.mode = \"push\", but no hook wrote $PIXIE_OUT/host-key before `host-key`"
@@ -1125,6 +1141,7 @@ async fn host_key(
     flake: &str,
     name: &str,
     machine: &Machine,
+    id: Option<&str>,
     pushed: Option<Zeroizing<Vec<u8>>>,
 ) -> Result<PublicKey> {
     let how = if pushed.is_some() { "pushed" } else { "pulled" };
@@ -1150,6 +1167,9 @@ async fn host_key(
     };
     info!(%key, how, "host key");
     if let Some(path) = &machine.host_key.public_key_path {
+        let path = &metadata::with_id(path, id, "hostKey.publicKeyPath")?;
+        // Many devices of one machine: each by its id.
+        let name = id.unwrap_or(name);
         let root = repo_root(flake)?;
         let file = metadata::repo_path(&root, path)?;
         let entry = key.to_line(Some(&format!("root@{name}")));
@@ -1315,14 +1335,15 @@ fn repo_root(flake: &str) -> Result<PathBuf> {
 /// Resolves the disk plan, asking the operator where it has to.
 async fn choose_disks(
     disko: &Disko,
-    pinned: bool,
+    machine: &Machine,
     present: &[Disk],
     requested: &mut BTreeMap<String, String>,
     yes: bool,
 ) -> Result<Vec<Choice>> {
-    let slots = plan::slots(disko, pinned, present)?;
+    let slots = plan::slots(disko, machine.disks.file.is_some(), present)?;
     loop {
-        let (role, candidates) = match plan::resolve(&slots, present, requested)? {
+        let resolved = plan::resolve(&slots, present, requested, &machine.disks.rules)?;
+        let (role, candidates) = match resolved {
             Resolution::Done(choices) => return Ok(choices),
             Resolution::Ask { role, candidates } => (role, candidates),
         };

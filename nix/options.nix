@@ -202,6 +202,50 @@ let
           '';
         };
 
+        disks.rules = mkOption {
+          type = types.attrsOf (
+            types.submodule {
+              options = {
+                transport = mkOption {
+                  type = types.nullOr (types.listOf types.str);
+                  default = null;
+                  example = [ "nvme" ];
+                  description = "Any of these transports, as lsblk names them (`nvme`, `sata`, `usb`, `mmc`, ...).";
+                };
+                model = mkOption {
+                  type = types.nullOr types.str;
+                  default = null;
+                  description = "The model contains this, in any case.";
+                };
+                minSize = mkOption {
+                  type = types.nullOr types.ints.unsigned;
+                  default = null;
+                  description = "At least this many bytes.";
+                };
+                maxSize = mkOption {
+                  type = types.nullOr types.ints.unsigned;
+                  default = null;
+                  description = "At most this many bytes.";
+                };
+                removable = mkOption {
+                  type = types.nullOr types.bool;
+                  default = null;
+                  description = "Removable, or not.";
+                };
+              };
+            }
+          );
+          default = { };
+          example = lib.literalExpression ''{ main.transport = [ "nvme" ]; }'';
+          description = ''
+            Which disk a role (a `/dev/disk/by-pixie/<role>` device, or in
+            pinned mode a disko disk) takes when nobody chooses: the only
+            free disk that matches. More than one, or none, is an error.
+            For many devices of one configuration, which can't each have a
+            `disks.json`.
+          '';
+        };
+
         hostKey = {
           mode = mkOption {
             type = types.enum [

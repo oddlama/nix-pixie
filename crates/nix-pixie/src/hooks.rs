@@ -324,6 +324,9 @@ pub struct Context {
     pub root: Option<String>,
     /// What earlier hooks wrote into `$PIXIE_OUT/context.json`, by hook.
     pub outputs: BTreeMap<String, serde_json::Value>,
+    /// The install's id (`--id`, or a hook's `$PIXIE_OUT/id`): which of
+    /// many devices of one configuration this is.
+    pub id: Option<String>,
 }
 
 /// Runs a machine's hooks as the install passes its steps.
@@ -411,6 +414,14 @@ impl Runner {
         if let Some(value) = outputs.context {
             self.context.outputs.insert(name.to_string(), value);
         }
+        if let Some(id) = outputs.id {
+            match &self.context.id {
+                Some(known) if *known != id => {
+                    bail!("hook {name} says the id is {id}, but it is {known} already")
+                }
+                _ => self.context.id = Some(id),
+            }
+        }
         if let Some(key) = outputs.host_key {
             if step >= Step::HostKey {
                 bail!(
@@ -479,6 +490,8 @@ pub struct Outputs {
     pub host_key: Option<Zeroizing<Vec<u8>>>,
     /// `context.json`: for later hooks, and the result.
     pub context: Option<serde_json::Value>,
+    /// `id`: the install's id.
+    pub id: Option<String>,
 }
 
 /// The largest `context.json` a hook may write.
@@ -496,6 +509,12 @@ pub fn collect_outputs(out: &Path) -> Result<Outputs> {
             Some("files") => outputs.files.extend(collect_files(&entry.path())?),
             Some("files.json") if entry.file_type()?.is_file() => {
                 manifest = Some(std::fs::read(entry.path())?);
+            }
+            Some("id") if entry.file_type()?.is_file() => {
+                let id = std::fs::read_to_string(entry.path()).context("id is not UTF-8")?;
+                let id = id.trim().to_string();
+                crate::metadata::check_id(&id)?;
+                outputs.id = Some(id);
             }
             Some("context.json") if entry.file_type()?.is_file() => {
                 if entry.metadata()?.len() > MAX_CONTEXT_BYTES {
@@ -515,8 +534,8 @@ pub fn collect_outputs(out: &Path) -> Result<Outputs> {
                 outputs.host_key = Some(Zeroizing::new(std::fs::read(entry.path())?));
             }
             _ => bail!(
-                "{}: a hook's outputs are files/, files.json, disk-keys/, host-key and \
-                 context.json",
+                "{}: a hook's outputs are files/, files.json, disk-keys/, host-key, \
+                 context.json and id",
                 name.to_string_lossy()
             ),
         }

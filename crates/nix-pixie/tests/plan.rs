@@ -76,7 +76,12 @@ fn requests(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 fn plan(config: &Disko, pinned: bool, wanted: &[(&str, &str)]) -> anyhow::Result<Resolution> {
     let disks = target();
-    resolve(&slots(config, pinned, &disks)?, &disks, &requests(wanted))
+    resolve(
+        &slots(config, pinned, &disks)?,
+        &disks,
+        &requests(wanted),
+        &BTreeMap::new(),
+    )
 }
 
 fn done(resolution: Resolution) -> Vec<Choice> {
@@ -134,6 +139,7 @@ fn the_last_free_disk_is_taken_without_asking() {
         resolve(
             &slots(&config, false, &disks).unwrap(),
             &disks,
+            &BTreeMap::new(),
             &BTreeMap::new(),
         )
         .unwrap(),
@@ -212,6 +218,7 @@ fn a_recorded_disk_in_use_says_what_holds_it() {
         &slots(&recorded, true, &disks).unwrap(),
         &disks,
         &requests(&[]),
+        &BTreeMap::new(),
     )
     .unwrap_err();
     let err = format!("{err:#}");
@@ -228,6 +235,7 @@ fn a_recorded_disk_in_use_says_what_holds_it() {
             &slots(&recorded, true, &disks).unwrap(),
             &disks,
             &requests(&[]),
+            &BTreeMap::new(),
         )
         .unwrap(),
     );
@@ -267,6 +275,7 @@ fn disks_formatted_during_this_boot_stay_installable() {
             &slots(&config, false, &disks).unwrap(),
             &disks,
             &requests(&[("main", "vdc")]),
+            &BTreeMap::new(),
         )
         .unwrap(),
     );
