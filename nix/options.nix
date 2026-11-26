@@ -246,6 +246,30 @@ let
           '';
         };
 
+        firmware = {
+          uefi = mkOption {
+            type = types.nullOr types.bool;
+            default = null;
+            description = ''
+              Whether the machine boots with UEFI. `null`: as the target
+              booted the installer, which is usually how it boots the
+              installed system too. An installer booted another way (over
+              USB, by a vendor's tool) may not see the firmware the system
+              boots with: then say so here, or the controller refuses EFI
+              boot loaders.
+            '';
+          };
+          setupMode = mkOption {
+            type = types.nullOr types.bool;
+            default = null;
+            description = ''
+              Whether the firmware is in Secure Boot setup mode. `null`: as
+              the installer sees it. Set it where the installer can't see
+              the firmware's variables, and they were cleared beforehand.
+            '';
+          };
+        };
+
         hooks = hooksOption ''
           This machine's hooks, on top of `hooks`. Settings here win over the
           ones from `hooks`, option by option.

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use nix_pixie_proto::inventory::Inventory;
+use nix_pixie_proto::inventory::{Firmware, Inventory};
 use serde::Deserialize;
 use tracing::{debug, info};
 
@@ -30,6 +30,8 @@ pub struct Machine {
     pub disks: Disks,
     pub host_key: HostKey,
     pub facter: Facter,
+    #[serde(default)]
+    pub firmware: FirmwareAssumed,
     /// Enabled hooks, by name (see `crate::hooks`).
     pub hooks: BTreeMap<String, Hook>,
 }
@@ -85,6 +87,26 @@ pub struct Disks {
     /// Pinned mode: where the chosen disks are recorded, relative to the
     /// flake. `None`: whatever the disko config names.
     pub file: Option<String>,
+}
+
+/// What to assume about the machine's firmware, where the installer can't
+/// tell; `None`: as the installer sees it.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FirmwareAssumed {
+    pub uefi: Option<bool>,
+    pub setup_mode: Option<bool>,
+}
+
+impl FirmwareAssumed {
+    /// The firmware the installer saw, with what is assumed instead.
+    pub fn apply(self, seen: &Firmware) -> Firmware {
+        Firmware {
+            uefi: self.uefi.unwrap_or(seen.uefi),
+            secure_boot: seen.secure_boot,
+            setup_mode: self.setup_mode.or(seen.setup_mode),
+        }
+    }
 }
 
 /// Where the machine's nixos-facter report goes, if it wants one.

@@ -817,7 +817,8 @@ async fn evaluate(
             sanitise(&inventory.system, 32)
         );
     }
-    preflight::check_boot(&facts.boot, &inventory.firmware, &machine.configuration)?;
+    let firmware = machine.firmware.apply(&inventory.firmware);
+    preflight::check_boot(&facts.boot, &firmware, &machine.configuration)?;
     let host_key = host_key_path(pulled, &facts, &machine.configuration)?;
     let disko = facts
         .disko
