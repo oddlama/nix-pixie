@@ -23,6 +23,7 @@ use tracing::{info, warn};
 
 use crate::agent::MAX_FAILURES;
 use crate::discovery::{self, Discovery, Method, Peer};
+use crate::exit;
 use crate::identity;
 use crate::link::Link;
 use crate::metadata::{self, Metadata, Suggestion};
@@ -72,6 +73,7 @@ pub struct PairArgs {
 /// Pairs with the target showing a code (default mode), shows what it is,
 /// asks the operator to approve it, and prints one JSON object describing it.
 pub async fn pair(args: PairArgs) -> Result<()> {
+    exit::reached(exit::Phase::Checking);
     // A typo in a given code fails at once.
     if let Some(code) = &args.code {
         target_code(code)?;
@@ -111,12 +113,14 @@ pub async fn pair(args: PairArgs) -> Result<()> {
         targets: &args.targets,
         relays: &args.relays,
     };
+    exit::reached(exit::Phase::Pairing);
     let step = ui::start_with("pair", search.looking(code));
     let (endpoint, mut discovery) = search.start(code).await?;
     let result = tokio::select! {
         r = async {
             let (conn, stream, peer) =
                 pair_with_target(&endpoint, &mut discovery, code, args.timeout).await?;
+            exit::reached(exit::Phase::Paired);
             step.done(describe_peer(&conn, &peer));
             let link = Link::new(&endpoint, &peer, conn, stream);
             let result = review(&link, &peer, flake.as_ref(), &args).await;

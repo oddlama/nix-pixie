@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::net::Relays;
-use crate::{agent, console, control, controller, discovery, identity, install, target};
+use crate::{agent, console, control, controller, discovery, events, identity, install, target};
 
 /// The command line.
 #[derive(Debug, Parser)]
@@ -48,6 +48,15 @@ pub enum Command {
         /// Controller identity key [default: $XDG_STATE_HOME/nix-pixie/identity].
         #[arg(long, global = true)]
         identity: Option<PathBuf>,
+        /// Also write progress as JSON lines to FILE (a file, a FIFO or
+        /// /dev/fd/N), for a program that drives the controller. The exit
+        /// codes say how far an install got; see the README.
+        #[arg(long, global = true, value_name = "FILE")]
+        events: Option<PathBuf>,
+        /// Neither substitute nor fetch anything: everything the install
+        /// needs is in the local store already.
+        #[arg(long, global = true)]
+        offline: bool,
         #[command(subcommand)]
         command: ControllerCommand,
     },
@@ -264,7 +273,18 @@ pub enum ControllerCommand {
 /// Whatever the command fails with.
 pub async fn run(cli: Cli) -> Result<ExitCode> {
     let result = match cli.command {
-        Command::Controller { identity, command } => {
+        Command::Controller {
+            identity,
+            events,
+            offline,
+            command,
+        } => {
+            if let Some(path) = &events {
+                events::open(path)?;
+            }
+            if offline {
+                crate::nix::offline();
+            }
             let identity = match identity {
                 Some(path) => path,
                 None => identity::default_path()?,

@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
+use crate::events;
+
 pub use input::{Input, Serviced};
 pub use render::{Status, Step, Tone, duration, span};
 
@@ -343,6 +345,12 @@ impl Console {
         if let Some(detail) = detail {
             step.detail = detail;
         }
+        let state = match step.status {
+            Status::Skipped => events::State::Skipped,
+            Status::Failed { .. } => events::State::Failed,
+            _ => events::State::Done,
+        };
+        events::step(key, state, &step.detail);
         self.redraw(&mut s);
     }
 }
@@ -370,6 +378,8 @@ pub fn paint(text: &str, tone: Tone) -> String {
 /// Replaces the list of steps. Steps that were in the list before keep their
 /// state, so the list can be refined as more becomes known.
 pub fn steps(list: impl IntoIterator<Item = (String, String)>) {
+    let list: Vec<(String, String)> = list.into_iter().collect();
+    events::steps(&list);
     let console = console();
     let mut s = console.lock();
     let old = std::mem::take(&mut s.steps);
@@ -433,6 +443,7 @@ fn begin(key: &str, detail: &str, announce: bool) -> Running {
             since: Instant::now(),
         };
         detail.clone_into(&mut step.detail);
+        events::step(key, events::State::Started, detail);
         let detail = if detail.is_empty() {
             String::new()
         } else {
@@ -517,6 +528,7 @@ pub fn skip(key: &str, reason: impl Into<String>) {
     {
         step.status = Status::Skipped;
         step.detail = reason.into();
+        events::step(key, events::State::Skipped, &step.detail);
         console.redraw(&mut s);
     }
 }
@@ -524,6 +536,7 @@ pub fn skip(key: &str, reason: impl Into<String>) {
 /// Tells the operator `lines`, below the steps until replaced or
 /// [`commit`]ed. Plain output prints them.
 pub fn show(lines: Vec<String>) {
+    events::notice(&lines);
     let console = console();
     let mut s = console.lock();
     if console.drawing(&s) {
@@ -547,6 +560,7 @@ pub fn commit() {
 
 /// Prints `lines` into the scrollback.
 pub fn note(lines: &[String]) {
+    events::notice(lines);
     let console = console();
     let mut s = console.lock();
     console.print_above(&mut s, &lines.join("\n"));
@@ -557,6 +571,7 @@ pub fn note(lines: &[String]) {
 /// what was shown, the question and the answer go into the scrollback.
 /// `None` once input has ended.
 pub async fn ask(question: &str) -> Option<String> {
+    events::question(question);
     let console = console();
     {
         let mut s = console.lock();
@@ -712,6 +727,7 @@ pub fn finish() {
             step.status = Status::Failed {
                 took: since.elapsed(),
             };
+            events::step(&step.key, events::State::Failed, &step.detail);
         }
     }
     s.asking = false;
@@ -727,6 +743,7 @@ pub fn finish() {
 /// Prints one line of the result to stdout. If stdout is the terminal too,
 /// above the region, which would otherwise be drawn over it.
 pub fn print_result(line: &str) {
+    events::result(line);
     let console = console();
     let mut s = console.lock();
     let shared = console.drawing(&s) && s.drawn > 0 && std::io::stdout().is_terminal();

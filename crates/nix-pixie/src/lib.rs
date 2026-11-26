@@ -18,7 +18,9 @@ pub mod controller;
 pub mod discovery;
 pub mod disko;
 pub mod dns;
+pub mod events;
 pub mod exec;
+pub mod exit;
 pub mod hooks;
 pub mod hostkey;
 pub mod identity;
@@ -61,4 +63,5 @@ pub async fn shutdown_signal() {
             let _ = tokio::signal::ctrl_c().await;
         }
     }
+    exit::interrupted();
 }

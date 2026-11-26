@@ -9,6 +9,7 @@ use anyhow::Result;
 use clap::Parser;
 use nix_pixie::cli::{self, Cli};
 use nix_pixie::ui::{self, Mode};
+use nix_pixie::{events, exit};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 
@@ -42,5 +43,18 @@ async fn main() -> Result<ExitCode> {
     }
     let result = cli::run(Cli::parse()).await;
     ui::finish();
-    result
+    let phase = exit::phase().name();
+    Ok(match result {
+        Ok(code) => {
+            events::exit(0, phase, None);
+            code
+        }
+        Err(error) => {
+            let code = exit::failure();
+            let message = format!("{error:#}");
+            events::exit(code, phase, Some(&message));
+            eprintln!("Error: {error:?}");
+            ExitCode::from(code)
+        }
+    })
 }

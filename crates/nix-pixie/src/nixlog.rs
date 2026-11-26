@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tracing::{debug, trace, warn};
 
 use crate::controller::human_size;
-use crate::ui;
+use crate::{events, ui};
 
 /// Activity types, `ActivityType` in Nix's `logging.hh`.
 mod kind {
@@ -277,6 +277,19 @@ impl Progress {
         parts.join(" · ")
     }
 
+    /// For a `progress` event.
+    pub fn event(&self) -> events::Progress {
+        let (bytes, paths, builds) = (self.bytes(), self.copies(), self.builds());
+        events::Progress {
+            bytes: bytes.done,
+            bytes_expected: bytes.expected,
+            paths: paths.done,
+            paths_expected: paths.expected,
+            builds: builds.done,
+            builds_expected: builds.expected,
+        }
+    }
+
     /// What was done, for when it is over: empty if nothing was.
     pub fn outcome(&self) -> String {
         let mut parts = Vec::new();
@@ -386,7 +399,7 @@ pub struct Output {
 /// otherwise its stderr is ours.
 pub async fn run(mut command: tokio::process::Command) -> Result<Output> {
     command.stdin(Stdio::null()).stdout(Stdio::piped());
-    if !ui::live() {
+    if !ui::live() && !events::enabled() {
         let output = command
             .stderr(Stdio::inherit())
             .output()
@@ -445,6 +458,7 @@ async fn follow(stderr: tokio::process::ChildStderr) -> std::io::Result<Progress
                 progress.feed(&event);
                 if updated.is_none_or(|t| t.elapsed() >= UPDATE_EVERY) {
                     ui::progress(progress.summary());
+                    events::progress(None, progress.event());
                     updated = Some(Instant::now());
                 }
             }
@@ -453,6 +467,7 @@ async fn follow(stderr: tokio::process::ChildStderr) -> std::io::Result<Progress
         }
     }
     ui::progress(progress.summary());
+    events::progress(None, progress.event());
     Ok(progress)
 }
 

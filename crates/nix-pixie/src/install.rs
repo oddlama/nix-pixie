@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::controller::{self, Approved, describe_disk, show_disk};
 use crate::discovery::{Method, Peer};
+use crate::exit;
 use crate::hooks::{self, Step};
 use crate::hostkey::{self, PublicKey};
 use crate::link::Link;
@@ -91,6 +92,7 @@ pub enum Then {
 
 /// Pairs with the target showing the code, and installs the machine onto it.
 pub async fn install(args: InstallArgs) -> Result<()> {
+    exit::reached(exit::Phase::Checking);
     // A typo in a given code fails at once.
     if let Some(code) = &args.code {
         controller::target_code(code)?;
@@ -129,6 +131,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         targets: &args.targets,
         relays: &args.relays,
     };
+    exit::reached(exit::Phase::Pairing);
     let step = ui::start_with("pair", search.looking(code));
     let (endpoint, mut discovery) = search.start(code).await?;
     let result = tokio::select! {
@@ -137,6 +140,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
                 &endpoint, &mut discovery, code, args.timeout,
             )
             .await?;
+            exit::reached(exit::Phase::Paired);
             step.done(controller::describe_peer(&conn, &peer));
             let link = Link::new(&endpoint, &peer, conn, stream);
             let result = session(&link, &peer, &metadata, &args, requested, programs).await;
@@ -951,6 +955,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
     };
     let step = ui::start("finish");
     let live = finish(link, &root, &disko.zpools, shutdown).await?;
+    exit::reached(exit::Phase::Installed);
     step.done(match shutdown {
         Shutdown::Reboot => "rebooting",
         Shutdown::PowerOff => "powering off",
@@ -1428,6 +1433,7 @@ async fn prepare_disks(link: &Link, choices: &[Choice], labels: Vec<String>) -> 
 
 /// Runs disko on the target. Its output is kept, and shown if it fails.
 async fn run_disko(link: &Link, script: &str, key_files: Vec<KeyFile>) -> Result<()> {
+    exit::reached(exit::Phase::Erasing);
     let request = ControllerMsg::RunDisko {
         script: script.into(),
         key_files,
