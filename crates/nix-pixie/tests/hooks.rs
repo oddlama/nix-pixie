@@ -183,6 +183,6 @@ fn outputs_are_files_disk_keys_and_a_host_key() {
     // A typo is an error, not silently ignored.
     std::fs::create_dir(out.join("file")).unwrap();
     let err = format!("{:#}", collect_outputs(&out).unwrap_err());
-    assert!(err.contains("files/, disk-keys/ and host-key"), "{err}");
+    assert!(err.contains("file: a hook's outputs are files/,"), "{err}");
     std::fs::remove_dir_all(&out).unwrap();
 }

@@ -233,15 +233,45 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// A file for the installed system, e.g. a secret a hook produced. Its
-/// contents are wiped from memory when dropped and never shown by `Debug`.
+/// A file for the installed system, e.g. a secret a hook produced, or a
+/// directory. Its contents are wiped from memory when dropped and never
+/// shown by `Debug`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacedFile {
     /// Absolute path as the installed system sees it.
     pub path: String,
     /// Permission bits; the agent drops setuid, setgid and sticky.
     pub mode: u32,
+    /// A directory, created if missing and given the mode and owner, rather
+    /// than a file. Without contents.
+    pub directory: bool,
+    /// Its owner and group; `None`: root.
+    pub user: Option<Account>,
+    pub group: Option<Account>,
     pub contents: Zeroizing<Vec<u8>>,
+}
+
+impl PlacedFile {
+    /// A file owned by root.
+    #[must_use]
+    pub fn file(path: String, mode: u32, contents: Zeroizing<Vec<u8>>) -> Self {
+        Self {
+            path,
+            mode,
+            directory: false,
+            user: None,
+            group: None,
+            contents,
+        }
+    }
+}
+
+/// A user or group: by number, or by name in the installed system, which
+/// only has its users and groups once it is installed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Account {
+    Id(u32),
+    Name(String),
 }
 
 impl fmt::Debug for PlacedFile {
@@ -249,6 +279,9 @@ impl fmt::Debug for PlacedFile {
         f.debug_struct("PlacedFile")
             .field("path", &self.path)
             .field("mode", &format_args!("{:o}", self.mode))
+            .field("directory", &self.directory)
+            .field("user", &self.user)
+            .field("group", &self.group)
             .field("contents", &format_args!("<{} bytes>", self.contents.len()))
             .finish()
     }

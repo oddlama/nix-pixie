@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
-use nix_pixie_proto::ctrl::PlacedFile;
+use nix_pixie_proto::ctrl::{Account, PlacedFile};
 use tokio::process::Command;
 use tracing::info;
 
@@ -196,7 +196,11 @@ pub async fn install(
 pub fn place_files(root: &str, files: &[PlacedFile]) -> Result<(), String> {
     check_root(root)?;
     let real_root = std::fs::canonicalize(root).map_err(|e| format!("{root}: {e}"))?;
-    for file in files {
+    // Directories first, so their modes and owners don't depend on the
+    // order the files came in.
+    let mut ordered: Vec<&PlacedFile> = files.iter().collect();
+    ordered.sort_by(|a, b| (!a.directory, &a.path).cmp(&(!b.directory, &b.path)));
+    for file in ordered {
         place_file(&real_root, root, file).map_err(|e| format!("{}: {e:#}", file.path))?;
     }
     info!(%root, files = files.len(), "placed files");
@@ -207,6 +211,9 @@ pub fn place_files(root: &str, files: &[PlacedFile]) -> Result<(), String> {
 /// `real_root`); the mount check is the caller's.
 pub fn place_file(real_root: &Path, root: &str, file: &PlacedFile) -> Result<()> {
     let target = below_root(root, &file.path)?;
+    if file.directory {
+        return place_directory(real_root, root, &target, file);
+    }
     let dir = target.parent().context("no parent directory")?;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -230,7 +237,74 @@ pub fn place_file(real_root: &Path, root: &str, file: &PlacedFile) -> Result<()>
     std::io::Write::write_all(&mut out, &file.contents)?;
     // Exactly these bits, whatever the umask.
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
-    Ok(())
+    set_owner(root, &target, file)
+}
+
+/// A directory of [`place_file`]: created if missing, and given its mode
+/// and owner either way.
+fn place_directory(real_root: &Path, root: &str, target: &Path, file: &PlacedFile) -> Result<()> {
+    let parent = target.parent().context("no parent directory")?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+    if !std::fs::canonicalize(parent)?.starts_with(real_root) {
+        bail!("leads outside the installed system (through a symlink)");
+    }
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => bail!("is there already, and not a directory"),
+        Err(_) => std::fs::DirBuilder::new()
+            .mode(file.mode & 0o777)
+            .create(target)?,
+    }
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(file.mode & 0o777))?;
+    set_owner(root, target, file)
+}
+
+/// Gives `path` the owner and group `file` asks for. Names are looked up
+/// in the installed system under `root`, which has its users and groups
+/// once it is installed.
+fn set_owner(root: &str, path: &Path, file: &PlacedFile) -> Result<()> {
+    if file.user.is_none() && file.group.is_none() {
+        return Ok(());
+    }
+    let user = file
+        .user
+        .as_ref()
+        .map(|account| account_id(root, "etc/passwd", "user", account))
+        .transpose()?;
+    let group = file
+        .group
+        .as_ref()
+        .map(|account| account_id(root, "etc/group", "group", account))
+        .transpose()?;
+    std::os::unix::fs::lchown(path, user, group).context("changing the owner")
+}
+
+/// The number of `account`, a user or group, from `database` (`etc/passwd`
+/// or `etc/group`) under `root`.
+fn account_id(root: &str, database: &str, what: &str, account: &Account) -> Result<u32> {
+    let name = match account {
+        Account::Id(id) => return Ok(*id),
+        Account::Name(name) => name,
+    };
+    let text = std::fs::read_to_string(Path::new(root).join(database)).unwrap_or_default();
+    text.lines()
+        .find_map(|line| {
+            let mut fields = line.split(':');
+            (fields.next() == Some(name.as_str()))
+                .then(|| fields.nth(1)?.parse::<u32>().ok())
+                .flatten()
+        })
+        .with_context(|| {
+            format!(
+                "there is no {what} {name:?} in the installed system: users and groups exist \
+                 once it is installed (put the file into $PIXIE_OUT in a hook after `install`), \
+                 or give the number"
+            )
+        })
 }
 
 /// Unmounts everything under `root` and exports `zpools`, so the first boot

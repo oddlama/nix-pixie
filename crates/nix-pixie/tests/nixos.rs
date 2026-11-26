@@ -50,10 +50,8 @@ fn placed_files_get_exact_modes_and_stay_inside() {
     std::os::unix::fs::symlink(&outside, root.join("etc/static")).unwrap();
     let real_root = std::fs::canonicalize(&root).unwrap();
     let root_str = root.to_str().unwrap();
-    let file = |path: &str, mode: u32, contents: &[u8]| PlacedFile {
-        path: path.into(),
-        mode,
-        contents: Zeroizing::new(contents.to_vec()),
+    let file = |path: &str, mode: u32, contents: &[u8]| {
+        PlacedFile::file(path.into(), mode, Zeroizing::new(contents.to_vec()))
     };
 
     place_file(

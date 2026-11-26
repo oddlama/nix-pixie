@@ -15,13 +15,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context as _, Result, bail};
-use nix_pixie_proto::ctrl::PlacedFile;
+use nix_pixie_proto::ctrl::{Account, PlacedFile};
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
 use zeroize::Zeroizing;
 
 use crate::metadata::Hook;
-use crate::state::private_dir;
+use crate::state::private_ram_dir;
 use crate::target::{self, Target};
 use crate::ui;
 use crate::{nix, nixlog};
@@ -477,11 +477,15 @@ pub struct Outputs {
 /// and `host-key` is a mistake and refused.
 pub fn collect_outputs(out: &Path) -> Result<Outputs> {
     let mut outputs = Outputs::default();
+    let mut manifest = None;
     for entry in std::fs::read_dir(out).with_context(|| format!("reading {}", out.display()))? {
         let entry = entry?;
         let name = entry.file_name();
         match name.to_str() {
-            Some("files") => outputs.files = collect_files(&entry.path())?,
+            Some("files") => outputs.files.extend(collect_files(&entry.path())?),
+            Some("files.json") if entry.file_type()?.is_file() => {
+                manifest = Some(std::fs::read(entry.path())?);
+            }
             Some("disk-keys") => {
                 outputs.disk_keys = collect_files(&entry.path())?
                     .into_iter()
@@ -492,12 +496,102 @@ pub fn collect_outputs(out: &Path) -> Result<Outputs> {
                 outputs.host_key = Some(Zeroizing::new(std::fs::read(entry.path())?));
             }
             _ => bail!(
-                "{}: a hook's outputs are files/, disk-keys/ and host-key",
+                "{}: a hook's outputs are files/, files.json, disk-keys/ and host-key",
                 name.to_string_lossy()
             ),
         }
     }
+    if let Some(json) = manifest {
+        apply_manifest(&mut outputs.files, &json).context("files.json")?;
+    }
     Ok(outputs)
+}
+
+/// One entry of `$PIXIE_OUT/files.json`: what a file under `files/`, or a
+/// directory, should be like in the installed system.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestEntry {
+    /// Octal, e.g. `"0700"`.
+    mode: Option<String>,
+    user: Option<AccountSpec>,
+    group: Option<AccountSpec>,
+}
+
+/// A user or group as `files.json` names it.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AccountSpec {
+    Id(u32),
+    Name(String),
+}
+
+/// Applies `files.json` to `files`: modes and owners for the files listed,
+/// and a directory for every other path listed.
+pub fn apply_manifest(files: &mut Vec<PlacedFile>, json: &[u8]) -> Result<()> {
+    let manifest: BTreeMap<String, ManifestEntry> = serde_json::from_slice(json).context(
+        r#"expected {"/absolute/path": {"mode": "0700", "user": "name or id", "group": "name or id"}}"#,
+    )?;
+    for (path, entry) in manifest {
+        let plain = path.starts_with('/')
+            && path.len() > 1
+            && Path::new(&path)
+                .components()
+                .skip(1)
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !plain {
+            bail!("{path:?} is not an absolute, plain path");
+        }
+        let mode = entry
+            .mode
+            .as_deref()
+            .map(|mode| {
+                u32::from_str_radix(mode, 8)
+                    .ok()
+                    .filter(|m| *m <= 0o777)
+                    .with_context(|| format!("{path}: mode {mode:?} is not octal permission bits"))
+            })
+            .transpose()?;
+        let account = |spec: Option<AccountSpec>| -> Result<Option<Account>> {
+            Ok(match spec {
+                None => None,
+                Some(AccountSpec::Id(id)) => Some(Account::Id(id)),
+                Some(AccountSpec::Name(name)) => {
+                    let valid = name.len() <= 32
+                        && name
+                            .bytes()
+                            .next()
+                            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+                    if !valid {
+                        bail!("{path}: {name:?} is not a user or group name");
+                    }
+                    Some(Account::Name(name))
+                }
+            })
+        };
+        let (user, group) = (account(entry.user)?, account(entry.group)?);
+        if let Some(file) = files.iter_mut().find(|f| f.path == path) {
+            if let Some(mode) = mode {
+                file.mode = mode;
+            }
+            file.user = user;
+            file.group = group;
+        } else {
+            files.push(PlacedFile {
+                path,
+                mode: mode.unwrap_or(0o755),
+                directory: true,
+                user,
+                group,
+                contents: Zeroizing::new(Vec::new()),
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(())
 }
 
 /// Runs one hook's program, in `dir`, on the operator's terminal (its stdout
@@ -511,7 +605,8 @@ async fn run(
     context: &Context,
     target: Option<Target<'_>>,
 ) -> Result<Outputs> {
-    let scratch = private_dir()?;
+    // Outputs may be secrets: in RAM only.
+    let scratch = private_ram_dir()?;
     let result = async {
         let mut json = serde_json::to_value(context)?;
         if let Some(object) = json.as_object_mut() {
@@ -602,11 +697,11 @@ pub fn collect_files(root: &Path) -> Result<Vec<PlacedFile>> {
                 let Some(relative) = relative.to_str() else {
                     bail!("{} is not UTF-8", relative.display());
                 };
-                files.push(PlacedFile {
-                    path: format!("/{relative}"),
-                    mode: meta.permissions().mode() & 0o777,
-                    contents: Zeroizing::new(std::fs::read(&path)?),
-                });
+                files.push(PlacedFile::file(
+                    format!("/{relative}"),
+                    meta.permissions().mode() & 0o777,
+                    Zeroizing::new(std::fs::read(&path)?),
+                ));
             } else {
                 bail!(
                     "{}: only regular files can go into the installed system",

@@ -62,6 +62,47 @@ pub fn private_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Like [`private_dir`], but in RAM, for what may be secrets, such as a
+/// hook's outputs: in `$XDG_RUNTIME_DIR`, `/run/user/<uid>` or `/dev/shm`,
+/// whichever is on tmpfs first.
+pub fn private_ram_dir() -> Result<PathBuf> {
+    let mountinfo =
+        std::fs::read_to_string("/proc/self/mountinfo").context("reading /proc/self/mountinfo")?;
+    let uid = rustix::process::getuid().as_raw();
+    let candidates = [
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        Some(PathBuf::from(format!("/run/user/{uid}"))),
+        Some(PathBuf::from("/dev/shm")),
+    ];
+    let base = candidates
+        .into_iter()
+        .flatten()
+        .filter(|p| p.is_absolute() && p.is_dir())
+        .find(|p| in_ram(p, &mountinfo))
+        .with_context(|| {
+            format!(
+                "hooks' outputs may be secrets, which must not touch a disk, but none of \
+                 $XDG_RUNTIME_DIR, /run/user/{uid} and /dev/shm is on tmpfs"
+            )
+        })?;
+    let suffix: u64 = rand::random();
+    let dir = base.join(format!("nix-pixie-{}-{suffix:016x}", std::process::id()));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Whether `path` is on a filesystem in RAM, by `mountinfo`.
+pub fn in_ram(path: &Path, mountinfo: &str) -> bool {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    crate::store::mounts(mountinfo)
+        .filter(|(point, _)| path.starts_with(point))
+        .max_by_key(|(point, _)| point.components().count())
+        .is_some_and(|(_, fstype)| matches!(fstype.as_str(), "tmpfs" | "ramfs" | "rootfs"))
+}
+
 /// Atomically replaces `path` with `contents` plus a newline, mode 0600.
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
     let name = path.file_name().context("path has no file name")?;
