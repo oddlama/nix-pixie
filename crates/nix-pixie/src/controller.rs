@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,6 +18,7 @@ use nix_pixie_proto::ctrl::{ControllerMsg, MAX_TARGET_FRAME, TargetMsg};
 use nix_pixie_proto::frame::read_frame;
 use nix_pixie_proto::inventory::{Disk, Inventory};
 use nix_pixie_proto::pair::{PairError, Side};
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::agent::MAX_FAILURES;
@@ -88,10 +90,7 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     }
 
     ui::steps(pair_steps(false, !args.push.is_empty()));
-    let code = match given {
-        Some(code) => code,
-        None => ui::code::ask_target_code().await?,
-    };
+    let code = code_or_ask(given, args.method, &args.targets).await?;
     let nameplate = code.nameplate().context(ui::code::NAMEPLATE_NEEDED)?;
     let search = Search {
         identity: &args.identity,
@@ -116,6 +115,66 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     discovery.shutdown();
     endpoint.close().await;
     result
+}
+
+/// Targets nearby that show a code, as discovery finds them while the
+/// operator types one: for completing nameplates.
+pub struct Nearby {
+    pub found: Arc<Mutex<ui::code::Nearby>>,
+    stop: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Nearby {
+    /// Looks around with `method`, or asks `targets` only.
+    pub fn start(method: Method, targets: &[String]) -> Self {
+        let found = Arc::new(Mutex::new(ui::code::Nearby::new()));
+        let (stop, mut stopped) = oneshot::channel();
+        let (into, targets) = (found.clone(), targets.to_vec());
+        let task = tokio::spawn(async move {
+            let Ok(targets) = discovery::resolve_targets(&targets).await else {
+                return;
+            };
+            let Ok(mut discovery) = Discovery::start(method, targets).await else {
+                return;
+            };
+            loop {
+                tokio::select! {
+                    peer = discovery.next() => match peer {
+                        Ok(peer) => {
+                            if let Pairing::ShowsCode { nameplate } = peer.pairing
+                                && let Ok(mut found) = into.lock()
+                            {
+                                found.insert(nameplate, peer.label);
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                    _ = &mut stopped => break,
+                }
+            }
+            discovery.shutdown();
+        });
+        Self { found, stop, task }
+    }
+
+    /// Stops looking.
+    pub async fn stop(self) {
+        let _ = self.stop.send(());
+        let _ = self.task.await;
+    }
+}
+
+/// The code shown on the target: as given, or asked for on the terminal
+/// with nameplates completing from the targets nearby.
+pub async fn code_or_ask(given: Option<Code>, method: Method, targets: &[String]) -> Result<Code> {
+    if let Some(code) = given {
+        return Ok(code);
+    }
+    let nearby = Nearby::start(method, targets);
+    let asked = ui::code::ask_target_code(nearby.found.clone()).await;
+    nearby.stop().await;
+    asked
 }
 
 /// A target's code as given on the command line.

@@ -112,10 +112,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         None
     };
 
-    let code = match given {
-        Some(code) => code,
-        None => ui::code::ask_target_code().await?,
-    };
+    let code = controller::code_or_ask(given, args.method, &args.targets).await?;
     let nameplate = code.nameplate().context(ui::code::NAMEPLATE_NEEDED)?;
     let search = controller::Search {
         identity: &args.identity,

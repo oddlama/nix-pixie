@@ -47,6 +47,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     import json
     import re
+    import time
 
     def as_alice(cmd):
         return f"su - alice -c '{cmd}'"
@@ -130,9 +131,10 @@ pkgs.testers.runNixOSTest {
             return next(word[:n] for n in range(1, len(word) + 1) if [w for w in words if w.startswith(word[:n])] == [word])
 
         nameplate, first, second, third = code.split("-")
-        # For printf: Tab, Enter (\\r) and Backspace (\\177).
+        # For printf: Tab, Enter (\\r) and Backspace (\\177). The nameplate
+        # completes from the targets found meanwhile.
         keys = (
-            f"{nameplate}-{shortest(first)}\\t{shortest(second)}\\t"
+            f"{nameplate[:3]}\\t{shortest(first)}\\t{shortest(second)}\\t"
             # A typo: Enter refuses it, and it is taken back.
             + "zzz\\r\\177\\177\\177"
             + f"{shortest(third)}\\t\\r"
@@ -145,6 +147,7 @@ pkgs.testers.runNixOSTest {
             + " script --quiet --return --flush --command 'nix-pixie controller pair --yes' /dev/null"
         )
         controller.wait_until_succeeds("grep -q 'Code shown on the target' /tmp/typed.out", timeout=60)
+        time.sleep(5)
         controller.succeed(f"printf '{keys}' 1<>/tmp/keys")
         try:
             controller.wait_until_succeeds("systemctl show -P SubState typed-pair | grep -qx -e exited -e failed -e dead", timeout=60)

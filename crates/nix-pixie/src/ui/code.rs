@@ -3,10 +3,13 @@
 //! Enter without losing what was typed. Unlike `--code`, the code never
 //! shows up in the shell's history or the process list.
 //!
-//! Completion only uses the public wordlist, so it reveals nothing about
-//! the code. Nothing typed is kept: there is no history.
+//! Completion only uses public things: the wordlist, and the nameplates of
+//! targets nearby, which they announce anyway. It reveals nothing about the
+//! code. Nothing typed is kept: there is no history.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, bail};
 use nix_pixie_proto::code::{Code, WORDS, completions};
@@ -52,11 +55,23 @@ fn current(line: &str, pos: usize) -> (usize, &str) {
     (start, before.get(start..).unwrap_or_default())
 }
 
-/// The words a Tab at `pos` may complete to, and where they go. Each ends
-/// with a `-` unless it is the code's last word.
+/// Targets nearby that show a code: nameplate and label.
+pub type Nearby = BTreeMap<u32, String>;
+
+/// What a Tab at `pos` may complete to, where it goes, and how each is
+/// listed: the nameplates of targets `nearby` at the start, words after.
+/// Each ends with a `-` unless it is the code's last word.
 #[must_use]
-pub fn complete(line: &str, pos: usize) -> (usize, Vec<String>) {
+pub fn complete(line: &str, pos: usize, nearby: &Nearby) -> (usize, Vec<(String, String)>) {
     let (start, token) = current(line, pos);
+    if start == 0 && kind(token) == Token::Nameplate {
+        let found = nearby
+            .iter()
+            .filter(|(nameplate, _)| nameplate.to_string().starts_with(token))
+            .map(|(nameplate, label)| (format!("{nameplate}-"), format!("{nameplate}  {label}")))
+            .collect();
+        return (start, found);
+    }
     if token.is_empty() || kind(token) == Token::Nameplate {
         return (start, Vec::new());
     }
@@ -69,18 +84,29 @@ pub fn complete(line: &str, pos: usize) -> (usize, Vec<String>) {
     let dash = if words_before + 1 < WORDS { "-" } else { "" };
     let words = completions(token)
         .iter()
-        .map(|word| format!("{word}{dash}"))
+        .map(|word| (format!("{word}{dash}"), (*word).to_string()))
         .collect();
     (start, words)
 }
 
-/// The rest of the only word the token at the end of `line` can become.
+/// The rest of the only word (or nearby nameplate) the token at the end of
+/// `line` can become.
 #[must_use]
-pub fn hint(line: &str, pos: usize) -> Option<String> {
+pub fn hint(line: &str, pos: usize, nearby: &Nearby) -> Option<String> {
     if pos != line.len() {
         return None;
     }
-    let (_, token) = current(line, pos);
+    let (start, token) = current(line, pos);
+    if start == 0 && !token.is_empty() && kind(token) == Token::Nameplate {
+        let mut found = nearby
+            .keys()
+            .map(ToString::to_string)
+            .filter(|nameplate| nameplate.starts_with(token));
+        return match (found.next(), found.next()) {
+            (Some(only), None) => only.get(token.len()..).map(str::to_string),
+            _ => None,
+        };
+    }
     match completions(token) {
         [word] if !token.is_empty() && kind(token) == Token::Word => {
             word.get(token.len()..).map(str::to_string)
@@ -102,6 +128,13 @@ pub fn invalid(line: &str) -> Option<String> {
 /// The editor's helper for a code.
 struct CodeHelper {
     colors: bool,
+    nearby: Arc<Mutex<Nearby>>,
+}
+
+impl CodeHelper {
+    fn nearby(&self) -> Nearby {
+        self.nearby.lock().map_or_default(|n| n.clone())
+    }
 }
 
 impl Completer for CodeHelper {
@@ -113,12 +146,12 @@ impl Completer for CodeHelper {
         pos: usize,
         _: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let (start, words) = complete(line, pos);
-        let pairs = words
+        let (start, found) = complete(line, pos, &self.nearby());
+        let pairs = found
             .into_iter()
-            .map(|word| Pair {
-                display: word.trim_end_matches('-').to_string(),
-                replacement: word,
+            .map(|(replacement, display)| Pair {
+                display,
+                replacement,
             })
             .collect();
         Ok((start, pairs))
@@ -129,7 +162,7 @@ impl Hinter for CodeHelper {
     type Hint = String;
 
     fn hint(&self, line: &str, pos: usize, _: &Context<'_>) -> Option<String> {
-        hint(line, pos)
+        hint(line, pos, &self.nearby())
     }
 }
 
@@ -187,12 +220,13 @@ impl Validator for CodeHelper {
 
 impl rustyline::Helper for CodeHelper {}
 
-/// Asks for the code shown on the target, on the terminal.
+/// Asks for the code shown on the target, on the terminal. Nameplates
+/// complete from the targets `nearby`, as they are found meanwhile.
 ///
 /// # Errors
 ///
 /// Without a terminal, or if the operator gives up (Ctrl-C, Ctrl-D).
-pub async fn ask_target_code() -> Result<Code> {
+pub async fn ask_target_code(nearby: Arc<Mutex<Nearby>>) -> Result<Code> {
     if !super::interactive() {
         bail!("--code is needed when not running on a terminal");
     }
@@ -208,7 +242,7 @@ pub async fn ask_target_code() -> Result<Code> {
             .build();
         let mut editor = Editor::<CodeHelper, DefaultHistory>::with_config(config)
             .context("starting the code prompt")?;
-        editor.set_helper(Some(CodeHelper { colors }));
+        editor.set_helper(Some(CodeHelper { colors, nearby }));
         match editor.readline("Code shown on the target: ") {
             Ok(line) => Ok(line),
             Err(ReadlineError::Interrupted) => bail!("interrupted"),
