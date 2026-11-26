@@ -202,7 +202,16 @@ pub async fn gather(
     let mut missing = Vec::new();
     for need in needs {
         if let Some(contents) = provided.remove(&need.path) {
-            check(&need, &contents).map_err(|reason| {
+            // A hook may provide an empty passphrase on purpose: a bootstrap
+            // one, replaced on the first boot (by a TPM, say).
+            let empty_passphrase =
+                contents.is_empty() && matches!(need.kind, Kind::Passphrase { .. });
+            let checked = if empty_passphrase {
+                Ok(())
+            } else {
+                check(&need, &contents)
+            };
+            checked.map_err(|reason| {
                 anyhow::anyhow!("the key a hook provided for {}: {reason}", need.path)
             })?;
             files.push(KeyFile {
