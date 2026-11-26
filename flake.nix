@@ -123,10 +123,10 @@
             };
 
             packages = {
-              default = lib.addMetaAttrs {
-                mainProgram = "nix-pixie";
-                license = lib.licenses.mit;
-              } config.nci.outputs.nix-pixie.packages.release;
+              # With nixpkgs' Rust rather than nci, so installer images can
+              # build it from their own nixpkgs, for their own platform
+              # (see nix/package.nix).
+              default = pkgs.callPackage ./nix/package.nix { };
 
               # The agent for live systems that aren't our installer, e.g. a
               # cloud provider's NixOS ISO: `sudo nix run github:oddlama/nix-pixie#agent`.
