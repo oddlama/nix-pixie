@@ -159,9 +159,25 @@ pkgs.testers.runNixOSTest {
         result = controller.succeed("systemctl show -P Result pixie-install").strip()
         assert result == "success", f"the install failed ({result}):\n{install_output()}"
 
-    with subtest("the ISO installs and powers off"):
+    with subtest("tty1 shows the code, and takes commands"):
         target.wait_for_file("/run/nix-pixie/code")
         code = target.succeed("cat /run/nix-pixie/code").strip()
+        # The screen's text, row after row.
+        target.wait_until_succeeds(f"grep -qF 'Pairing code:  {code}' /dev/vcs1", timeout=60)
+        target.succeed("grep -qF 'Alt+F2: a shell (tty2)' /dev/vcs1")
+        target.fail("systemctl is-active getty@tty1.service")
+        # No relay is in reach here: typed on tty1, `relay off` gets a
+        # short code for this network instead.
+        target.send_chars("relay off\n")
+        target.wait_until_succeeds(f"test -s /run/nix-pixie/code && test \"$(cat /run/nix-pixie/code)\" != {code}")
+        code = target.succeed("cat /run/nix-pixie/code").strip()
+        assert len(code.split("-")[0]) <= 2, code
+        target.wait_until_succeeds(f"grep -qF 'Pairing code:  {code}' /dev/vcs1", timeout=30)
+        target.succeed("grep -qF 'now using no relay' /dev/vcs1")
+        status = target.succeed("pixie relay")
+        assert "No relays: only controllers on this network" in status, status
+
+    with subtest("the ISO installs and powers off"):
         controller.succeed(
             "systemd-run --unit=pixie-install --remain-after-exit --uid=alice"
             + " --working-directory=/home/alice/repo -E HOME=/home/alice"

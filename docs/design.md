@@ -987,10 +987,20 @@ the repository, at points of the install.
 UDP 47011/47012/5353). Boots to tty1 with the pairing code, about 10 s after
 the boot menu in QEMU.
 
-**Relays at runtime** (implemented): `pixie relay URL…|off|n0|default`
-(`nix-pixie relay`, through `sudo` for the ISO's user) goes over the agent's
+**tty1** (implemented: `nix-pixie console`, `services.nix-pixie-agent.console`,
+on in the installer) replaces the login prompt there with the agent's screen:
+the code and the controller's command line, how the relay stands, the latest
+messages, and a prompt for commands. It reads the agent's state over its
 control socket (`control.sock` in the state directory, which only root can
-enter). The agent takes it only while it
+enter), so either restarts without the other. Kernel messages go to tty12
+(`setterm --msgredirect`) and the agent's output only to the journal, so
+nothing scribbles over the screen; tty2 keeps its shell. Messages are what
+the agent prints anyway, kept as a list (`screen.rs`), not a second channel
+of its own.
+
+**Relays at runtime** (implemented): `relay URL…|off|n0|default`, typed on
+tty1 or as `pixie relay …` (`nix-pixie relay`, through `sudo` for the
+ISO's user), goes over the same socket. The agent takes it only while it
 waits for a controller, never while one pairs or is paired, which it
 refuses: changing relays means a new endpoint (with the same key) and a new
 code, since with relays or without them nameplates differ. The choice is
@@ -1028,7 +1038,8 @@ finds it; the open ports then are what gives a controller behind NAT a
 direct path to a server with a public address, without any hole punching.
 
 - Extends `installation-cd-minimal` and `netboot-minimal` and adds:
-  - the agent service, plus agent UI on tty1 (pairing code, status, logs)
+  - the agent service, plus agent UI on tty1 (pairing code, status, logs;
+    done, see above)
   - getty on tty2+ for manual debugging
   - `nix-grpc-daemon` and `nixos-facter`
 

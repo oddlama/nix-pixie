@@ -51,6 +51,17 @@ in
       '';
     };
 
+    console.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether tty1 shows the agent's code, relay and messages, with a
+        prompt for commands like `relay URL` (`nix-pixie console`), instead
+        of a login prompt. Kernel messages go to tty12 then, and the agent's
+        output only to the journal, so nothing scribbles over it.
+      '';
+    };
+
     relay = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -121,14 +132,41 @@ in
         # disks it formatted, or their mounts would keep it from formatting
         # them again.
         RuntimeDirectoryPreserve = true;
-        # The pairing code is printed on stdout: show it on the console too.
-        StandardOutput = "journal+console";
+        # The pairing code is printed on stdout: show it on the console too,
+        # unless tty1 shows it already.
+        StandardOutput = if cfg.console.enable then "journal" else "journal+console";
         Restart = "always";
         RestartSec = 2;
       };
     };
 
     environment.systemPackages = [ pixie ];
+
+    systemd.services.nix-pixie-console = lib.mkIf cfg.console.enable {
+      description = "nix-pixie on tty1";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "nix-pixie-agent.service"
+        "systemd-user-sessions.service"
+      ];
+      conflicts = [ "getty@tty1.service" ];
+      serviceConfig = {
+        # Kernel messages to tty12, not over the screen; `-`: a console
+        # that isn't a VT (a serial one) has none to redirect.
+        ExecStartPre = "-${pkgs.util-linux}/bin/setterm --msgredirect 12";
+        ExecStart = "${exe} console";
+        StandardInput = "tty";
+        StandardOutput = "tty";
+        TTYPath = "/dev/tty1";
+        TTYReset = true;
+        TTYVHangup = true;
+        TTYVTDisallocate = true;
+        Restart = "always";
+        RestartSec = 1;
+      };
+    };
+    systemd.services."getty@tty1".enable = lib.mkIf cfg.console.enable false;
+    systemd.services."autovt@tty1".enable = lib.mkIf cfg.console.enable false;
 
     networking.firewall = lib.mkIf cfg.openFirewall {
       allowedUDPPorts = [

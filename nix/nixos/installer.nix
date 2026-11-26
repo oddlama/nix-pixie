@@ -82,7 +82,10 @@ in
     ./storage.nix
   ];
 
-  services.nix-pixie-agent.enable = true;
+  services.nix-pixie-agent = {
+    enable = true;
+    console.enable = lib.mkDefault true;
+  };
 
   # Wired links belong to networkd. The NixOS installer profile also enables
   # NetworkManager (for `nmtui` and Wi-Fi), which would otherwise manage them

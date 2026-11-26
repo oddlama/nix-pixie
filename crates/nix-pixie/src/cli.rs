@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::net::Relays;
-use crate::{agent, control, controller, discovery, identity, install, target};
+use crate::{agent, console, control, controller, discovery, identity, install, target};
 
 /// The command line.
 #[derive(Debug, Parser)]
@@ -76,6 +76,13 @@ pub enum Command {
         /// relays) or `default` (as the agent was started). Without any,
         /// how the relay stands.
         setting: Vec<String>,
+        /// The agent's state directory.
+        #[arg(long, default_value = "/run/nix-pixie")]
+        state_dir: PathBuf,
+    },
+    /// The installer's tty1: the agent's code, relay and messages, and a
+    /// prompt for commands like `relay URL`.
+    Console {
         /// The agent's state directory.
         #[arg(long, default_value = "/run/nix-pixie")]
         state_dir: PathBuf,
@@ -256,6 +263,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             .await
         }
         Command::Relay { setting, state_dir } => relay(&state_dir, &setting).await,
+        Command::Console { state_dir } => console::run(state_dir).await,
         Command::Netboot => bail!("netboot is not implemented yet"),
         Command::Target {
             command: TargetCommand::Exec { chroot, command },

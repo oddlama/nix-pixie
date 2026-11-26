@@ -173,11 +173,14 @@ packages.x86_64-linux.installer =
 ## 🧭 Usage
 
 Boot the target from the installer and plug it into your network. After a few
-seconds it shows a code:
+seconds its screen shows a code:
 
 ```
-    nix-pixie pairing code:  482913-acid-acorn-acre
+Pairing code:  482913-acid-acorn-acre
 ```
+
+The screen also says whether the target reaches its relay and what happens
+during the install. Alt+F2 gets you a shell, and kernel messages are on tty12.
 
 Now run the controller in your flake's repository, on your own machine and as
 your normal user:
@@ -260,8 +263,8 @@ or none at all:
 - **Your own relay:** `--relay https://relay.example.org` on the controller,
   and `services.nix-pixie-agent.relay.urls` in the installer image. Both sides
   need the same one, so the target shows the flag next to its code. On a
-  running target, run `pixie relay https://relay.example.org` in a shell there
-  (Alt+F2). It shows a new code
+  running target, type `relay https://relay.example.org` on its screen, or run
+  `pixie relay https://relay.example.org` in a shell there. It shows a new code
   and keeps the relay until it reboots; `relay off` leaves only the local
   network, `relay n0` takes n0's relays, and `relay default` goes back.
 - **No relay:** `--no-relay` and `services.nix-pixie-agent.relay.enable = false`.
