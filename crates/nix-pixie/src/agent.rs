@@ -33,6 +33,7 @@ use crate::mdns::{self, Mdns};
 use crate::net::{self, Relays, Stream};
 use crate::nixos;
 use crate::probe::Responder;
+use crate::relay_status::{self, Reach};
 use crate::rendezvous::Rendezvous;
 use crate::state::StateDir;
 use crate::store;
@@ -78,12 +79,12 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     }
 
     let state = StateDir::create(args.state_dir)?;
-    // A controller's code has no nameplate to meet at: without one, relays
     // From an earlier run of the agent during this boot: the disks it
     // formatted and the host key it made carry over, its session doesn't.
     for stale in ["code", "paired-controller", "approved", "relay"] {
         state.remove(stale);
     }
+    // A controller's code has no nameplate to meet at: without one, relays
     // are of no use.
     let relays = if controller_code.is_some() {
         Relays::Disabled
@@ -99,11 +100,23 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     state.write("endpoint-id", &endpoint.id().to_string())?;
     info!(id = %endpoint.id(), port = net::bound_port(&endpoint)?, "agent started");
 
+    let (reach, watching) = if relays.is_enabled() {
+        let (shown, reach) = watch::channel(Reach::Trying);
+        let task = tokio::spawn(relay_status::watch(
+            endpoint.clone(),
+            relays.to_string(),
+            shown,
+        ));
+        (Some(reach), Some(task))
+    } else {
+        (None, None)
+    };
     let mut announcer = Announcer {
         endpoint: &endpoint,
         mdns: &mdns,
         probe: &announce_tx,
         relays: &relays,
+        reach,
         state: &state,
         advertised: None,
         rendezvous: None,
@@ -118,6 +131,9 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         () = crate::shutdown_signal() => Ok(()),
     };
     announcer.withdraw().await;
+    if let Some(task) = watching {
+        task.abort();
+    }
     responder.abort();
     mdns.shutdown();
     endpoint.close().await;
@@ -131,6 +147,8 @@ struct Announcer<'a> {
     mdns: &'a Mdns,
     probe: &'a watch::Sender<Option<Announcement>>,
     relays: &'a Relays,
+    /// Whether the relay is reachable, with relays.
+    reach: Option<watch::Receiver<Reach>>,
     state: &'a StateDir,
     advertised: Option<String>,
     rendezvous: Option<Rendezvous>,
@@ -178,6 +196,14 @@ impl Announcer<'_> {
         }
     }
 
+    /// How the relay stands, as a line of the code's banner (nothing
+    /// without relays).
+    fn relay_line(&self) -> String {
+        self.reach.as_ref().map_or_else(String::new, |reach| {
+            format!("    {}\n", reach.borrow().line(&self.relays.to_string()))
+        })
+    }
+
     /// What the controller needs besides the code to find us.
     fn controller_flags(&self) -> String {
         match self.relays {
@@ -202,8 +228,9 @@ async fn show_code(announcer: &mut Announcer<'_>, state: &StateDir) -> Result<()
         announcer.announce(Pairing::ShowsCode { nameplate }).await?;
         state.write("code", &code.to_string())?;
         println!(
-            "\n    nix-pixie pairing code:  {code}\n\n    On the controller: nix-pixie controller pair --code {code}{}\n",
-            announcer.controller_flags()
+            "\n    nix-pixie pairing code:  {code}\n\n    On the controller: nix-pixie controller pair --code {code}{}\n{}",
+            announcer.controller_flags(),
+            announcer.relay_line()
         );
 
         let paired = accept_pairing(endpoint, &code, Side::OwnsCode).await;

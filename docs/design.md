@@ -283,8 +283,12 @@ is the code. (`crates/nix-pixie/src/rendezvous.rs`,
   all 900,000; what they get is a machine to guess codes at, three per code
   with growing pauses (§2).
 - **No relay in reach** (airgapped, or a captive network): the code shows
-  right away, the agent logs after 15 s that only controllers on its network
-  will find it, and keeps trying. The controller's error lists the relays
+  right away, and after 15 s the target's screen says that only controllers
+  on its network will find it; it keeps trying. Its screen tells every
+  change (`relay_status.rs`): reachable, not reachable with the last error,
+  lost and back, and each code shown says how things stand. 15 s without the
+  relay count as unreachable, so a network that is still coming up or a
+  relay that restarts doesn't alarm anybody. The controller's error lists the relays
   next to DNS-SD and probes: `relay: this machine reached none of n0's
   public relays`, or `no target waiting at …`.
 - **Direct paths.** Through the relay the two exchange their addresses and

@@ -165,6 +165,22 @@ pkgs.testers.runNixOSTest {
             f" | grep -F -- 'nix-pixie controller pair --code {code} --relay {relay_url}/'"
         )
 
+    def screen_says(text, times=1):
+        target.wait_until_succeeds(
+            f"test $(journalctl -u nix-pixie-agent -o cat | grep -c -F -- '{text}') -ge {times}",
+            timeout=120,
+        )
+
+    with subtest("the target says whether its relay is reachable, and when that changes"):
+        reachable = f"Relay: {relay_url}/ is reachable, so controllers on other networks can find this machine."
+        screen_says(reachable)
+        relay.succeed("systemctl stop iroh-relay")
+        screen_says(f"Relay: {relay_url}/ is not reachable (")
+        screen_says("Until it is, only controllers on this network can find this machine.")
+        relay.succeed("systemctl start iroh-relay")
+        relay.wait_for_open_port(3340)
+        screen_says(reachable, times=2)
+
     with subtest("without the relay the controller finds nobody, and says where it looked"):
         out = controller.fail(as_alice(f"nix-pixie controller pair --code {code} --no-relay --timeout 5") + " 2>&1")
         assert "no target with nameplate" in out and "only found with --target" in out, out

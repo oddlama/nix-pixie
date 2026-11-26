@@ -33,6 +33,7 @@ pub mod plan;
 pub mod preflight;
 pub mod probe;
 pub mod push;
+pub mod relay_status;
 pub mod rendezvous;
 pub mod secrets;
 pub mod state;

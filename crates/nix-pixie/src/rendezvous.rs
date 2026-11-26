@@ -141,8 +141,9 @@ async fn wait(
         .await
         .is_err()
     {
-        info!(
-            "no relay reachable{}; until one is, only controllers on this network find this machine",
+        // The operator hears of it from `relay_status`.
+        debug!(
+            "no relay reachable{}; not at the rendezvous until one is",
             relay_error(agent).map_or_else(String::new, |e| format!(" ({e})"))
         );
         agent.online().await;
@@ -160,7 +161,7 @@ async fn wait(
     *bound = Some(endpoint.clone());
     endpoint.online().await;
     let relay = home_relay(agent).map_or_else(|| "a relay".to_string(), |url| url.to_string());
-    info!(%relay, "controllers on other networks can find this machine");
+    info!(%relay, "waiting at the rendezvous");
     state.write("relay", &relay)?;
 
     let mut askers = JoinSet::new();

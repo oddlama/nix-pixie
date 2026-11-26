@@ -244,7 +244,8 @@ A target announces itself in several ways and the controller automatically finds
   code (`482913`), and that is where the controller asks for it. Neither side
   needs an open port or a public address for this. Once they know each other
   they try to punch a direct connection through NATs and firewalls. If that
-  fails, the install goes through the relay, which works but is slow.
+  fails, the install goes through the relay, which works but is slow. The
+  target's screen says whether it reaches its relay, and when that changes.
 
 By default the relays are the public ones run by [n0](https://n0.computer), the
 makers of [iroh](https://github.com/n0-computer/iroh), which nix-pixie uses for
