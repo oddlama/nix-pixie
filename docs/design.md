@@ -1155,7 +1155,7 @@ Running them: `checks [PATTERN]` in the devshell builds the matching checks
 `nix flake check` evaluates all of them in one process, which needs more
 memory than a busy machine has; `checks` evaluates each on its own first.
 A layout test takes 2 to 4 minutes and about 3 GiB while it runs; all
-twenty-five checks take about 25 minutes with `JOBS=2`. The install tests fail
+twenty-six checks take about 30 minutes with `JOBS=2`. The install tests fail
 as soon as the install fails instead of waiting out their timeouts.
 
 On a machine that is busy with other things, use `JOBS=1`. NixOS test VMs run
