@@ -10,6 +10,8 @@
   rustPlatform,
   iproute2,
   openssh,
+  pkg-config,
+  zstd,
 }:
 rustPlatform.buildRustPackage {
   pname = "nix-pixie";
@@ -27,6 +29,9 @@ rustPlatform.buildRustPackage {
     # The iroh fork that keeps link-local scope ids (see docs/design.md).
     outputHashes."iroh-1.4.1" = "sha256-WbQy4tj/LJb/oJ6Sc3UoS1h5jkReV1dHwjLKp5ymBnE=";
   };
+  # zstd-sys links nixpkgs' libzstd rather than building its own.
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [ zstd ];
   cargoBuildFlags = [
     "--package"
     "nix-pixie"
