@@ -1,7 +1,7 @@
 # nix-pixie, built with nixpkgs' Rust: the flake's package, and the agent of
-# installer images (also cross-compiled, from the image's own nixpkgs). It
-# takes nothing but nixpkgs, so a test VM evaluates it to the same
-# derivation as the host that prebuilt it.
+# installer images (also cross-compiled, from the image's own nixpkgs, for a
+# device of another platform). It takes nothing but nixpkgs, so a test VM
+# evaluates it to the same derivation as the host that prebuilt it.
 #
 # The flake's checks build the crates with nci instead, which caches the
 # dependencies, and run the tests there.
@@ -10,10 +10,6 @@
   rustPlatform,
   iproute2,
   openssh,
-  # Pin the tools only the controller runs (`ip` for discovery, ssh-keyscan
-  # for the host key check): about 170 MB of closure. An agent-only build
-  # (an initrd) leaves them out; the binary then looks them up on PATH.
-  controllerTools ? true,
 }:
 rustPlatform.buildRustPackage {
   pname = "nix-pixie";
@@ -36,7 +32,7 @@ rustPlatform.buildRustPackage {
     "nix-pixie"
   ];
   doCheck = false;
-  env = lib.optionalAttrs controllerTools {
+  env = {
     # Discovery reads the neighbour table with `ip`, and the host key check
     # after an install uses ssh-keyscan; pinned.
     NIX_PIXIE_IP = lib.getExe' iproute2 "ip";

@@ -77,10 +77,6 @@
             agent = withDefaultPackage ./nix/nixos/agent.nix;
             # Agent plus installer networking: add to any live system.
             installer = withDefaultPackage ./nix/nixos/installer.nix;
-            # The agent in a systemd stage-1 initrd: an installer that is a
-            # kernel and an initrd, for devices booted over USB or the
-            # network. Builds the agent from the configuration's own nixpkgs.
-            installer-initrd = ./nix/nixos/installer-initrd.nix;
           };
         };
 
@@ -137,22 +133,6 @@
               agent = pkgs.callPackage ./nix/agent-package.nix {
                 nix-pixie = config.packages.default;
               };
-
-              # The agent in a stage-1 initrd with nixpkgs' generic kernel and
-              # a USB gadget: kernel, initrd and command line. For devices
-              # that boot over USB or the network; build your own with the
-              # device's kernel (nixosModules.installer-initrd).
-              installer-initrd =
-                (inputs.nixpkgs.lib.nixosSystem {
-                  modules = [
-                    ./nix/nixos/installer-initrd.nix
-                    {
-                      nixpkgs.hostPlatform = system;
-                      boot.initrd.nix-pixie-agent.usbGadget.enable = true;
-                      system.stateVersion = lib.trivial.release;
-                    }
-                  ];
-                }).config.system.build.nixPixieInstaller;
 
               # Boot this on the machine to install; it shows a pairing code.
               installer-iso =

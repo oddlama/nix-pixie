@@ -38,7 +38,6 @@ we build on them.
 | Targets on other networks (`--target HOST`, unicast probes) running the agent package on a stock NixOS live system (`nix run …#agent`) | done; this way the target must be reachable on UDP 47011/47012 | `checks.vm-remote` (target behind a router with its default firewall; plain NixOS, none of our modules) |
 | Targets nobody can connect to (NAT, closed firewall): found at a relay with only the code, then a direct path where one can be punched. n0's public relays by default, `--relay URL` for others, `--no-relay` for none | done for target-shown codes | `checks.vm-relay` (no open ports; first a whole install through the relay with no route at all, then one over a punched path, with the host key checked after boot); by hand through n0's relay between two NATed network namespaces |
 | Online guessing: rotation after 3 spent guesses, backing off 2 s doubling to 60 s | done | unit tests of the delay, `checks.vm-pairing` |
-| Devices without a screen: an installer that is a kernel and a systemd stage-1 initrd (`nixosModules.installer-initrd`), USB gadget (network and serial), unattended pairing with a controller's code from a credential, link-local `--target fe80::2%iface` | implemented, not yet VM-tested | `packages.installer-initrd` builds; unit tests of the address parsing |
 | A driving program's interface: JSON events (`--events`), exit codes by phase, the agent's status on a serial terminal (`console --plain`/`--json`), `--offline` | implemented, not yet VM-tested | unit tests of the console |
 | Many devices, one configuration: `--id`/`$PIXIE_OUT/id`, `{id}` paths, `disks.rules`, `facter.mode`, side-by-side installs | implemented, not yet VM-tested | unit tests of the disk plan |
 | Hooks: owners and directory modes (`files.json`), `target exec --stdin`, `context.json` to later hooks, `encrypted/` into the repo with age, `seen-host-key` and `bootCheck = "hooks"`, outputs in RAM only | implemented, not yet VM-tested | unit tests of the outputs |
@@ -1015,48 +1014,6 @@ boot.
 `services.nix-pixie-agent.relay.{enable,urls}` chooses the relays (§1); with
 `openFirewall = false` and a relay in reach, the image opens no ports at
 all.
-
-**Devices without a screen** (implemented: `nix/nixos/installer-initrd.nix`).
-Boards that a vendor's tool boots over USB, or that netboot, get a kernel and
-an initrd, not an ISO; many have no screen and often no serial console of
-their own.
-
-- *Stage 1 only.* The agent runs in a systemd initrd that never switches
-  root (`boot.initrd.systemd.root = null`, the units that look for a root
-  or switch to it suppressed). Built as its own NixOS configuration with the
-  device's platform and kernel, so modules and `zpool` match the kernel it
-  runs; `system.build.nixPixieInstaller` has kernel, initrd and command
-  line.
-- *Tools in a second archive.* The systemd initrd copies only the files it
-  is told to (make-initrd-ng), which breaks scripts like `nixos-install`.
-  The agent's tools (Nix, nixos-install and -enter, util-linux, kmod,
-  OpenSSH, optionally nixos-facter and ZFS) are a `makeInitrd` archive with
-  their whole closures, prepended to the initrd, and a unit loads their
-  registration into Nix's database before the agent starts, so the live
-  store works as on the ISO. With nixpkgs' generic kernel the initrd is
-  98 MB with zstd, 69 MB of it the tools. Baking Nix in was chosen over
-  bootstrapping it after boot (a tiny initrd that receives Nix as plain
-  archives first): simpler, and transferring the initrd is fast enough.
-- *The agent built for the device.* `nix/package.nix` takes only nixpkgs,
-  so the configuration builds it from its own nixpkgs, cross-compiled if
-  need be, and without the controller's tools (`controllerTools = false`).
-- *Unattended pairing.* Whatever boots the device sets
-  `systemd.set_credential=pixie.code:<controller code>` on the kernel
-  command line, and `controller install --controller-code-file` dials the
-  target waiting for that code. Both sides prove it with SPAKE2 as for a
-  target's code, so both are authenticated. The code is in
-  `/proc/cmdline`, readable by root only in the initrd, and is used once.
-  Rejected: trusting the cable instead of a code (the device may also be
-  on a LAN, whose hosts could then take it over), and pinned keys (the
-  device's private key would travel the same way as the code).
-- *USB gadget.* configfs: CDC-NCM (`usb0`, with the fixed link-local
-  address `fe80::2`, so `--target 'fe80::2%<host interface>'` reaches it;
-  every device is on a link of its own) and CDC-ACM (`ttyGS0`), where
-  `nix-pixie console --plain` or `--json` reports the status and takes
-  commands.
-- *Firmware the installer can't see.* An installer booted by a vendor's
-  tool may see no EFI variables; a machine's `firmware.uefi` and
-  `firmware.setupMode` say what to assume for the boot loader checks.
 
 **Stock live systems** (`packages.<system>.agent`): where only the
 provider's NixOS ISO boots (Hetzner Cloud, say), the operator runs

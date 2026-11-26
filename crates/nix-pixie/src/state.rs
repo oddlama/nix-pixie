@@ -100,7 +100,7 @@ pub fn in_ram(path: &Path, mountinfo: &str) -> bool {
     crate::store::mounts(mountinfo)
         .filter(|(point, _)| path.starts_with(point))
         .max_by_key(|(point, _)| point.components().count())
-        .is_some_and(|(_, fstype)| matches!(fstype.as_str(), "tmpfs" | "ramfs" | "rootfs"))
+        .is_some_and(|(_, fstype)| matches!(fstype.as_str(), "tmpfs" | "ramfs"))
 }
 
 /// Atomically replaces `path` with `contents` plus a newline, mode 0600.
