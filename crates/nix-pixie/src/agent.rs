@@ -784,11 +784,7 @@ async fn accept_streams(conn: Connection, approved: Arc<AtomicBool>) {
                 Ok(_) if !approved.load(Ordering::Relaxed) => {
                     Err(anyhow::anyhow!("stream before approval"))
                 }
-                Ok(StreamRequest::Store { root }) => match store::check_root(&root) {
-                    Ok(_) => store::serve(Some(&root), recv, send).await,
-                    Err(reason) => Err(anyhow::anyhow!(reason)),
-                },
-                Ok(StreamRequest::LiveStore) => store::serve(None, recv, send).await,
+                Ok(request) => serve_store(request, recv, send).await,
                 Err(e) => Err(e.into()),
             };
             if let Err(e) = result {
@@ -797,6 +793,26 @@ async fn accept_streams(conn: Connection, approved: Arc<AtomicBool>) {
         });
         // Reap finished tasks as we go.
         while tasks.try_join_next().is_some() {}
+    }
+}
+
+/// Serves a store stream as `request` asks.
+async fn serve_store(
+    request: StreamRequest,
+    recv: iroh::endpoint::RecvStream,
+    send: iroh::endpoint::SendStream,
+) -> Result<()> {
+    let (request, zstd) = match request {
+        StreamRequest::Zstd(inner) => (*inner, true),
+        request => (request, false),
+    };
+    match request {
+        StreamRequest::Store { root } => match store::check_root(&root) {
+            Ok(_) => store::serve(Some(&root), recv, send, zstd).await,
+            Err(reason) => Err(anyhow::anyhow!(reason)),
+        },
+        StreamRequest::LiveStore => store::serve(None, recv, send, zstd).await,
+        StreamRequest::Zstd(_) => Err(anyhow::anyhow!("compressed twice")),
     }
 }
 
@@ -847,55 +863,7 @@ async fn serve_controller(
                 Some(reply) => reply,
                 None => continue,
             },
-            ControllerMsg::RequestFacterReport => facter_report(state).await,
-            ControllerMsg::RequestAddresses => TargetMsg::Addresses {
-                addrs: net::own_addresses(),
-            },
-            ControllerMsg::PrepareStore { root } => prepare_store(&root),
-            ControllerMsg::PrepareDisks { disks, labels } => {
-                session.prepared = None;
-                prepare_disks(state, disks, &labels, &mut session.prepared).await
-            }
-            ControllerMsg::RunDisko { script, key_files } => {
-                run_disko(state, stream, &script, &key_files, session.prepared.take()).await?
-            }
-            ControllerMsg::GenerateHostKey => generate_host_key(state).await,
-            ControllerMsg::ProvideHostKey { private } => {
-                match nixos::store_host_key(state, &private.0).await {
-                    Ok(public) => TargetMsg::HostKey { public },
-                    Err(e) => {
-                        warn!("pushed host key: {e:#}");
-                        TargetMsg::HostKeyFailed {
-                            error: format!("{e:#}"),
-                        }
-                    }
-                }
-            }
-            ControllerMsg::Install {
-                root,
-                system,
-                host_key_path,
-            } => install(state, stream, &root, &system, host_key_path.as_deref()).await?,
-            ControllerMsg::PlaceFiles { root, files } => match nixos::place_files(&root, &files) {
-                Ok(()) => TargetMsg::FilesPlaced,
-                Err(reason) => {
-                    warn!(%reason, "refusing to place files");
-                    TargetMsg::FilesRefused { reason }
-                }
-            },
-            ControllerMsg::Exec {
-                program,
-                args,
-                root,
-                input,
-            } => exec(stream, &program, &args, root.as_deref(), input).await?,
-            ControllerMsg::Finish { root, zpools, then } => {
-                let reply = finish(&root, &zpools).await;
-                if matches!(reply, TargetMsg::Finished { .. }) {
-                    session.shutdown = Some(then);
-                }
-                reply
-            }
+            message => answer(state, stream, session, message).await?,
         };
         // Kept before it is sent: if sending fails, the controller comes
         // back for it.
@@ -908,6 +876,78 @@ async fn serve_controller(
             }));
         }
     }
+}
+
+/// The reply to an approved request.
+async fn answer(
+    state: &StateDir,
+    stream: &mut Stream,
+    session: &mut Session,
+    message: ControllerMsg,
+) -> Result<TargetMsg> {
+    Ok(match message {
+        ControllerMsg::RequestFacterReport => facter_report(state).await,
+        ControllerMsg::RequestAddresses => TargetMsg::Addresses {
+            addrs: net::own_addresses(),
+        },
+        ControllerMsg::PrepareStore { root } => prepare_store(&root),
+        ControllerMsg::Substitute {
+            root,
+            from,
+            keys,
+            paths,
+        } => store::substitute(stream, &root, &from, &keys, &paths).await?,
+        ControllerMsg::PrepareDisks { disks, labels } => {
+            session.prepared = None;
+            prepare_disks(state, disks, &labels, &mut session.prepared).await
+        }
+        ControllerMsg::RunDisko { script, key_files } => {
+            run_disko(state, stream, &script, &key_files, session.prepared.take()).await?
+        }
+        ControllerMsg::GenerateHostKey => generate_host_key(state).await,
+        ControllerMsg::ProvideHostKey { private } => {
+            match nixos::store_host_key(state, &private.0).await {
+                Ok(public) => TargetMsg::HostKey { public },
+                Err(e) => {
+                    warn!("pushed host key: {e:#}");
+                    TargetMsg::HostKeyFailed {
+                        error: format!("{e:#}"),
+                    }
+                }
+            }
+        }
+        ControllerMsg::Install {
+            root,
+            system,
+            host_key_path,
+        } => install(state, stream, &root, &system, host_key_path.as_deref()).await?,
+        ControllerMsg::PlaceFiles { root, files } => match nixos::place_files(&root, &files) {
+            Ok(()) => TargetMsg::FilesPlaced,
+            Err(reason) => {
+                warn!(%reason, "refusing to place files");
+                TargetMsg::FilesRefused { reason }
+            }
+        },
+        ControllerMsg::Exec {
+            program,
+            args,
+            root,
+            input,
+        } => exec(stream, &program, &args, root.as_deref(), input).await?,
+        ControllerMsg::Finish { root, zpools, then } => {
+            let reply = finish(&root, &zpools).await;
+            if matches!(reply, TargetMsg::Finished { .. }) {
+                session.shutdown = Some(then);
+            }
+            reply
+        }
+        // Handled before.
+        ControllerMsg::Approve { .. }
+        | ControllerMsg::Reject { .. }
+        | ControllerMsg::Resume { .. } => TargetMsg::ExecFailed {
+            error: "unexpected".into(),
+        },
+    })
 }
 
 /// Checks the disks the controller chose, and keeps them for `RunDisko`.
@@ -970,6 +1010,9 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::Exec { .. } => Some(TargetMsg::ExecFailed { error: reason }),
         // None, rather than a message just for refusing this.
         ControllerMsg::RequestAddresses => Some(TargetMsg::Addresses { addrs: Vec::new() }),
+        ControllerMsg::Substitute { .. } => Some(TargetMsg::Substituted {
+            error: Some(reason),
+        }),
     }
 }
 

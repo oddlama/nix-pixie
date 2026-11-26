@@ -58,7 +58,7 @@ pub enum Command {
         #[arg(long, global = true)]
         offline: bool,
         #[command(subcommand)]
-        command: ControllerCommand,
+        command: Box<ControllerCommand>,
     },
     /// Run the installer-side agent (as root, inside the installer image).
     Agent {
@@ -220,6 +220,24 @@ pub enum ControllerCommand {
         /// hooks. A hook can give it instead, in `$PIXIE_OUT/id`.
         #[arg(long)]
         id: Option<String>,
+        /// A binary cache the target copies the system from first (e.g. one
+        /// on its own network, faster than through the controller; it needs
+        /// a network to it); the controller sends what is missing.
+        /// Repeatable.
+        #[arg(long = "substituter", value_name = "URL")]
+        substituters: Vec<String>,
+        /// A key whose signatures the target trusts for the substituters,
+        /// e.g. cache.example.org-1:AbC...=. Repeatable.
+        #[arg(
+            long = "trusted-public-key",
+            value_name = "KEY",
+            requires = "substituters"
+        )]
+        trusted_public_keys: Vec<String>,
+        /// Don't compress what goes to the target: for links faster than
+        /// zstd on this machine, or contents that don't compress.
+        #[arg(long)]
+        no_compression: bool,
         /// Install this machine (default: the one whose hints match).
         #[arg(long)]
         machine: Option<String>,
@@ -306,7 +324,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
                 Some(path) => path,
                 None => identity::default_path()?,
             };
-            run_controller(identity, command).await
+            run_controller(identity, *command).await
         }
         Command::Agent {
             state_dir,
@@ -420,6 +438,9 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
             code,
             controller_code_file,
             id,
+            substituters,
+            trusted_public_keys,
+            no_compression,
             flake,
             machine,
             disks,
@@ -433,11 +454,18 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
             targets,
             relay,
         } => {
+            if no_compression {
+                crate::push::no_compression();
+            }
             install::install(install::InstallArgs {
                 identity,
                 code,
                 controller_code_file,
                 id,
+                caches: install::Caches {
+                    from: substituters,
+                    keys: trusted_public_keys,
+                },
                 timeout: Duration::from_secs(timeout),
                 method: discovery,
                 flake,

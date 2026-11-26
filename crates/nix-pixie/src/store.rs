@@ -9,8 +9,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use async_compression::tokio::bufread::ZstdDecoder;
+use async_compression::tokio::write::ZstdEncoder;
 use iroh::endpoint::{RecvStream, SendStream};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info};
 
 /// Filesystems that live in RAM, or can't hold a store.
@@ -125,7 +127,88 @@ fn octal(digits: [u8; 3]) -> Option<u8> {
 /// signatures.
 ///
 /// `root: None` serves the live system's own store instead.
-pub async fn serve(root: Option<&str>, mut recv: RecvStream, mut send: SendStream) -> Result<()> {
+/// Copies `paths` with their closures from the binary caches `from` into
+/// the store under `root`, trusting signatures by `keys`, with Nix's
+/// output as `Output` frames. The first cache that has everything ends it;
+/// what arrived from others stays. Returns `Substituted`; the outer
+/// `Result` is about the control stream.
+pub async fn substitute(
+    stream: &mut crate::net::Stream,
+    root: &str,
+    from: &[String],
+    keys: &[String],
+    paths: &[String],
+) -> Result<nix_pixie_proto::ctrl::TargetMsg> {
+    use nix_pixie_proto::ctrl::TargetMsg;
+    let failed = |error: String| Ok(TargetMsg::Substituted { error: Some(error) });
+    if let Err(reason) = check_root(root) {
+        return failed(reason);
+    }
+    let url = |u: &String| {
+        !u.is_empty()
+            && !u.starts_with('-')
+            && u.bytes().all(|b| b.is_ascii_graphic())
+            && [
+                "https://",
+                "http://",
+                "file://",
+                "s3://",
+                "ssh://",
+                "ssh-ng://",
+            ]
+            .iter()
+            .any(|scheme| u.starts_with(scheme))
+    };
+    if from.is_empty() || !from.iter().all(url) {
+        return failed("not a binary cache URL".into());
+    }
+    if !keys
+        .iter()
+        .all(|k| k.bytes().all(|b| b.is_ascii_graphic()) && !k.is_empty())
+    {
+        return failed("not a public key".into());
+    }
+    if paths.is_empty() || !paths.iter().all(|p| is_store_path(p)) {
+        return failed("not store paths".into());
+    }
+    let mut errors = Vec::new();
+    for cache in from {
+        let mut command = tokio::process::Command::new("nix");
+        command
+            .args(["--extra-experimental-features", "nix-command"])
+            .args(["copy", "--from", cache, "--to"])
+            .arg(format!("local?root={root}"))
+            .args(["--option", "trusted-public-keys", &keys.join(" ")])
+            .args(paths);
+        match crate::child::run("nix copy", command, stream).await? {
+            Ok(()) => {
+                info!(%cache, "substituted");
+                return Ok(TargetMsg::Substituted { error: None });
+            }
+            Err(error) => errors.push(format!("{cache}: {error}")),
+        }
+    }
+    failed(errors.join("; "))
+}
+
+/// With `zstd`, both directions are compressed (see
+/// `nix_pixie_proto::ctrl::StreamRequest::Zstd`).
+pub async fn serve(
+    root: Option<&str>,
+    recv: RecvStream,
+    send: SendStream,
+    zstd: bool,
+) -> Result<()> {
+    let (mut recv, mut send): (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ) = if zstd {
+        let mut decoder = ZstdDecoder::new(tokio::io::BufReader::new(recv));
+        decoder.multiple_members(true);
+        (Box::new(decoder), Box::new(ZstdEncoder::new(send)))
+    } else {
+        (Box::new(recv), Box::new(send))
+    };
     let store = root.map_or_else(
         || "the live store".to_string(),
         |root| format!("local?root={root}"),
@@ -161,7 +244,8 @@ pub async fn serve(root: Option<&str>, mut recv: RecvStream, mut send: SendStrea
     };
     let download = async {
         let copied = tokio::io::copy(&mut stdout, &mut send).await;
-        let _ = send.finish();
+        // Ends the zstd frame, if any, and the stream.
+        let _ = send.shutdown().await;
         copied
     };
     let (up, down) = tokio::join!(upload, download);

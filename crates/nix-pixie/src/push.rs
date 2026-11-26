@@ -7,9 +7,12 @@
 //! target filesystems (`crates/nix-pixie/src/store.rs`). Nothing is staged in
 //! between, and the target never gets to read the controller's store.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use async_compression::tokio::bufread::ZstdDecoder;
+use async_compression::tokio::write::ZstdEncoder;
 use iroh::endpoint::Connection;
 use nix_pixie_proto::ctrl::{ControllerMsg, StreamRequest, TargetMsg};
 use nix_pixie_proto::frame::write_frame;
@@ -34,6 +37,15 @@ pub struct Copied {
     pub seconds: f64,
     /// How much was copied, for the operator (empty if nothing was).
     pub what: String,
+}
+
+/// Whether store streams are compressed (`--no-compression` turns it off).
+static COMPRESS: AtomicBool = AtomicBool::new(true);
+
+/// Stops compressing store streams: for links faster than zstd on the
+/// controller's CPU, or contents that don't compress.
+pub fn no_compression() {
+    COMPRESS.store(false, Ordering::Relaxed);
 }
 
 /// Fails unless every path is valid in the local store, so a typo surfaces
@@ -147,6 +159,12 @@ async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) -> R
 /// Connects every client of the local socket to a new stream of the kind
 /// `request` names.
 async fn forward(listener: UnixListener, conn: Connection, request: StreamRequest) {
+    let zstd = COMPRESS.load(Ordering::Relaxed);
+    let request = if zstd {
+        StreamRequest::Zstd(Box::new(request))
+    } else {
+        request
+    };
     let mut tasks = JoinSet::new();
     while let Ok((mut local, _)) = listener.accept().await {
         let conn = conn.clone();
@@ -155,8 +173,15 @@ async fn forward(listener: UnixListener, conn: Connection, request: StreamReques
             let result = async {
                 let (mut send, recv) = conn.open_bi().await?;
                 write_frame(&mut send, &request).await?;
-                let mut remote = tokio::io::join(recv, send);
-                let (up, down) = tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
+                let (up, down) = if zstd {
+                    let mut decoder = ZstdDecoder::new(tokio::io::BufReader::new(recv));
+                    decoder.multiple_members(true);
+                    let mut remote = tokio::io::join(decoder, ZstdEncoder::new(send));
+                    tokio::io::copy_bidirectional(&mut local, &mut remote).await?
+                } else {
+                    let mut remote = tokio::io::join(recv, send);
+                    tokio::io::copy_bidirectional(&mut local, &mut remote).await?
+                };
                 debug!(up, down, "store connection done");
                 anyhow::Ok(())
             }
