@@ -97,12 +97,25 @@ let
           dmiSerial = [ ];
           serial = [ ];
         };
-        disks.file = null;
+        disks = {
+          file = null;
+          rules = { };
+        };
         hostKey = {
           mode = "pull";
           publicKeyPath = "machines/web1/ssh_host_ed25519_key.pub";
         };
-        facter.reportPath = "machines/web1/facter.json";
+        facter = {
+          reportPath = "machines/web1/facter.json";
+          mode = "write";
+          ignore = [ ];
+        };
+        firmware = {
+          uefi = null;
+          setupMode = null;
+        };
+        secrets.recipients = [ ];
+        bootCheck = "ssh";
         hooks = {
           rekey = rekey // {
             args = [ "rekey" ];
@@ -117,12 +130,25 @@ let
           dmiSerial = [ ];
           serial = [ ];
         };
-        disks.file = null;
+        disks = {
+          file = null;
+          rules = { };
+        };
         hostKey = {
           mode = "none";
           publicKeyPath = "machines/rack-a/host.pub";
         };
-        facter.reportPath = "machines/rack-a/facter.json";
+        facter = {
+          reportPath = "machines/rack-a/facter.json";
+          mode = "write";
+          ignore = [ ];
+        };
+        firmware = {
+          uefi = null;
+          setupMode = null;
+        };
+        secrets.recipients = [ ];
+        bootCheck = "ssh";
         hooks = { inherit rekey notify; };
       };
       generic = {
@@ -132,12 +158,25 @@ let
           dmiSerial = [ ];
           serial = [ ];
         };
-        disks.file = null;
+        disks = {
+          file = null;
+          rules = { };
+        };
         hostKey = {
           mode = "none";
           publicKeyPath = "machines/generic/host.pub";
         };
-        facter.reportPath = "machines/generic/facter.json";
+        facter = {
+          reportPath = "machines/generic/facter.json";
+          mode = "write";
+          ignore = [ ];
+        };
+        firmware = {
+          uefi = null;
+          setupMode = null;
+        };
+        secrets.recipients = [ ];
+        bootCheck = "ssh";
         hooks = { inherit rekey notify; };
       };
       db1 = {
@@ -147,12 +186,25 @@ let
           dmiSerial = [ ];
           serial = [ ];
         };
-        disks.file = "machines/db1/disks.json";
+        disks = {
+          file = "machines/db1/disks.json";
+          rules = { };
+        };
         hostKey = {
           mode = "none";
           publicKeyPath = "machines/db1/host.pub";
         };
-        facter.reportPath = null;
+        facter = {
+          reportPath = null;
+          mode = "write";
+          ignore = [ ];
+        };
+        firmware = {
+          uefi = null;
+          setupMode = null;
+        };
+        secrets.recipients = [ ];
+        bootCheck = "ssh";
         hooks = { inherit rekey; };
       };
     };
