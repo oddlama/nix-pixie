@@ -195,7 +195,9 @@ pub fn check_key_path(path: &str, mountinfo: &str) -> Result<(), String> {
         .max_by_key(|(point, _)| point.components().count())
         .map(|(_, fstype)| fstype);
     match fstype.as_deref() {
-        Some("tmpfs" | "ramfs") => Ok(()),
+        // `rootfs`: an initramfs's root, which is in RAM too (an installer
+        // that is only an initrd keeps /tmp there).
+        Some("tmpfs" | "ramfs" | "rootfs") => Ok(()),
         Some(other) => Err(format!(
             "{path} would be on {other}, and keys must never touch a disk"
         )),
