@@ -315,7 +315,8 @@ pub async fn write_into_repo(root: &Path, path: &Path, contents: &[u8]) -> Resul
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let tmp = path.with_extension("nix-pixie-tmp");
+    // Installs running side by side may write the same file.
+    let tmp = path.with_extension(format!("nix-pixie-tmp-{}", std::process::id()));
     std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
 
@@ -327,6 +328,18 @@ pub async fn write_into_repo(root: &Path, path: &Path, contents: &[u8]) -> Resul
         .await
         .is_ok_and(|o| o.status.success());
     if in_git {
+        git_add(root, path).await?;
+        debug!(path = %path.display(), "git add");
+    }
+    Ok(())
+}
+
+/// `git add path`, waiting for another `git` (another install running side
+/// by side) that holds the index's lock, for up to 30 s.
+async fn git_add(root: &Path, path: &Path) -> Result<()> {
+    let mut pause = std::time::Duration::from_millis(50);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         let added = tokio::process::Command::new("git")
             .arg("-C")
             .arg(root)
@@ -336,13 +349,15 @@ pub async fn write_into_repo(root: &Path, path: &Path, contents: &[u8]) -> Resul
             .output()
             .await
             .context("running `git add`")?;
-        anyhow::ensure!(
-            added.status.success(),
-            "`git add {}` failed: {}",
-            path.display(),
-            String::from_utf8_lossy(&added.stderr).trim()
-        );
-        debug!(path = %path.display(), "git add");
+        if added.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&added.stderr);
+        if stderr.contains("index.lock") && tokio::time::Instant::now() + pause < deadline {
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(std::time::Duration::from_secs(2));
+            continue;
+        }
+        bail!("`git add {}` failed: {}", path.display(), stderr.trim());
     }
-    Ok(())
 }

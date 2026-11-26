@@ -61,19 +61,28 @@ fn create(path: &Path) -> Result<SecretKey> {
             .with_context(|| format!("creating {}", dir.display()))?;
     }
     let key = SecretKey::generate();
-    let mut file = match OpenOptions::new()
+    // Written completely before it appears under its name: installs running
+    // side by side may create it at the same time, and must not read half
+    // of it.
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut file = OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .mode(0o600)
-        .open(path)
-    {
-        Ok(file) => file,
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    writeln!(file, "{}", hex::encode(&key.to_bytes()))?;
+    file.sync_all()?;
+    drop(file);
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {}
         // Another process created it first; use theirs.
         Err(e) if e.kind() == ErrorKind::AlreadyExists => return load(path),
         Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
-    };
-    writeln!(file, "{}", hex::encode(&key.to_bytes()))?;
-    file.sync_all()?;
+    }
     tracing::info!(path = %path.display(), id = %key.public(), "created controller identity");
     Ok(key)
 }
