@@ -293,6 +293,7 @@ async fn check_machine(
     requested: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, PathBuf>> {
     check_push(name, machine)?;
+    crate::encrypt::check_recipients(&machine.secrets.recipients)?;
     if let Some(report) = missing_facter_report(&args.flake, machine, args.id.as_deref()) {
         // A configuration that reads its facter report can't evaluate
         // before the first one arrives (after approval); check it then.
@@ -907,7 +908,7 @@ async fn start_hooks(
         Some(programs) => programs,
         None => hooks::resolve(&args.flake, &machine.hooks).await?,
     };
-    hooks::Runner::new(
+    let mut runner = hooks::Runner::new(
         machine.hooks.clone(),
         programs,
         metadata::local_flake_dir(&args.flake).map_or_else(std::env::current_dir, Ok)?,
@@ -919,7 +920,9 @@ async fn start_hooks(
             id: args.id.clone(),
             ..hooks::Context::default()
         },
-    )
+    )?;
+    runner.encrypt_to(machine.secrets.recipients.clone());
+    Ok(runner)
 }
 
 /// Pull mode: the pulled key, and where the configuration wants it.

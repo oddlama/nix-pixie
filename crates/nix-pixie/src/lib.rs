@@ -18,6 +18,7 @@ pub mod controller;
 pub mod discovery;
 pub mod disko;
 pub mod dns;
+pub mod encrypt;
 pub mod events;
 pub mod exec;
 pub mod exit;

@@ -18,9 +18,10 @@ use anyhow::{Context as _, Result, bail};
 use nix_pixie_proto::ctrl::{Account, PlacedFile};
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
+use tracing::info;
 use zeroize::Zeroizing;
 
-use crate::metadata::Hook;
+use crate::metadata::{self, Hook};
 use crate::state::private_ram_dir;
 use crate::target::{self, Target};
 use crate::ui;
@@ -349,6 +350,8 @@ pub struct Runner {
     host_key: Option<Zeroizing<Vec<u8>>>,
     /// The last step whose hooks ran.
     reached: Option<Step>,
+    /// For `$PIXIE_OUT/encrypted/`.
+    recipients: Vec<String>,
 }
 
 impl Runner {
@@ -368,7 +371,14 @@ impl Runner {
             disk_keys: BTreeMap::new(),
             host_key: None,
             reached: None,
+            recipients: Vec::new(),
         })
+    }
+
+    /// Encrypt what hooks put into `$PIXIE_OUT/encrypted/` to these age
+    /// recipients or SSH keys (the machine's `secrets.recipients`).
+    pub fn encrypt_to(&mut self, recipients: Vec<String>) {
+        self.recipients = recipients;
     }
 
     /// The hooks that follow `step`, in the order they would run.
@@ -400,7 +410,7 @@ impl Runner {
                 Ok(outputs)
             })
             .await?;
-            self.take_outputs(&name, step, outputs)?;
+            self.take_outputs(&name, step, outputs).await?;
             let total: usize = self.pending.iter().map(|f| f.contents.len()).sum();
             if total > MAX_FILES_BYTES {
                 bail!(
@@ -413,9 +423,20 @@ impl Runner {
     }
 
     /// Keeps what a hook produced, if it's not too late for it.
-    fn take_outputs(&mut self, name: &str, step: Step, outputs: Outputs) -> Result<()> {
+    async fn take_outputs(&mut self, name: &str, step: Step, outputs: Outputs) -> Result<()> {
         if let Some(value) = outputs.context {
             self.context.outputs.insert(name.to_string(), value);
+        }
+        for secret in &outputs.encrypted {
+            let path = secret.path.trim_start_matches('/');
+            let file = metadata::repo_path(&self.dir, path)?;
+            let encrypted = crate::encrypt::encrypt(&self.recipients, &secret.contents)
+                .with_context(|| format!("hook {name}: encrypted/{path}"))?;
+            metadata::write_into_repo(&self.dir, &file, &encrypted).await?;
+            info!(
+                hook = name,
+                path, "wrote an encrypted secret into the repository"
+            );
         }
         if let Some(id) = outputs.id {
             match &self.context.id {
@@ -495,6 +516,8 @@ pub struct Outputs {
     pub context: Option<serde_json::Value>,
     /// `id`: the install's id.
     pub id: Option<String>,
+    /// `encrypted/<path>`: for the repository at `<path>`, encrypted.
+    pub encrypted: Vec<PlacedFile>,
 }
 
 /// The largest `context.json` a hook may write.
@@ -513,6 +536,7 @@ pub fn collect_outputs(out: &Path) -> Result<Outputs> {
             Some("files.json") if entry.file_type()?.is_file() => {
                 manifest = Some(std::fs::read(entry.path())?);
             }
+            Some("encrypted") => outputs.encrypted = collect_files(&entry.path())?,
             Some("id") if entry.file_type()?.is_file() => {
                 let id = std::fs::read_to_string(entry.path()).context("id is not UTF-8")?;
                 let id = id.trim().to_string();
@@ -538,7 +562,7 @@ pub fn collect_outputs(out: &Path) -> Result<Outputs> {
             }
             _ => bail!(
                 "{}: a hook's outputs are files/, files.json, disk-keys/, host-key, \
-                 context.json and id",
+                 context.json, id and encrypted/",
                 name.to_string_lossy()
             ),
         }

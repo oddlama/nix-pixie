@@ -317,6 +317,18 @@ let
           '';
         };
 
+        secrets.recipients = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p" ];
+          description = ''
+            Age recipients (`age1...`) or SSH public keys that secrets go to
+            when a hook hands them to the controller for the repository
+            (`$PIXIE_OUT/encrypted/<path>`): they only ever get there
+            encrypted, e.g. a LUKS recovery key the target generated.
+          '';
+        };
+
         firmware = {
           uefi = mkOption {
             type = types.nullOr types.bool;

@@ -32,6 +32,8 @@ pub struct Machine {
     pub facter: Facter,
     #[serde(default)]
     pub firmware: FirmwareAssumed,
+    #[serde(default)]
+    pub secrets: Secrets,
     /// Enabled hooks, by name (see `crate::hooks`).
     pub hooks: BTreeMap<String, Hook>,
 }
@@ -133,6 +135,14 @@ pub fn with_id(path: &str, id: Option<&str>, option: &str) -> Result<String> {
         )
     })?;
     Ok(path.replace(ID, id))
+}
+
+/// Where secrets hooks give the controller for the repository go.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Secrets {
+    /// Age recipients or SSH public keys they are encrypted to.
+    #[serde(default)]
+    pub recipients: Vec<String>,
 }
 
 /// What to assume about the machine's firmware, where the installer can't
