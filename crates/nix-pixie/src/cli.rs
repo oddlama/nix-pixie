@@ -1,6 +1,6 @@
 //! The command line: argument definitions and dispatch to the roles.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::net::Relays;
-use crate::{agent, controller, discovery, identity, install, target};
+use crate::{agent, control, controller, discovery, identity, install, target};
 
 /// The command line.
 #[derive(Debug, Parser)]
@@ -67,6 +67,18 @@ pub enum Command {
         controller_code: Option<String>,
         #[command(flatten)]
         relay: RelayArgs,
+    },
+    /// On the target (as root): how its relay stands, or which relays the
+    /// running agent uses from now on, e.g. your own iroh-relay. The agent
+    /// shows a new code with them. Lasts until the target reboots.
+    Relay {
+        /// Relay URLs, `off` (none: only this network), `n0` (n0's public
+        /// relays) or `default` (as the agent was started). Without any,
+        /// how the relay stands.
+        setting: Vec<String>,
+        /// The agent's state directory.
+        #[arg(long, default_value = "/run/nix-pixie")]
+        state_dir: PathBuf,
     },
     /// Serve DHCP and PXE for the installer image (needs root).
     Netboot,
@@ -243,6 +255,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             })
             .await
         }
+        Command::Relay { setting, state_dir } => relay(&state_dir, &setting).await,
         Command::Netboot => bail!("netboot is not implemented yet"),
         Command::Target {
             command: TargetCommand::Exec { chroot, command },
@@ -253,6 +266,27 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         }
     };
     result.map(|()| ExitCode::SUCCESS)
+}
+
+/// `nix-pixie relay`: changes the agent's relays, or says how they stand.
+async fn relay(state_dir: &Path, words: &[String]) -> Result<()> {
+    if words.is_empty() {
+        let status = control::watch(state_dir).await?.next().await?;
+        println!(
+            "{}",
+            status
+                .relay
+                .as_deref()
+                .unwrap_or("No relays: only controllers on this network find this machine.")
+        );
+        if let Some(shown) = status.code {
+            println!("Pairing code: {} ({})", shown.code, shown.command);
+        }
+        return Ok(());
+    }
+    let done = control::set_relays(state_dir, control::Setting::parse(words)?).await?;
+    println!("{done}");
+    Ok(())
 }
 
 async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result<()> {

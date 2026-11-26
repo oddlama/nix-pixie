@@ -181,6 +181,23 @@ pkgs.testers.runNixOSTest {
         relay.wait_for_open_port(3340)
         screen_says(reachable, times=2)
 
+    with subtest("`pixie relay` changes the relays of the running agent, for the rest of the boot"):
+        code = next_code("")
+        out = target.succeed("pixie relay off")
+        assert "now using no relay" in out, out
+        # Without relays there is no rendezvous to wait for.
+        target.wait_until_succeeds(f"test -s /run/nix-pixie/code && test \"$(cat /run/nix-pixie/code)\" != '{code}'")
+        short = target.succeed("cat /run/nix-pixie/code").strip()
+        assert len(short.split("-")[0]) <= 2, short
+        # Back to the relay, by its URL as one would type a relay of one's own.
+        out = target.succeed(f"pixie relay {relay_url}")
+        assert f"now using {relay_url}/" in out, out
+        code = next_code(short)
+        assert len(code.split("-")[0]) == 6, code
+        assert target.succeed("cat /run/nix-pixie/relays").strip() == relay_url
+        screen_says(f"Relays changed to {relay_url}/.")
+        assert target.succeed("pixie relay").startswith(f"Relay: {relay_url}/ is reachable"), "relay status"
+
     with subtest("without the relay the controller finds nobody, and says where it looked"):
         out = controller.fail(as_alice(f"nix-pixie controller pair --code {code} --no-relay --timeout 5") + " 2>&1")
         assert "no target with nameplate" in out and "only found with --target" in out, out

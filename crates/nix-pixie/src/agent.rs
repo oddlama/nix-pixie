@@ -21,11 +21,12 @@ use nix_pixie_proto::ctrl::{
 use nix_pixie_proto::frame::{FrameError, read_frame, write_frame};
 use nix_pixie_proto::pair::Side;
 use nix_pixie_proto::{ALPN_CTRL, ALPN_RESUME};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::child;
+use crate::control;
 use crate::disko;
 use crate::exec;
 use crate::inventory;
@@ -35,6 +36,7 @@ use crate::nixos;
 use crate::probe::Responder;
 use crate::relay_status::{self, Reach};
 use crate::rendezvous::Rendezvous;
+use crate::screen::{self, Shown};
 use crate::state::StateDir;
 use crate::store;
 
@@ -86,20 +88,94 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     }
     // A controller's code has no nameplate to meet at: without one, relays
     // are of no use.
-    let relays = if controller_code.is_some() {
+    let configured = if controller_code.is_some() {
         Relays::Disabled
     } else {
         args.relays
     };
-    // A fresh identity per boot. Nothing persists on the installer.
-    let endpoint = net::bind(SecretKey::generate(), args.port, &relays).await?;
+    let mut relays = if controller_code.is_some() {
+        Relays::Disabled
+    } else {
+        chosen_earlier(&state).unwrap_or_else(|| configured.clone())
+    };
+    // A fresh identity per boot, the same for every endpoint of this run.
+    // Nothing persists on the installer.
+    let secret = SecretKey::generate();
     let mdns = Mdns::new()?;
     let responder = Responder::bind().await?;
     let (announce_tx, announce_rx) = watch::channel(None);
     let responder = tokio::spawn(responder.run(announce_rx));
-    state.write("endpoint-id", &endpoint.id().to_string())?;
-    info!(id = %endpoint.id(), port = net::bound_port(&endpoint)?, "agent started");
+    let (changes_tx, mut changes) = mpsc::channel(1);
+    let idle = Arc::new(AtomicBool::new(false));
+    let control = tokio::spawn(control::serve(
+        state.path().join(control::SOCKET),
+        Arc::new(control::Agent {
+            configured,
+            changes: changes_tx,
+            idle: idle.clone(),
+        }),
+    ));
+    let mut requests = Requests {
+        changes: &mut changes,
+        idle: &idle,
+    };
+    let shared = Shared {
+        secret: &secret,
+        port: args.port,
+        mdns: &mdns,
+        probe: &announce_tx,
+        state: &state,
+    };
+    let result = loop {
+        match listen(&shared, &relays, controller_code.as_ref(), &mut requests).await {
+            Ok(Outcome::Relays(change)) => relays = take_change(&state, change),
+            Ok(Outcome::Done) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
+    control.abort();
+    responder.abort();
+    mdns.shutdown();
+    result
+}
 
+/// What every endpoint of the agent's run shares.
+struct Shared<'a> {
+    secret: &'a SecretKey,
+    port: u16,
+    mdns: &'a Mdns,
+    probe: &'a watch::Sender<Option<Announcement>>,
+    state: &'a StateDir,
+}
+
+/// The relays chosen with `nix-pixie relay` earlier during this boot.
+fn chosen_earlier(state: &StateDir) -> Option<Relays> {
+    let text = state.read(control::CHOSEN)?;
+    match control::chosen(&text) {
+        Ok(relays) => {
+            info!(%relays, "using the relays chosen earlier during this boot");
+            Some(relays)
+        }
+        Err(e) => {
+            warn!("ignoring the relays chosen earlier: {e:#}");
+            None
+        }
+    }
+}
+
+/// Waits for controllers on an endpoint with `relays`, until shut down or
+/// the operator chooses other relays.
+async fn listen(
+    shared: &Shared<'_>,
+    relays: &Relays,
+    controller_code: Option<&Code>,
+    requests: &mut Requests<'_>,
+) -> Result<Outcome> {
+    let endpoint = net::bind(shared.secret.clone(), shared.port, relays).await?;
+    shared
+        .state
+        .write("endpoint-id", &endpoint.id().to_string())?;
+    info!(id = %endpoint.id(), port = net::bound_port(&endpoint)?, %relays, "agent listening");
     let (reach, watching) = if relays.is_enabled() {
         let (shown, reach) = watch::channel(Reach::Trying);
         let task = tokio::spawn(relay_status::watch(
@@ -113,31 +189,66 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     };
     let mut announcer = Announcer {
         endpoint: &endpoint,
-        mdns: &mdns,
-        probe: &announce_tx,
-        relays: &relays,
+        mdns: shared.mdns,
+        probe: shared.probe,
+        relays,
         reach,
-        state: &state,
+        state: shared.state,
         advertised: None,
         rendezvous: None,
     };
-    let result = tokio::select! {
+    let outcome = tokio::select! {
         r = async {
-            match &controller_code {
-                None => show_code(&mut announcer, &state).await,
-                Some(code) => typed_code(&mut announcer, &state, code).await,
+            match controller_code {
+                None => show_code(&mut announcer, shared.state, requests).await,
+                Some(code) => typed_code(&mut announcer, shared.state, code, requests)
+                    .await
+                    .map(|()| Outcome::Done),
             }
         } => r,
-        () = crate::shutdown_signal() => Ok(()),
+        () = crate::shutdown_signal() => Ok(Outcome::Done),
     };
     announcer.withdraw().await;
     if let Some(task) = watching {
         task.abort();
     }
-    responder.abort();
-    mdns.shutdown();
+    screen::code(None);
+    screen::relay(None);
     endpoint.close().await;
-    result
+    outcome
+}
+
+/// Keeps the relays the operator chose for the rest of the boot, and
+/// answers them.
+fn take_change(state: &StateDir, change: control::Change) -> Relays {
+    let kept = if let Some(text) = &change.chosen {
+        state.write(control::CHOSEN, text)
+    } else {
+        state.remove(control::CHOSEN);
+        Ok(())
+    };
+    let answer = kept
+        .map(|()| format!("now using {}; the target shows a new code", change.relays))
+        .map_err(|e| format!("{e:#}"));
+    let _ = change.answer.send(answer);
+    screen::say(format!("Relays changed to {}.", change.relays));
+    change.relays
+}
+
+/// Why the agent stopped waiting for controllers.
+enum Outcome {
+    /// Shut down, or (with a typed code) the session is over.
+    Done,
+    /// The operator chose other relays.
+    Relays(control::Change),
+}
+
+/// Relay changes from the control socket. They are only taken while the
+/// agent waits for a controller, never while one pairs or is paired.
+struct Requests<'a> {
+    changes: &'a mut mpsc::Receiver<control::Change>,
+    /// Set while waiting, for the control socket to see.
+    idle: &'a AtomicBool,
 }
 
 /// Publishes our announcement via DNS-SD and probe replies and, with
@@ -196,12 +307,11 @@ impl Announcer<'_> {
         }
     }
 
-    /// How the relay stands, as a line of the code's banner (nothing
-    /// without relays).
-    fn relay_line(&self) -> String {
-        self.reach.as_ref().map_or_else(String::new, |reach| {
-            format!("    {}\n", reach.borrow().line(&self.relays.to_string()))
-        })
+    /// How the relay stands, for the code's banner (nothing without
+    /// relays).
+    fn relay_line(&self) -> Option<String> {
+        let reach = self.reach.as_ref()?;
+        Some(reach.borrow().line(&self.relays.to_string()))
     }
 
     /// What the controller needs besides the code to find us.
@@ -217,7 +327,12 @@ impl Announcer<'_> {
 }
 
 /// Default mode: show a code, let the operator type it on the controller.
-async fn show_code(announcer: &mut Announcer<'_>, state: &StateDir) -> Result<()> {
+/// Returns when the operator chooses other relays.
+async fn show_code(
+    announcer: &mut Announcer<'_>,
+    state: &StateDir,
+    requests: &mut Requests<'_>,
+) -> Result<Outcome> {
     let endpoint = announcer.endpoint;
     let mut rotations = 0;
     loop {
@@ -227,27 +342,39 @@ async fn show_code(announcer: &mut Announcer<'_>, state: &StateDir) -> Result<()
         let code = Code::generate(Some(nameplate))?;
         announcer.announce(Pairing::ShowsCode { nameplate }).await?;
         state.write("code", &code.to_string())?;
-        println!(
-            "\n    nix-pixie pairing code:  {code}\n\n    On the controller: nix-pixie controller pair --code {code}{}\n{}",
-            announcer.controller_flags(),
-            announcer.relay_line()
-        );
+        screen::code(Some(Shown {
+            code: code.to_string(),
+            command: format!(
+                "nix-pixie controller pair --code {code}{}",
+                announcer.controller_flags()
+            ),
+        }));
+        if let Some(line) = announcer.relay_line() {
+            println!("    {line}\n");
+        }
 
-        let paired = accept_pairing(endpoint, &code, Side::OwnsCode).await;
+        let paired = accept_pairing(endpoint, &code, Side::OwnsCode, requests).await;
         announcer.withdraw().await;
         state.remove("code");
-        if let Some((conn, stream)) = paired? {
-            if let Err(e) = session(endpoint, state, &conn, stream).await {
-                warn!("session ended with an error: {e:#}");
+        screen::code(None);
+        match paired? {
+            Accepted::Paired(conn, stream) => {
+                if let Err(e) = session(endpoint, state, &conn, stream).await {
+                    warn!("session ended with an error: {e:#}");
+                }
             }
-        } else {
-            rotations += 1;
-            let delay = rotation_delay(rotations);
-            warn!(
-                "{MAX_FAILURES} pairing attempts with a wrong code; someone may be guessing. Showing a new code in {}s.",
-                delay.as_secs()
-            );
-            tokio::time::sleep(delay).await;
+            Accepted::Spent => {
+                rotations += 1;
+                let delay = rotation_delay(rotations);
+                warn!("{MAX_FAILURES} pairing attempts with a wrong code");
+                screen::say(format!(
+                    "{MAX_FAILURES} pairing attempts with a wrong code; someone may be guessing. \
+                     A new code follows in {} s.",
+                    delay.as_secs()
+                ));
+                tokio::time::sleep(delay).await;
+            }
+            Accepted::Change(change) => return Ok(Outcome::Relays(change)),
         }
     }
 }
@@ -283,29 +410,66 @@ async fn nameplates_in_use(mdns: &Mdns, endpoint: &Endpoint) -> Result<Vec<u32>>
 
 /// Alternative mode: the operator typed the controller's code here. The
 /// controller finds us and dials in.
-async fn typed_code(announcer: &mut Announcer<'_>, state: &StateDir, code: &Code) -> Result<()> {
+async fn typed_code(
+    announcer: &mut Announcer<'_>,
+    state: &StateDir,
+    code: &Code,
+    requests: &mut Requests<'_>,
+) -> Result<()> {
     announcer.announce(Pairing::TypedControllerCode).await?;
-    println!("\n    Waiting for the controller to connect...\n");
-    let paired = accept_pairing(announcer.endpoint, code, Side::TypedCode).await;
+    screen::say("Waiting for the controller to connect...");
+    let paired = accept_pairing(announcer.endpoint, code, Side::TypedCode, requests).await;
     announcer.withdraw().await;
     match paired? {
-        Some((conn, stream)) => session(announcer.endpoint, state, &conn, stream).await,
-        None => bail!(
+        Accepted::Paired(conn, stream) => session(announcer.endpoint, state, &conn, stream).await,
+        Accepted::Spent => bail!(
             "the code was rejected {MAX_FAILURES} times; check the code shown by the controller and enter it again"
         ),
+        // Not taken with a typed code (see `accept_pairing`).
+        Accepted::Change(_) => Ok(()),
     }
 }
 
-/// Accepts connections until one pairs with `code`. `None` after
-/// [`MAX_FAILURES`] spent guesses.
+/// How waiting for a controller ended.
+enum Accepted {
+    Paired(Connection, Stream),
+    /// [`MAX_FAILURES`] guesses were spent.
+    Spent,
+    /// The operator chose other relays (with a code of our own only).
+    Change(control::Change),
+}
+
+/// Accepts connections until one pairs with `code`, or the operator
+/// chooses other relays.
 async fn accept_pairing(
     endpoint: &Endpoint,
     code: &Code,
     side: Side,
-) -> Result<Option<(Connection, Stream)>> {
+    requests: &mut Requests<'_>,
+) -> Result<Accepted> {
     let mut failures = 0;
     loop {
-        let incoming = endpoint.accept().await.context("endpoint closed")?;
+        requests.idle.store(true, Ordering::Relaxed);
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => incoming.context("endpoint closed")?,
+            Some(change) = requests.changes.recv() => {
+                // Its asker gave up waiting.
+                if change.answer.is_closed() {
+                    continue;
+                }
+                if side == Side::TypedCode {
+                    let _ = change.answer.send(Err(
+                        "this machine waits for a controller whose code was typed in, which \
+                         uses no relays"
+                            .into(),
+                    ));
+                    continue;
+                }
+                requests.idle.store(false, Ordering::Relaxed);
+                return Ok(Accepted::Change(change));
+            }
+        };
+        requests.idle.store(false, Ordering::Relaxed);
         let conn = match tokio::time::timeout(net::CONNECT_TIMEOUT, incoming).await {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
@@ -321,14 +485,14 @@ async fn accept_pairing(
             continue;
         }
         match net::accept_and_pair(endpoint, &conn, side, code).await {
-            Ok(stream) => return Ok(Some((conn, stream))),
+            Ok(stream) => return Ok(Accepted::Paired(conn, stream)),
             Err(failure) => {
                 conn.close(VarInt::from_u32(1), b"pairing failed");
                 if failure.guess_spent {
                     failures += 1;
                     warn!(%peer, failures, "pairing failed: {}", failure.error);
                     if failures >= MAX_FAILURES {
-                        return Ok(None);
+                        return Ok(Accepted::Spent);
                     }
                 } else {
                     warn!(%peer, "pairing attempt failed: {}", failure.error);
@@ -351,7 +515,7 @@ async fn session(
     let controller = conn.remote_id();
     info!(%controller, "paired with controller");
     state.write("paired-controller", &controller.to_string())?;
-    println!("\n    Paired with controller {controller}.\n");
+    screen::say(format!("Paired with controller {controller}."));
 
     let mut session = Session::default();
     let (comebacks, mut returns) = tokio::sync::mpsc::channel(4);
@@ -393,19 +557,19 @@ async fn session(
             info!(%controller, "the controller lost the connection ({error:#}) and came back");
         } else {
             warn!(%controller, "lost the controller ({error:#}); waiting for it to come back");
-            println!(
-                "\n    Lost the controller. Waiting up to {} for it to come back...\n",
+            screen::say(format!(
+                "Lost the controller. Waiting up to {} for it to come back...",
                 humantime(wait)
-            );
+            ));
         }
         let Some((back, resumed)) = wait_for_resume(early, &mut returns, &session, wait).await
         else {
             warn!(%controller, "the controller didn't come back; ending the session");
-            println!("\n    The controller didn't come back.\n");
+            screen::say("The controller didn't come back.");
             break Ok(());
         };
         info!(%controller, answered = session.answered, "the controller is back");
-        println!("\n    The controller is back.\n");
+        screen::say("The controller is back.");
         (conn, stream) = (back, resumed);
     };
     acceptor.abort();
@@ -596,7 +760,7 @@ async fn shut_down(how: Shutdown) -> Result<()> {
         Shutdown::PowerOff => ("poweroff", "Powering off."),
     };
     info!(how = verb, "installed; shutting down");
-    println!("\n    Installed. {message}\n");
+    screen::say(format!("Installed. {message}"));
     let status = tokio::process::Command::new("systemctl")
         .arg(verb)
         .status()
@@ -670,7 +834,7 @@ async fn serve_controller(
             ControllerMsg::Reject { reason } => {
                 let reason = net::sanitise(&reason, 200);
                 warn!(%reason, "rejected by the controller");
-                println!("\n    Rejected by the controller: {reason}\n");
+                screen::say(format!("Rejected by the controller: {reason}"));
                 return Ok(None);
             }
             // Only first on a new connection.
@@ -759,7 +923,7 @@ async fn prepare_disks(
                 .map(|d| format!("{} ({})", d.device, d.role))
                 .collect();
             info!(disks = ?names, "disks ready to format");
-            println!("\n    About to format: {}\n", names.join(", "));
+            screen::say(format!("About to format: {}", names.join(", ")));
             *prepared = Some(disks);
             TargetMsg::DisksReady
         }
@@ -776,8 +940,10 @@ fn approve(state: &StateDir, approved: &AtomicBool, machine: Option<String>) -> 
     state.write("approved", machine.as_deref().unwrap_or(""))?;
     info!(?machine, "approved by the controller");
     match machine {
-        Some(machine) => println!("\n    Approved as {machine}. Waiting for the controller.\n"),
-        None => println!("\n    Approved. Waiting for the controller.\n"),
+        Some(machine) => screen::say(format!(
+            "Approved as {machine}. Waiting for the controller."
+        )),
+        None => screen::say("Approved. Waiting for the controller."),
     }
     Ok(())
 }
@@ -849,7 +1015,7 @@ fn prepare_store(root: &str) -> TargetMsg {
     match store::check_root(root) {
         Ok(fstype) => {
             info!(%root, %fstype, "ready to receive store paths");
-            println!("\n    Receiving the system into {root} ({fstype}).\n");
+            screen::say(format!("Receiving the system into {root} ({fstype})."));
             TargetMsg::StoreReady { fstype }
         }
         Err(reason) => {
@@ -882,13 +1048,13 @@ async fn install(
     system: &str,
     host_key_path: Option<&str>,
 ) -> Result<TargetMsg> {
-    println!("\n    Installing the boot loader...\n");
+    screen::say("Installing the boot loader...");
     Ok(
         match nixos::install(state, stream, root, system, host_key_path).await? {
             Ok(()) => TargetMsg::InstallDone,
             Err(error) => {
                 warn!(%error, "nixos-install");
-                println!("\n    Installing failed: {error}\n");
+                screen::say(format!("Installing failed: {error}"));
                 TargetMsg::InstallFailed { error }
             }
         },
@@ -924,16 +1090,16 @@ async fn run_disko(
             error: "the disks were not prepared".to_string(),
         });
     };
-    println!("\n    Formatting...\n");
+    screen::say("Formatting...");
     Ok(
         match disko::run(state, stream, script, &disks, key_files).await? {
             Ok(()) => {
-                println!("\n    Formatted and mounted.\n");
+                screen::say("Formatted and mounted.");
                 TargetMsg::DiskoDone
             }
             Err(error) => {
                 warn!(%error, "disko");
-                println!("\n    Formatting failed: {error}\n");
+                screen::say(format!("Formatting failed: {error}"));
                 TargetMsg::DiskoFailed { error }
             }
         },

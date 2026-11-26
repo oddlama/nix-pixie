@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod child;
 pub mod cli;
+pub mod control;
 pub mod controller;
 pub mod discovery;
 pub mod disko;
@@ -35,6 +36,7 @@ pub mod probe;
 pub mod push;
 pub mod relay_status;
 pub mod rendezvous;
+pub mod screen;
 pub mod secrets;
 pub mod state;
 pub mod store;

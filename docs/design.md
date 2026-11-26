@@ -985,8 +985,17 @@ the repository, at points of the install.
 **Built:** `packages.<system>.installer-iso` = `installation-cd-minimal` +
 `nixosModules.installer` (agent, wired networking via networkd, firewall for
 UDP 47011/47012/5353). Boots to tty1 with the pairing code, about 10 s after
-the boot menu in QEMU. The code is printed by the agent's service onto the
-console, next to the autologin prompt, until the tty1 UI exists.
+the boot menu in QEMU.
+
+**Relays at runtime** (implemented): `pixie relay URL…|off|n0|default`
+(`nix-pixie relay`, through `sudo` for the ISO's user) goes over the agent's
+control socket (`control.sock` in the state directory, which only root can
+enter). The agent takes it only while it
+waits for a controller, never while one pairs or is paired, which it
+refuses: changing relays means a new endpoint (with the same key) and a new
+code, since with relays or without them nameplates differ. The choice is
+kept in the state directory, so a restarted agent keeps it until the next
+boot.
 `nixosModules.installer` works in any custom live image.
 `services.nix-pixie-agent.relay.{enable,urls}` chooses the relays (§1); with
 `openFirewall = false` and a relay in reach, the image opens no ports at

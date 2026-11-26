@@ -133,6 +133,9 @@ pkgs.testers.runNixOSTest {
           target.succeed("rm -rf /mnt/nix")
           current = code()
           push_in_background("interrupted", current, "/mnt")
+          # Not while a controller is paired: that would end its session.
+          refused = target.fail("pixie relay off 2>&1")
+          assert "a controller is pairing or paired right now" in refused, refused
           controller.succeed("systemctl kill -s INT interrupted")
           assert finished("interrupted") != "success"
           # Closed on purpose, not lost: the target doesn't wait for it.

@@ -13,6 +13,8 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+use crate::screen;
+
 /// How long the relay may be away before it counts as unreachable.
 pub const PATIENCE: Duration = Duration::from_secs(15);
 /// The longest error shown.
@@ -123,6 +125,7 @@ pub async fn watch(endpoint: Endpoint, configured: String, shown: watch::Sender<
         if !reach.same_news(&shown.borrow()) {
             report(&reach, &configured);
         }
+        screen::relay(Some(reach.line(&configured)));
         shown.send_replace(reach.clone());
         // Wake up when it changes, or when the patience runs out.
         let deadline = (!matches!(reach, Reach::Unreachable { .. } | Reach::Reachable(_)))
@@ -148,5 +151,5 @@ fn report(reach: &Reach, configured: &str) {
         Reach::Reachable(relay) => info!(%relay, "relay reachable"),
         Reach::Unreachable { relay, error } => warn!(?relay, ?error, "relay not reachable"),
     }
-    println!("\n    {}\n", reach.line(configured));
+    screen::say(reach.line(configured));
 }

@@ -259,7 +259,11 @@ or none at all:
 
 - **Your own relay:** `--relay https://relay.example.org` on the controller,
   and `services.nix-pixie-agent.relay.urls` in the installer image. Both sides
-  need the same one, so the target shows the flag next to its code.
+  need the same one, so the target shows the flag next to its code. On a
+  running target, run `pixie relay https://relay.example.org` in a shell there
+  (Alt+F2). It shows a new code
+  and keeps the relay until it reboots; `relay off` leaves only the local
+  network, `relay n0` takes n0's relays, and `relay default` goes back.
 - **No relay:** `--no-relay` and `services.nix-pixie-agent.relay.enable = false`.
   The code gets shorter (`42-acid-acorn-acre`) and only finds targets on your
   network.

@@ -8,6 +8,15 @@
 }:
 let
   cfg = config.services.nix-pixie-agent;
+  exe = lib.getExe cfg.package;
+  # `pixie relay URL` and friends, typed on the target's console. They talk
+  # to the agent's control socket, which only root may use.
+  pixie = pkgs.writeShellScriptBin "pixie" ''
+    if [ "$(id -u)" != 0 ] && command -v sudo >/dev/null; then
+      exec sudo ${exe} "$@"
+    fi
+    exec ${exe} "$@"
+  '';
   relayFlags =
     if !cfg.relay.enable then
       [ "--no-relay" ]
@@ -118,6 +127,8 @@ in
         RestartSec = 2;
       };
     };
+
+    environment.systemPackages = [ pixie ];
 
     networking.firewall = lib.mkIf cfg.openFirewall {
       allowedUDPPorts = [
