@@ -90,12 +90,12 @@ fn refuses_disks_that_are_gone_or_in_use_right_now() {
     };
     let present = vec![
         Disk {
-            in_use: true,
+            mounts: vec!["/iso".into()],
             ..disk("vda")
         },
         disk("vdb"),
         Disk {
-            in_use: true,
+            mounts: vec!["/mnt".into()],
             formatted_this_boot: true,
             ..disk("vdc")
         },

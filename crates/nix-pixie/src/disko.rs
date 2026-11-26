@@ -84,11 +84,8 @@ pub fn check_present(disks: &[DiskAssignment], present: &[Disk]) -> Result<(), S
             .iter()
             .find(|d| d.name == wanted.device)
             .ok_or_else(|| format!("{} is gone", wanted.device))?;
-        if !disk.installable() {
-            return Err(format!(
-                "{} is in use (mounted or swap) or read-only; it may be the installer's own disk",
-                wanted.device
-            ));
+        if let Some(reason) = plan::unusable(disk) {
+            return Err(reason);
         }
     }
     Ok(())

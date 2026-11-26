@@ -18,6 +18,8 @@ use crate::net::{hostname, sanitise};
 const EFI_GLOBAL: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 /// Longest string we keep from sysfs or lsblk.
 const MAX_FIELD: usize = 128;
+/// Mount points listed per disk: enough to tell what holds it.
+const MAX_MOUNTS: usize = 16;
 
 /// Everything about this machine. `formatted` are the disks nix-pixie
 /// formatted earlier during this boot.
@@ -220,8 +222,8 @@ pub fn parse_lsblk<S: std::hash::BuildHasher>(
                 return None;
             }
             let mut contents = Vec::new();
-            let mut in_use = false;
-            walk(dev, &mut contents, &mut in_use);
+            let mut mounts = Vec::new();
+            walk(dev, &mut contents, &mut mounts);
             Some(Disk {
                 by_id: by_id.get(&name).cloned().unwrap_or_default(),
                 size_bytes: number(dev, "size"),
@@ -233,7 +235,7 @@ pub fn parse_lsblk<S: std::hash::BuildHasher>(
                 read_only: flag(dev, "ro"),
                 partition_table: text(dev, "pttype"),
                 contents,
-                in_use,
+                mounts,
                 formatted_this_boot: false,
                 name,
             })
@@ -242,7 +244,7 @@ pub fn parse_lsblk<S: std::hash::BuildHasher>(
 }
 
 /// Collects signatures and mounts of `dev` and everything below it.
-fn walk(dev: &Value, contents: &mut Vec<Content>, in_use: &mut bool) {
+fn walk(dev: &Value, contents: &mut Vec<Content>, mounts: &mut Vec<String>) {
     let fstype = text(dev, "fstype");
     let partlabel = text(dev, "partlabel");
     if fstype.is_some() || partlabel.is_some() {
@@ -254,12 +256,17 @@ fn walk(dev: &Value, contents: &mut Vec<Content>, in_use: &mut bool) {
             partlabel,
         });
     }
-    if let Some(mounts) = dev.get("mountpoints").and_then(Value::as_array)
-        && mounts
-            .iter()
-            .any(|m| m.as_str().is_some_and(|m| !m.is_empty()))
+    for mount in dev
+        .get("mountpoints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|m| !m.is_empty())
     {
-        *in_use = true;
+        if mounts.len() < MAX_MOUNTS {
+            mounts.push(sanitise(mount, MAX_FIELD));
+        }
     }
     for child in dev
         .get("children")
@@ -267,7 +274,7 @@ fn walk(dev: &Value, contents: &mut Vec<Content>, in_use: &mut bool) {
         .into_iter()
         .flatten()
     {
-        walk(child, contents, in_use);
+        walk(child, contents, mounts);
     }
 }
 

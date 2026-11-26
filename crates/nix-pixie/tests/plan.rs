@@ -30,7 +30,7 @@ fn disk(name: &str, by_id: &[&str]) -> Disk {
 fn target() -> Vec<Disk> {
     vec![
         Disk {
-            in_use: true,
+            mounts: vec!["/iso".into()],
             ..disk("vda", &["virtio-installer"])
         },
         disk("vdb", &["virtio-pixie-a"]),
@@ -204,9 +204,46 @@ fn unset_devices_explain_the_options() {
 }
 
 #[test]
+fn a_recorded_disk_in_use_says_what_holds_it() {
+    let mut disks = target();
+    disks[2].mounts = vec!["/mnt".into(), "/mnt/boot".into()];
+    let recorded = disko(&[("main", Some("/dev/disk/by-id/virtio-pixie-b"))]);
+    let err = resolve(
+        &slots(&recorded, true, &disks).unwrap(),
+        &disks,
+        &requests(&[]),
+    )
+    .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(
+        err.starts_with("main can't go onto the disk recorded for it, vdc; choose another")
+            && err.contains("vdc is in use (/mnt, /mnt/boot), and not by an earlier attempt")
+            && err.contains("unmount it on the target, or boot the installer again"),
+        "{err}"
+    );
+    // Its own attempt earlier in this boot: disko unmounts it again.
+    disks[2].formatted_this_boot = true;
+    let choices = done(
+        resolve(
+            &slots(&recorded, true, &disks).unwrap(),
+            &disks,
+            &requests(&[]),
+        )
+        .unwrap(),
+    );
+    assert_eq!(choices[0].disk, "vdc");
+}
+
+#[test]
 fn refuses_disks_in_use_and_double_assignments() {
-    let err = plan(&agnostic(), false, &[("main", "vda")]).unwrap_err();
-    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+    let err = format!(
+        "{:#}",
+        plan(&agnostic(), false, &[("main", "vda")]).unwrap_err()
+    );
+    assert!(
+        err.contains("vda is in use (/iso)") && err.contains("unmount it"),
+        "{err}"
+    );
 
     let two = disko(&[
         ("main", Some("/dev/disk/by-pixie/main")),
@@ -222,7 +259,7 @@ fn refuses_disks_in_use_and_double_assignments() {
 #[test]
 fn disks_formatted_during_this_boot_stay_installable() {
     let mut disks = target();
-    disks[2].in_use = true;
+    disks[2].mounts = vec!["/mnt".into(), "/mnt/boot".into()];
     disks[2].formatted_this_boot = true;
     let config = agnostic();
     let choices = done(

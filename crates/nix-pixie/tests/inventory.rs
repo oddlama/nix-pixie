@@ -41,7 +41,7 @@ fn parses_lsblk() {
     assert_eq!(vda.size_bytes, 1 << 30);
     assert_eq!(vda.partition_table.as_deref(), Some("gpt"));
     assert!(vda.rotational && !vda.removable && !vda.read_only);
-    assert!(vda.in_use, "swap inside LUKS counts as in use");
+    assert_eq!(vda.mounts, ["[SWAP]"], "swap inside LUKS counts as in use");
     let fstypes: Vec<_> = vda.contents.iter().map(|c| c.fstype.as_deref()).collect();
     assert_eq!(fstypes, [Some("ext4"), Some("crypto_LUKS"), Some("swap")]);
     assert_eq!(vda.contents[0].partlabel.as_deref(), Some("disk-main-root"));
@@ -53,7 +53,7 @@ fn parses_lsblk() {
         Some("Samsung SSD 980 [31m"),
         "control characters stripped"
     );
-    assert!(!nvme.rotational && nvme.read_only && !nvme.in_use && !nvme.has_data());
+    assert!(!nvme.rotational && nvme.read_only && !nvme.in_use() && !nvme.has_data());
 }
 
 #[test]

@@ -79,6 +79,11 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 
     let state = StateDir::create(args.state_dir)?;
     // A controller's code has no nameplate to meet at: without one, relays
+    // From an earlier run of the agent during this boot: the disks it
+    // formatted and the host key it made carry over, its session doesn't.
+    for stale in ["code", "paired-controller", "approved", "relay"] {
+        state.remove(stale);
+    }
     // are of no use.
     let relays = if controller_code.is_some() {
         Relays::Disabled

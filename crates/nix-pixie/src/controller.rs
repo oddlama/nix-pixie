@@ -562,7 +562,17 @@ fn disk_parts(disk: &Disk) -> (String, String, Option<Tone>) {
         .collect::<Vec<_>>()
         .join(" ");
     let (state, tone) = if !disk.installable() {
-        ("in use, not installable".to_string(), Some(Tone::Dim))
+        (
+            format!(
+                "in use ({}), not installable",
+                disk.mounts
+                    .iter()
+                    .map(|m| clean(m))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some(Tone::Dim),
+        )
     } else if disk.has_data() {
         let mut found: Vec<String> = disk.partition_table.iter().map(|t| clean(t)).collect();
         found.extend(disk.contents.iter().map(|c| {

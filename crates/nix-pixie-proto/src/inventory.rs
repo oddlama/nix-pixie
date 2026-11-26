@@ -80,9 +80,9 @@ pub struct Disk {
     /// Signatures found on the disk itself and its partitions (and anything
     /// stacked on them, like LUKS or LVM).
     pub contents: Vec<Content>,
-    /// Something on it is mounted or used as swap, e.g. the installer's own
-    /// boot medium.
-    pub in_use: bool,
+    /// Where things on it are mounted (`[SWAP]` for swap), e.g. the
+    /// installer's own boot medium.
+    pub mounts: Vec<String>,
     /// nix-pixie formatted it earlier during this boot of the installer, so
     /// whatever is mounted from it belongs to that attempt, and the next
     /// disko run unmounts it.
@@ -90,11 +90,17 @@ pub struct Disk {
 }
 
 impl Disk {
+    /// Something on it is mounted or used as swap.
+    #[must_use]
+    pub fn in_use(&self) -> bool {
+        !self.mounts.is_empty()
+    }
+
     /// Whether nix-pixie may install onto it. Not the installer's own boot
     /// medium or anything else in use, unless it was nix-pixie's own doing.
     #[must_use]
     pub fn installable(&self) -> bool {
-        self.size_bytes > 0 && !self.read_only && (!self.in_use || self.formatted_this_boot)
+        self.size_bytes > 0 && !self.read_only && (!self.in_use() || self.formatted_this_boot)
     }
 
     /// Whether installing onto this disk would destroy something.

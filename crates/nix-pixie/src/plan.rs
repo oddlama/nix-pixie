@@ -17,6 +17,7 @@ use nix_pixie_proto::inventory::Disk;
 use serde::Serialize;
 
 use crate::disko::is_plain_name;
+use crate::net::sanitise;
 use crate::system::Disko;
 
 const BY_ID: &str = "/dev/disk/by-id/";
@@ -280,8 +281,11 @@ pub fn resolve(
             let disk = by_name(disk).context("the disk disappeared")?;
             assigned.take(slot, disk).with_context(|| {
                 format!(
-                    "the recorded disk for {}; choose another with --disk {}=...",
-                    slot.role, slot.role
+                    "{} can't go onto the disk recorded for it, {disk}; choose another with \
+                     --disk {}=...",
+                    slot.role,
+                    slot.role,
+                    disk = sanitise(&disk.name, 64)
                 )
             })?;
         }
@@ -347,14 +351,32 @@ struct Assigned {
     chosen: BTreeMap<String, String>,
 }
 
+/// Why nix-pixie may not install onto `disk`, for the operator, if it may
+/// not (see [`Disk::installable`]). The target's own words are sanitised.
+pub fn unusable(disk: &Disk) -> Option<String> {
+    if disk.installable() {
+        return None;
+    }
+    let name = sanitise(&disk.name, 64);
+    Some(if disk.size_bytes == 0 {
+        format!("{name} has no medium")
+    } else if disk.read_only {
+        format!("{name} is read-only")
+    } else {
+        let mounts: Vec<String> = disk.mounts.iter().map(|m| sanitise(m, 128)).collect();
+        format!(
+            "{name} is in use ({}), and not by an earlier attempt of this installer: it may \
+             be the installer's own disk. If you mounted it yourself, unmount it on the \
+             target, or boot the installer again",
+            mounts.join(", ")
+        )
+    })
+}
+
 impl Assigned {
     fn take(&mut self, slot: &Slot, disk: &Disk) -> Result<()> {
-        if !disk.installable() {
-            bail!(
-                "{} ({}) is in use or read-only; it may be the installer's own disk",
-                disk.name,
-                slot.role
-            );
+        if let Some(reason) = unusable(disk) {
+            bail!("{reason} ({} would go there)", slot.role);
         }
         if let Some(other) = self.taken.insert(disk.name.clone(), slot.role.clone()) {
             bail!("{} is chosen for both {other} and {}", disk.name, slot.role);

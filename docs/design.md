@@ -760,7 +760,10 @@ evaluates each disk's `device` (unset ones as `null`) and classifies it:
   nix-pixie formatted earlier during this boot of the installer. What is
   mounted from them is that attempt's, and disko's destroy step unmounts it,
   so reinstalling in the same session works. The agent records them in its
-  tmpfs state directory.
+  tmpfs state directory, which outlives restarts of the agent until the next
+  boot (`RuntimeDirectoryPreserve`); only the session's files (code, paired
+  controller) are cleared when it starts. Disks in use for any other reason
+  are refused with what is mounted from them.
 - Refused before building: a disk that is not being formatted but already
   carries a GPT partition label or ZFS pool name the layout creates (e.g. a
   disk from an earlier install with the same layout). disko finds its

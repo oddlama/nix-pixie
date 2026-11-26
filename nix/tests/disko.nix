@@ -155,7 +155,14 @@ pkgs.testers.runNixOSTest {
         target.succeed("test -e /mnt/precious")
         next_code(current)
 
-    with subtest("--wipe reinstalls onto the recorded disk"):
+    with subtest("--wipe reinstalls onto the recorded disk, mounted, after the agent restarted"):
+        # The agent still knows the disk is its own doing, though its
+        # filesystems are mounted (disko unmounts them).
+        old = target.succeed("cat /run/nix-pixie/code").strip()
+        target.succeed("systemctl restart nix-pixie-agent")
+        next_code(old)
+        target.succeed("grep -qx vdc /run/nix-pixie/formatted")
+        assert mounted_from("/mnt") == "/dev/vdc2", mounted_from("/mnt")
         report = install("--machine web1 --yes --wipe")
         assert report["disks"][0]["disk"] == "vdc", report
         assert mounted_from("/mnt") == "/dev/vdc2", mounted_from("/mnt")

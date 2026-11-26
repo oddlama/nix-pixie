@@ -108,6 +108,10 @@ in
         );
         RuntimeDirectory = "nix-pixie";
         RuntimeDirectoryMode = "0700";
+        # Kept until the next boot: a restarted agent must still know which
+        # disks it formatted, or their mounts would keep it from formatting
+        # them again.
+        RuntimeDirectoryPreserve = true;
         # The pairing code is printed on stdout: show it on the console too.
         StandardOutput = "journal+console";
         Restart = "always";
