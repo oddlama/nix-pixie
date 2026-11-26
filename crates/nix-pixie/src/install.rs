@@ -48,8 +48,11 @@ const OUTPUT_TAIL_LINES: usize = 40;
 /// How `nix-pixie controller install` was invoked.
 pub struct InstallArgs {
     pub identity: PathBuf,
-    /// `None`: asked for on the terminal, right before pairing.
+    /// `None`: asked for on the terminal, right before pairing, unless
+    /// there is a controller's code.
     pub code: Option<String>,
+    /// A controller's code to pair with instead.
+    pub controller_code_file: Option<PathBuf>,
     pub timeout: Duration,
     pub method: Method,
     /// Flake with the `pixie` output and the configurations.
@@ -89,11 +92,12 @@ pub enum Then {
 /// Pairs with the target showing the code, and installs the machine onto it.
 pub async fn install(args: InstallArgs) -> Result<()> {
     // A typo in a given code fails at once.
-    let given = args
-        .code
-        .as_deref()
-        .map(controller::target_code)
-        .transpose()?;
+    if let Some(code) = &args.code {
+        controller::target_code(code)?;
+    }
+    if let Some(path) = &args.controller_code_file {
+        controller::controller_code_file(path)?;
+    }
     let requested = parse_disk_args(&args.disks)?;
     ui::steps(step_list(&args, Known::default()));
     // Check what we can before pairing: a mistake shouldn't cost the code.
@@ -112,20 +116,25 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         None
     };
 
-    let code = controller::code_or_ask(given, args.method, &args.targets).await?;
-    let nameplate = code.nameplate().context(ui::code::NAMEPLATE_NEEDED)?;
+    let code = controller::pair_code(
+        args.code.as_deref(),
+        args.controller_code_file.as_deref(),
+        args.method,
+        &args.targets,
+    )
+    .await?;
     let search = controller::Search {
         identity: &args.identity,
         method: args.method,
         targets: &args.targets,
         relays: &args.relays,
     };
-    let step = ui::start_with("pair", search.looking(nameplate));
-    let (endpoint, mut discovery) = search.start(nameplate).await?;
+    let step = ui::start_with("pair", search.looking(code));
+    let (endpoint, mut discovery) = search.start(code).await?;
     let result = tokio::select! {
         r = async {
             let (conn, stream, peer) = controller::pair_with_target(
-                &endpoint, &mut discovery, &code, nameplate, args.timeout,
+                &endpoint, &mut discovery, code, args.timeout,
             )
             .await?;
             step.done(controller::describe_peer(&conn, &peer));

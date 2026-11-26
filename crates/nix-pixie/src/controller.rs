@@ -46,8 +46,11 @@ pub fn print_id(identity_path: &Path) -> Result<()> {
 /// How `nix-pixie controller pair` was invoked.
 pub struct PairArgs {
     pub identity: PathBuf,
-    /// `None`: asked for on the terminal, right before pairing.
+    /// `None`: asked for on the terminal, right before pairing, unless
+    /// there is a controller's code.
     pub code: Option<String>,
+    /// A controller's code to pair with instead.
+    pub controller_code_file: Option<PathBuf>,
     pub timeout: Duration,
     pub method: Method,
     /// Flake with the `pixie` output, for matching and writing reports.
@@ -70,7 +73,12 @@ pub struct PairArgs {
 /// asks the operator to approve it, and prints one JSON object describing it.
 pub async fn pair(args: PairArgs) -> Result<()> {
     // A typo in a given code fails at once.
-    let given = args.code.as_deref().map(target_code).transpose()?;
+    if let Some(code) = &args.code {
+        target_code(code)?;
+    }
+    if let Some(path) = &args.controller_code_file {
+        controller_code_file(path)?;
+    }
     // Check everything we can first: a mistake shouldn't cost a pairing code.
     push::check_local_paths(&args.push).await?;
     let flake = match &args.flake {
@@ -90,20 +98,25 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     }
 
     ui::steps(pair_steps(false, !args.push.is_empty()));
-    let code = code_or_ask(given, args.method, &args.targets).await?;
-    let nameplate = code.nameplate().context(ui::code::NAMEPLATE_NEEDED)?;
+    let code = pair_code(
+        args.code.as_deref(),
+        args.controller_code_file.as_deref(),
+        args.method,
+        &args.targets,
+    )
+    .await?;
     let search = Search {
         identity: &args.identity,
         method: args.method,
         targets: &args.targets,
         relays: &args.relays,
     };
-    let step = ui::start_with("pair", search.looking(nameplate));
-    let (endpoint, mut discovery) = search.start(nameplate).await?;
+    let step = ui::start_with("pair", search.looking(code));
+    let (endpoint, mut discovery) = search.start(code).await?;
     let result = tokio::select! {
         r = async {
             let (conn, stream, peer) =
-                pair_with_target(&endpoint, &mut discovery, &code, nameplate, args.timeout).await?;
+                pair_with_target(&endpoint, &mut discovery, code, args.timeout).await?;
             step.done(describe_peer(&conn, &peer));
             let link = Link::new(&endpoint, &peer, conn, stream);
             let result = review(&link, &peer, flake.as_ref(), &args).await;
@@ -216,38 +229,118 @@ pub struct Search<'a> {
     pub relays: &'a Relays,
 }
 
-impl Search<'_> {
-    /// Where it looks for the target showing `nameplate`, for the operator.
-    pub fn looking(&self, nameplate: u32) -> String {
-        if !self.targets.is_empty() {
-            return format!("asking {}", self.targets.join(", "));
-        }
-        let at_relay = self.relays.is_enabled()
-            && NameplateSpace::of(nameplate) == Some(NameplateSpace::Relay);
-        if at_relay {
-            format!("looking for {nameplate} on this network and at the relay")
-        } else {
-            format!("looking for {nameplate} on this network")
+/// The code a pairing proves, and whose it is.
+#[derive(Debug, Clone, Copy)]
+pub enum PairCode {
+    /// Shown by the target, starting with its nameplate; typed here.
+    Target { code: Code, nameplate: u32 },
+    /// Ours (`--controller-code-file`), handed to the target by other means,
+    /// such as the kernel command line of an installer booted over USB.
+    /// The target waits for this controller to dial it.
+    Controller(Code),
+}
+
+impl PairCode {
+    /// The code's nameplate, if it has one.
+    fn nameplate(self) -> Option<u32> {
+        match self {
+            Self::Target { nameplate, .. } => Some(nameplate),
+            Self::Controller(_) => None,
         }
     }
 
-    /// Binds the controller's endpoint and starts looking for the target
-    /// showing `nameplate`: at the given hosts, or else on the local network
-    /// and, if the nameplate is one for relays, at its rendezvous.
-    pub async fn start(&self, nameplate: u32) -> Result<(Endpoint, Discovery)> {
+    /// A rendezvous to look for the target at, with relays.
+    fn at_relay(self) -> Option<u32> {
+        self.nameplate()
+            .filter(|n| NameplateSpace::of(*n) == Some(NameplateSpace::Relay))
+    }
+
+    /// Which target, for messages.
+    fn which(self) -> String {
+        match self {
+            Self::Target { nameplate, .. } => format!("target with nameplate {nameplate}"),
+            Self::Controller(_) => "target waiting for this controller's code".into(),
+        }
+    }
+}
+
+/// The code of a target or of this controller, as given or asked for.
+///
+/// # Errors
+///
+/// If a file can't be read, or a code doesn't parse or is of the wrong kind.
+pub async fn pair_code(
+    target: Option<&str>,
+    controller: Option<&Path>,
+    method: Method,
+    targets: &[String],
+) -> Result<PairCode> {
+    if let Some(path) = controller {
+        return Ok(PairCode::Controller(controller_code_file(path)?));
+    }
+    let code = code_or_ask(target.map(target_code).transpose()?, method, targets).await?;
+    let nameplate = code.nameplate().context(ui::code::NAMEPLATE_NEEDED)?;
+    Ok(PairCode::Target { code, nameplate })
+}
+
+/// A controller's code from `path`: three words, without a nameplate.
+///
+/// # Errors
+///
+/// If the file can't be read, or doesn't hold a controller's code.
+pub fn controller_code_file(path: &Path) -> Result<Code> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the code from {}", path.display()))?;
+    let code =
+        Code::parse(text.trim()).with_context(|| format!("the code in {}", path.display()))?;
+    if code.nameplate().is_some() {
+        bail!(
+            "{} holds a target's code (it starts with a number); a controller's code is three \
+             words, e.g. from `nix-pixie controller new-code`",
+            path.display()
+        );
+    }
+    Ok(code)
+}
+
+impl Search<'_> {
+    /// Where it looks for the target, for the operator.
+    pub fn looking(&self, code: PairCode) -> String {
+        if !self.targets.is_empty() {
+            return format!("asking {}", self.targets.join(", "));
+        }
+        match code {
+            PairCode::Target { nameplate, .. }
+                if self.relays.is_enabled() && code.at_relay().is_some() =>
+            {
+                format!("looking for {nameplate} on this network and at the relay")
+            }
+            PairCode::Target { nameplate, .. } => {
+                format!("looking for {nameplate} on this network")
+            }
+            PairCode::Controller(_) => "looking for a target waiting for this code".into(),
+        }
+    }
+
+    /// Binds the controller's endpoint and starts looking for the target:
+    /// at the given hosts, or else on the local network and, if the code's
+    /// nameplate is one for relays, at its rendezvous.
+    pub async fn start(&self, code: PairCode) -> Result<(Endpoint, Discovery)> {
         let targets = discovery::resolve_targets(self.targets).await?;
-        // A target with a short nameplate isn't at any rendezvous, so
-        // don't connect to relays for it.
-        let relays =
-            if targets.is_empty() && NameplateSpace::of(nameplate) == Some(NameplateSpace::Relay) {
-                self.relays.clone()
-            } else {
-                Relays::Disabled
-            };
+        // A target with a short nameplate (or none) isn't at any rendezvous,
+        // so don't connect to relays for it.
+        let rendezvous = code.at_relay().filter(|_| targets.is_empty());
+        let relays = if rendezvous.is_some() {
+            self.relays.clone()
+        } else {
+            Relays::Disabled
+        };
         let secret = identity::load_or_create(self.identity)?;
         let endpoint = net::bind(secret, 0, &relays).await?;
         let mut discovery = Discovery::start(self.method, targets).await?;
-        if relays.is_enabled() {
+        if let Some(nameplate) = rendezvous
+            && relays.is_enabled()
+        {
             discovery.search_relays(&endpoint, nameplate, &relays);
         }
         Ok((endpoint, discovery))
@@ -257,41 +350,43 @@ impl Search<'_> {
 pub async fn pair_with_target(
     endpoint: &Endpoint,
     discovery: &mut Discovery,
-    code: &Code,
-    nameplate: u32,
+    pair: PairCode,
     timeout: Duration,
 ) -> Result<(Connection, Stream, Peer)> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut dialer = Dialer::default();
+    let which = pair.which();
+    let (wanted, side, code) = match pair {
+        PairCode::Target { code, nameplate } => {
+            (Pairing::ShowsCode { nameplate }, Side::TypedCode, code)
+        }
+        PairCode::Controller(code) => (Pairing::TypedControllerCode, Side::OwnsCode, code),
+    };
     loop {
         let Ok(peer) = tokio::time::timeout_at(deadline, discovery.next()).await else {
             if dialer.paired_with_any() {
-                bail!(
-                    "no target with nameplate {nameplate} accepted the code ({})",
-                    discovery.describe()
-                );
+                bail!("no {which} accepted the code ({})", discovery.describe());
             }
             if let Some(error) = &dialer.last_connect_error {
-                bail!(
-                    "found a target with nameplate {nameplate}, but could not connect to it: {error}"
-                );
+                bail!("found a {which}, but could not connect to it: {error}");
             }
-            bail!(
-                "no target with nameplate {nameplate} found ({}). {}",
-                discovery.describe(),
-                discovery.hint(nameplate)
-            );
+            let hint = pair
+                .nameplate()
+                .map_or("", |nameplate| discovery.hint(nameplate));
+            bail!("no {which} found ({}). {hint}", discovery.describe());
         };
         let peer = peer?;
-        // Nameplates are random and small, so two targets can share one; try each.
-        if peer.pairing != (Pairing::ShowsCode { nameplate }) || !dialer.would_dial(&peer) {
+        // Nameplates are random and small, so two targets can share one; try
+        // each. Every target waiting for a controller's code is tried too.
+        if peer.pairing != wanted || !dialer.would_dial(&peer) {
             continue;
         }
         let peer = discovery.settle(peer.id, SETTLE).await.unwrap_or(peer);
-        match dialer.attempt(endpoint, &peer, Side::TypedCode, code).await {
+        match dialer.attempt(endpoint, &peer, side, &code).await {
             Attempt::Paired(conn, stream) => return Ok((conn, stream, peer)),
             Attempt::TooManyFailures => bail!(
-                "{MAX_FAILURES} machines with nameplate {nameplate} rejected the code. Someone may be impersonating targets; get a new code from the target"
+                "{MAX_FAILURES} machines rejected the code (a {which}). Someone may be \
+                 impersonating targets; use a new code"
             ),
             Attempt::Skipped | Attempt::Failed => {}
         }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::net::Relays;
@@ -65,6 +65,10 @@ pub enum Command {
         /// `--target`: relays aren't used.
         #[arg(long, value_name = "CODE")]
         controller_code: Option<String>,
+        /// Like --controller-code, from a file, e.g. a systemd credential
+        /// set on the kernel command line: unattended, with no screen.
+        #[arg(long, value_name = "FILE", conflicts_with = "controller_code")]
+        controller_code_file: Option<PathBuf>,
         #[command(flatten)]
         relay: RelayArgs,
     },
@@ -121,6 +125,10 @@ pub enum TargetCommand {
 pub enum ControllerCommand {
     /// Print this controller's endpoint id (creates the identity if needed).
     Id,
+    /// Print a new controller's code, for a target that gets it some other
+    /// way than by typing (`agent --controller-code-file`) and for
+    /// `--controller-code-file` here. Use each code once.
+    NewCode,
     /// Pair with the target showing CODE; prints the paired target as JSON.
     Pair {
         /// The code shown on the target, e.g. 482913-acid-acorn-acre. Asked
@@ -128,6 +136,12 @@ pub enum ControllerCommand {
         /// shell's history.
         #[arg(long)]
         code: Option<String>,
+        /// Pair with a target waiting for this controller's code (three
+        /// words, from `nix-pixie controller new-code`), which was handed to
+        /// it some other way, e.g. on the kernel command line of an
+        /// installer booted over USB. For targets without a screen.
+        #[arg(long, value_name = "FILE", conflicts_with = "code")]
+        controller_code_file: Option<PathBuf>,
         /// Give up after this many seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -171,6 +185,12 @@ pub enum ControllerCommand {
         /// shell's history.
         #[arg(long)]
         code: Option<String>,
+        /// Pair with a target waiting for this controller's code (three
+        /// words, from `nix-pixie controller new-code`), which was handed to
+        /// it some other way, e.g. on the kernel command line of an
+        /// installer booted over USB. For targets without a screen.
+        #[arg(long, value_name = "FILE", conflicts_with = "code")]
+        controller_code_file: Option<PathBuf>,
         /// Flake with the `pixie` output and the configurations.
         #[arg(long, default_value = ".")]
         flake: String,
@@ -255,8 +275,18 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             state_dir,
             port,
             controller_code,
+            controller_code_file,
             relay,
         } => {
+            let controller_code = match controller_code_file {
+                Some(path) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading the code from {}", path.display()))?
+                        .trim()
+                        .to_string(),
+                ),
+                None => controller_code,
+            };
             agent::run(agent::AgentArgs {
                 state_dir,
                 port,
@@ -303,8 +333,13 @@ async fn relay(state_dir: &Path, words: &[String]) -> Result<()> {
 async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result<()> {
     match command {
         ControllerCommand::Id => controller::print_id(&identity),
+        ControllerCommand::NewCode => {
+            println!("{}", nix_pixie_proto::code::Code::generate(None)?);
+            Ok(())
+        }
         ControllerCommand::Pair {
             code,
+            controller_code_file,
             timeout,
             discovery,
             flake,
@@ -318,6 +353,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
             controller::pair(controller::PairArgs {
                 identity,
                 code,
+                controller_code_file,
                 timeout: Duration::from_secs(timeout),
                 method: discovery,
                 flake,
@@ -332,6 +368,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
         }
         ControllerCommand::Install {
             code,
+            controller_code_file,
             flake,
             machine,
             disks,
@@ -348,6 +385,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
             install::install(install::InstallArgs {
                 identity,
                 code,
+                controller_code_file,
                 timeout: Duration::from_secs(timeout),
                 method: discovery,
                 flake,
