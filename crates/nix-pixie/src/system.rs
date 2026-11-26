@@ -70,6 +70,10 @@ const FACTS: &str = r#"config: {
     in {
       systemdBoot = loader.systemd-boot.enable;
       lanzaboote = config.boot.lanzaboote.enable or false;
+      # Its own enrollment on the first boot, in versions that have it.
+      enrollKeys = (config.boot.lanzaboote.enable or false)
+        && (config.boot.lanzaboote.autoEnrollKeys.enable or false);
+      enrollReboots = config.boot.lanzaboote.autoEnrollKeys.autoReboot or false;
       grub = loader.grub.enable;
       grubEfi = loader.grub.efiSupport;
       grubBios = builtins.any (d: d != "nodev") grubDevices;
@@ -112,6 +116,13 @@ pub struct Boot {
     pub systemd_boot: bool,
     /// lanzaboote (Secure Boot), if its module is imported.
     pub lanzaboote: bool,
+    /// lanzaboote enrolls the Secure Boot keys on the first boot
+    /// (`boot.lanzaboote.autoEnrollKeys`). That needs the firmware in Setup
+    /// Mode; otherwise the machine runs without Secure Boot.
+    pub enroll_keys: bool,
+    /// It reboots right after preparing them (`autoEnrollKeys.autoReboot`),
+    /// for the boot loader to enroll them.
+    pub enroll_reboots: bool,
     pub grub: bool,
     /// GRUB installs an EFI binary.
     pub grub_efi: bool,

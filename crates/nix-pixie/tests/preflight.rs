@@ -82,6 +82,39 @@ fn efi_loaders_are_refused_on_bios() {
     assert!(refusal(&variables, &BIOS).contains("canTouchEfiVariables"));
 }
 
+fn enrolling(setup_mode: Option<bool>) -> (Boot, Firmware) {
+    let boot = Boot {
+        lanzaboote: true,
+        enroll_keys: true,
+        ..Boot::default()
+    };
+    (boot, Firmware { setup_mode, ..UEFI })
+}
+
+#[test]
+fn enrolling_secure_boot_keys_needs_setup_mode() {
+    let (boot, firmware) = enrolling(Some(true));
+    assert!(check_boot(&boot, &firmware, "web1").is_ok());
+    let (boot, firmware) = enrolling(Some(false));
+    let err = refusal(&boot, &firmware);
+    assert!(
+        err.contains("is not") && err.contains("Setup Mode") && err.contains("autoEnrollKeys"),
+        "{err}"
+    );
+    let (boot, firmware) = enrolling(None);
+    assert!(refusal(&boot, &firmware).contains("doesn't say whether it is"));
+}
+
+#[test]
+fn lanzaboote_without_enrolling_leaves_the_keys_alone() {
+    let boot = Boot {
+        lanzaboote: true,
+        ..Boot::default()
+    };
+    // Keys already enrolled, by hand or by an earlier install.
+    assert!(check_boot(&boot, &UEFI, "web1").is_ok());
+}
+
 #[test]
 fn bios_only_grub_is_refused_on_uefi() {
     let err = refusal(&grub(false, true), &UEFI);

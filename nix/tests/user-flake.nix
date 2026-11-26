@@ -13,6 +13,8 @@
   # Flake inputs, for their original store paths and NAR hashes.
   nixpkgs,
   disko,
+  # For configurations with Secure Boot, see `lanzaboote.nix`.
+  lanzaboote ? null,
 }:
 {
   # A file in `targets/`, imported by every configuration. It sets everything
@@ -64,12 +66,30 @@ let
         root.inputs = {
           nixpkgs = "nixpkgs";
           disko = "disko";
+        }
+        // lib.optionalAttrs withLanzaboote { lanzaboote = "lanzaboote"; };
+      }
+      // lib.optionalAttrs withLanzaboote {
+        lanzaboote = pathInput lanzaboote // {
+          flake = false;
         };
       };
       root = "root";
       version = 7;
     }
   );
+
+  withLanzaboote = lanzaboote != null;
+  # What lanzaboote's `default.nix` fetches, for the VM's store.
+  lanzabooteSources =
+    let
+      sources = import "${lanzaboote}/sources.nix";
+    in
+    [
+      lanzaboote.outPath
+      sources.crane
+      sources.rust-overlay
+    ];
 
   evalTarget =
     devices: extraModules:
@@ -84,6 +104,7 @@ let
           disko.devices.disk = lib.mapAttrs (_: device: { inherit device; }) devices;
         }
       ]
+      ++ lib.optional withLanzaboote (import ./lanzaboote.nix lanzaboote)
       ++ extraModules;
     }).config;
 
@@ -102,9 +123,15 @@ let
           url = "path:${disko}";
           flake = false;
         };
+        ${lib.optionalString withLanzaboote ''
+          lanzaboote = {
+            url = "path:${lanzaboote}";
+            flake = false;
+          };
+        ''}
       };
       outputs =
-        { self, nixpkgs, disko }:
+        { self, nixpkgs, disko, ... }@inputs:
         let
           pixieLib = import ./nix-pixie/lib.nix { inherit (nixpkgs) lib; };
           target =
@@ -119,7 +146,8 @@ let
                   nixpkgs.hostPlatform = "${system}";
                   disko.devices.disk = nixpkgs.lib.mapAttrs (_: device: { inherit device; }) devices;
                 }
-              ];
+              ]
+              ${lib.optionalString withLanzaboote "++ [ (import ./nix-pixie/lanzaboote.nix inputs.lanzaboote) ]"};
             };
         in
         {
@@ -157,6 +185,7 @@ let
     cp ${../options.nix} $out/nix-pixie/options.nix
     cp ${../nixos/system.nix} $out/nix-pixie/nixos/system.nix
     cp ${../nixos/disks.nix} $out/nix-pixie/nixos/disks.nix
+    ${lib.optionalString withLanzaboote "cp ${./lanzaboote.nix} $out/nix-pixie/lanzaboote.nix"}
   '';
 in
 {
@@ -180,6 +209,7 @@ in
       nixpkgsSource
       disko
     ]
+    ++ lib.optionals withLanzaboote lanzabooteSources
     ++ lib.concatMap (c: [
       c.system.build.diskoScript
       c.system.build.toplevel

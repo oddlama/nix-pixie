@@ -31,7 +31,7 @@ use crate::plan::{self, Choice, Resolution};
 use crate::preflight;
 use crate::push;
 use crate::secrets;
-use crate::system::{Built, Configuration, Disko, Facts, Ssh};
+use crate::system::{Boot, Built, Configuration, Disko, Facts, Ssh};
 use crate::target::Target;
 use crate::ui;
 
@@ -338,6 +338,9 @@ struct Check {
     machine: String,
     /// The first boot may wait for a disk passphrase on the console.
     encrypted: bool,
+    /// The first boot enrolls the Secure Boot keys: `Some(true)` if it
+    /// reboots right after for that.
+    enrolls_keys: Option<bool>,
 }
 
 impl Check {
@@ -453,6 +456,19 @@ fn boot_notice(check: &Check, args: &InstallArgs) -> Vec<String> {
              booting; type it there."
                 .into(),
         );
+    }
+    match check.enrolls_keys {
+        Some(true) => lines.push(
+            "On its first boot it prepares its Secure Boot keys and reboots by itself, for \
+             systemd-boot to enroll them."
+                .into(),
+        ),
+        Some(false) => lines.push(
+            "On its first boot it prepares its Secure Boot keys; systemd-boot enrolls them \
+             when it next boots."
+                .into(),
+        ),
+        None => {}
     }
     let pace = if args.boot_check_interval < args.boot_timeout {
         format!(
@@ -583,6 +599,7 @@ struct Plan {
     choices: Vec<Choice>,
     built: Built,
     disko: Disko,
+    boot: Boot,
     ssh: Ssh,
     /// Pull mode: the generated key, and where the installed system wants it.
     host_key: Option<(PublicKey, String)>,
@@ -696,6 +713,7 @@ async fn prepare(
         choices,
         built,
         disko,
+        boot: facts.boot,
         ssh: facts.ssh,
         host_key,
         key_files,
@@ -863,6 +881,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
         choices,
         built,
         disko,
+        boot,
         ssh,
         host_key,
         key_files,
@@ -933,6 +952,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
         live,
         machine: name,
         encrypted: !(disko.encryption.luks.is_empty() && disko.encryption.zfs.is_empty()),
+        enrolls_keys: boot.enroll_keys.then_some(boot.enroll_reboots),
     };
     let check = check.at(ssh_at, &hooks, &mut report);
     Ok(Installed {

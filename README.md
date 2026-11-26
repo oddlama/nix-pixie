@@ -527,6 +527,41 @@ before anything is erased, with a hint on what to use instead. For ZFS that is
 to create the dataset with `keylocation = "file:///tmp/secret.key"` and to
 switch it back with `postCreateHook = "zfs set keylocation=prompt <dataset>"`.
 
+### Secure Boot
+
+nix-pixie installs systems that boot with
+[lanzaboote](https://github.com/nix-community/lanzaboote). The easiest way lets
+the machine make its own keys and enroll them on its first boot, so they never
+leave it:
+
+```nix
+boot.lanzaboote = {
+  enable = true;
+  pkiBundle = "/var/lib/sbctl";
+  autoGenerateKeys.enable = true;
+  autoEnrollKeys = {
+    enable = true;
+    autoReboot = true;
+  };
+};
+```
+
+Keys can only be enrolled while the firmware is in Setup Mode, that is without
+any Secure Boot keys. So before you boot the installer, clear them in the
+firmware settings (look for "Reset to Setup Mode" or "Delete all keys"). That
+also turns Secure Boot off, which the installer needs since it isn't signed.
+The controller checks this before it erases anything. On its first boot the
+machine creates its keys and reboots, systemd-boot enrolls them, and from then
+on it boots with Secure Boot on. Microsoft's keys are enrolled as well,
+because the firmware of some graphics and network cards is signed with them
+(`autoEnrollKeys.includeMicrosoftKeys`). lanzaboote adds no boot entry to the
+firmware: the machine starts whatever its disk boots by default, so that disk
+has to come first in the boot order.
+
+To bring your own keys instead, for example the same ones for a whole fleet,
+leave out `autoGenerateKeys` and have a hook write them to
+`$PIXIE_OUT/files/var/lib/sbctl/` before `install`.
+
 ### Hardware reports
 
 With `facter.reportPath = "hosts/web1/facter.json"` on a machine, the target
@@ -607,7 +642,6 @@ There is still a lot I am going to add.
 - A binary cache
 - PXE boot, so the target doesn't even need a USB stick
 - kexec into the installer from any running Linux
-- Secure Boot, including enrolling lanzaboote keys during the install
 - Resuming an install after the controller itself was stopped
 - Installing a batch of machines in one go, with a single code that the controller shows
 

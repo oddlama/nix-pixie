@@ -33,6 +33,7 @@ we build on them.
 | Host keys: pull mode (target generates, public key recorded in the repo before building) | done; no rekeying hook yet | `checks.vm-install` |
 | Host keys: push mode (from a hook, stored on the target, checked after boot) | done | `checks.vm-install-luks-scripted` |
 | Sessions outliving their connection (network gone for up to 10 minutes): reconnect, resume, every request carried out once | done | `checks.vm-push` (a push cut off for 35 s, and an interrupted controller that frees the target at once), `checks.vm-install-hooks` (a hook's program running through a 35 s cut); network namespaces by hand |
+| Secure Boot with lanzaboote: keys made and enrolled by the installed system's first boot, Setup Mode checked before erasing | done | `checks.vm-iso-secure-boot` (from Setup Mode to Secure Boot on, with OVMF), unit tests of the check |
 | Long sessions across link-local flaps | the installer avoids the flaps; a session that loses its connection to one anyway resumes | `checks.vm-link-local` |
 | Targets on other networks (`--target HOST`, unicast probes) running the agent package on a stock NixOS live system (`nix run …#agent`) | done; this way the target must be reachable on UDP 47011/47012 | `checks.vm-remote` (target behind a router with its default firewall; plain NixOS, none of our modules) |
 | Targets nobody can connect to (NAT, closed firewall): found at a relay with only the code, then a direct path where one can be punched. n0's public relays by default, `--relay URL` for others, `--no-relay` for none | done for target-shown codes | `checks.vm-relay` (no open ports; first a whole install through the relay with no route at all, then one over a punched path, with the host key checked after boot); by hand through n0's relay between two NATed network namespaces |
@@ -503,7 +504,11 @@ target boots ─► network (DHCP | IPv4LL | IPv6LL) ─► DNS-SD ─► pair �
     can't boot). Implemented: systemd-boot, lanzaboote, EFI-only GRUB and
     `canTouchEfiVariables` are refused when the installer booted with BIOS;
     BIOS-only GRUB is refused when it booted with UEFI (it would need CSM).
-  - lanzaboote with Secure Boot not in setup mode → plan a wait step
+  - Secure Boot keys that can't be enrolled: a configuration whose first
+    boot enrolls them (lanzaboote's `autoEnrollKeys`) is refused unless the
+    firmware is in Setup Mode (implemented). Otherwise the enrollment fails
+    on that boot, and the machine runs without Secure Boot without anybody
+    noticing.
   - number of disks the disko config needs vs selected
   - fixed partition sizes vs disk size
   - closure size (`nix path-info -S`) vs the expected `/mnt` capacity
@@ -1023,7 +1028,16 @@ direct path to a server with a public address, without any hole punching.
      Secure Boot doesn't restrict userspace. This same portability is what the
      kexec and rescue-system path needs.
   2. Allow signing our image with user keys (shim/MOK, or lanzaboote keys).
-  3. Lanzaboote key enrollment = wait mode (setup mode is a firmware UI step).
+  3. Lanzaboote key enrollment (implemented): the installed system does it.
+     lanzaboote's `autoGenerateKeys` makes the keys on the first boot and
+     `autoEnrollKeys` leaves them on the ESP for systemd-boot, which enrolls
+     them on the next. The keys never leave the machine, and nix-pixie needs
+     no code on the target for it: the controller checks Setup Mode before
+     erasing (clearing the keys is a step in the firmware's settings, before
+     the installer boots) and tells the operator what the first boot does.
+     Enrolling from the installer instead would save a reboot, but once the
+     keys are in, the unsigned installer doesn't boot again, so a failure
+     after that would leave a machine that needs its firmware reset.
 - **Version skew:** the protocol version is in DNS-SD TXT and in the handshake.
   The controller supports the current and previous protocol versions, so old
   USB sticks keep working.
@@ -1128,8 +1142,9 @@ NixOS VM tests are the backbone. They cover:
   key check (done: `checks.vm-install-<layout>`, layouts in
   `nix/tests/layouts.nix`, BIOS GRUB)
 - the shipped installer ISO booted with UEFI, installing systemd-boot, the
-  firmware then booting the disk (done: `checks.vm-iso-uefi`); Secure Boot
-  still to do
+  firmware then booting the disk (done: `checks.vm-iso-uefi`), and with
+  lanzaboote: keys made and enrolled by the first boot, the second with
+  Secure Boot on (done: `checks.vm-iso-secure-boot`)
 - pull-mode rekey (agenix-rekey fixture)
 - interrupted push + resume (done: `checks.vm-push` cuts the network
   during a push and interrupts a controller, `checks.vm-install-hooks`

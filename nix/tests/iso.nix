@@ -3,6 +3,11 @@
 # then boots the installed system from that disk, like a real machine whose
 # disk comes first in the boot order.
 #
+# With lanzaboote's source, the system has Secure Boot instead
+# (`targets/secure-boot.nix`). The firmware starts in Setup Mode, without
+# keys, so the unsigned installer boots, and the installed system enrolls
+# its own keys.
+#
 # The image is `packages.installer-iso` plus the test driver's backdoor (and
 # lighter compression). Its network is our installer's: no DHCP server on the
 # test network, so the controller finds it, and later the installed system,
@@ -12,25 +17,37 @@
   package,
   nixpkgs,
   disko,
+  lanzaboote ? null,
 }:
 let
   inherit (pkgs) lib;
+  secureBoot = lanzaboote != null;
 
-  flake = import ./user-flake.nix { inherit pkgs nixpkgs disko; } {
-    target = "uefi.nix";
-    configurations.web1.disks.main = {
-      device = ''"/dev/disk/by-pixie/main"'';
-      built = "/dev/disk/by-pixie/main";
-    };
-    machines = ''
+  flake =
+    import ./user-flake.nix
       {
-        web1.hostKey = {
-          mode = "pull";
-          publicKeyPath = "machines/web1/ssh_host_ed25519_key.pub";
-        };
+        inherit
+          pkgs
+          nixpkgs
+          disko
+          lanzaboote
+          ;
       }
-    '';
-  };
+      {
+        target = if secureBoot then "secure-boot.nix" else "uefi.nix";
+        configurations.web1.disks.main = {
+          device = ''"/dev/disk/by-pixie/main"'';
+          built = "/dev/disk/by-pixie/main";
+        };
+        machines = ''
+          {
+            web1.hostKey = {
+              mode = "pull";
+              publicKeyPath = "machines/web1/ssh_host_ed25519_key.pub";
+            };
+          }
+        '';
+      };
 
   installer = nixpkgs.lib.nixosSystem {
     modules = [
@@ -46,13 +63,48 @@ let
   };
   iso = "${installer.config.system.build.isoImage}/iso/${installer.config.image.fileName}";
 
+  # Python lines for the body of a subtest.
+  body = lines: lib.concatMapStrings (line: "    ${line}\n") lines;
+  enrollingBoots = lib.optionalString secureBoot (body [
+    "# The first boot creates the keys, leaves them on the ESP for"
+    "# systemd-boot and reboots (in the same QEMU, which `allow_reboot`"
+    "# keeps running); systemd-boot enrolls them and resets."
+    "target.connect()"
+    "target.connected = False"
+    "target.connect()"
+  ]);
+  bootEntry = body (
+    if secureBoot then
+      [
+        "# lanzaboote writes no boot entry: the firmware boots the disk's"
+        "# default path, EFI/BOOT/BOOTX64.EFI (see the README)."
+        "assert \"No boot loaders listed in EFI Variables\" in status, status"
+      ]
+    else
+      [
+        "# canTouchEfiVariables: the install wrote a boot entry."
+        "assert \"Linux Boot Manager\" in status, status"
+      ]
+  );
+  secureBootOn = lib.optionalString secureBoot (body [
+    "assert \"Secure Boot: enabled (user)\" in status, status"
+    "boots = target.succeed(\"journalctl --list-boots --quiet\").strip().splitlines()"
+    "assert len(boots) == 2, boots"
+    "# Made on the target, and nowhere else."
+    "target.succeed(\"test -s /var/lib/sbctl/keys/db/db.key\")"
+  ]);
+  toldAboutKeys = lib.optionalString secureBoot (body [
+    "# Told while it waited."
+    "assert \"prepares its Secure Boot keys and reboots by itself\" in output, output"
+  ]);
+
   install = lib.concatStringsSep " " [
     "nix-pixie controller install --code CODE --machine web1 --disk main=vda"
     "--yes --then poweroff --boot-timeout 300 --boot-check-interval 5"
   ];
 in
 pkgs.testers.runNixOSTest {
-  name = "nix-pixie-iso-uefi";
+  name = if secureBoot then "nix-pixie-iso-secure-boot" else "nix-pixie-iso-uefi";
 
   nodes = {
     controller = {
@@ -121,16 +173,17 @@ pkgs.testers.runNixOSTest {
         target.wait_for_shutdown()
 
     with subtest("the firmware boots the installed system with systemd-boot"):
-        target.start()
+        target.start(${lib.optionalString secureBoot "allow_reboot=True"})
+    ${enrollingBoots}
         target.wait_for_unit("multi-user.target", timeout=300)
         target.fail("test -e /iso")
         source = target.succeed("findmnt -n -o SOURCE /").strip()
         assert source == "/dev/vda2", source
         status = target.succeed("bootctl status 2>&1")
+        print(status)
         assert "Product: systemd-boot" in status, status
-        # canTouchEfiVariables: the install wrote a boot entry.
-        assert "Linux Boot Manager" in status, status
-
+    ${bootEntry}
+    ${secureBootOn}
     with subtest("the controller checks the host key over link-local"):
         controller.wait_until_succeeds(
             "systemctl show -P SubState pixie-install | grep -qx -e exited -e failed",
@@ -146,5 +199,6 @@ pkgs.testers.runNixOSTest {
         recorded = controller.succeed("cat ~alice/repo/machines/web1/ssh_host_ed25519_key.pub")
         assert host_key["verified"] and host_key["seen"] == " ".join(recorded.split()[:2]), host_key
         assert host_key["address"].startswith("fe80:"), host_key
+    ${toldAboutKeys}
   '';
 }

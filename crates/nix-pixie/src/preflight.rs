@@ -19,6 +19,20 @@ pub fn check_boot(boot: &Boot, firmware: &Firmware, configuration: &str) -> Resu
                  boot.loader.grub.efiSupport)"
             );
         }
+        if boot.enroll_keys && firmware.setup_mode != Some(true) {
+            let state = if firmware.setup_mode.is_none() {
+                "doesn't say whether it is"
+            } else {
+                "is not"
+            };
+            bail!(
+                "{who} enrolls its Secure Boot keys on its first boot \
+                 (boot.lanzaboote.autoEnrollKeys), which works only while the firmware is in \
+                 Setup Mode. The target's firmware {state}, so the machine would run without \
+                 Secure Boot. Clear its Secure Boot keys in the firmware settings (\"Reset to \
+                 Setup Mode\", \"Delete all keys\" or similar), then boot the installer again"
+            );
+        }
         return Ok(());
     }
     let bios = "the target booted the installer in BIOS (legacy) mode. If it has UEFI, boot \

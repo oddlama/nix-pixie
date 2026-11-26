@@ -12,6 +12,12 @@
       url = "github:nix-community/disko";
       flake = false;
     };
+    # Only for the checks too, from its source: its flake would add four
+    # inputs of its own.
+    lanzaboote = {
+      url = "github:nix-community/lanzaboote";
+      flake = false;
+    };
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
       inputs.nixpkgs-lib.follows = "nixpkgs";
@@ -178,6 +184,11 @@
                 vm-iso-uefi = import ./nix/tests/iso.nix {
                   inherit pkgs;
                   inherit (inputs) nixpkgs disko;
+                  package = config.packages.default;
+                };
+                vm-iso-secure-boot = import ./nix/tests/iso.nix {
+                  inherit pkgs;
+                  inherit (inputs) nixpkgs disko lanzaboote;
                   package = config.packages.default;
                 };
                 vm-remote = import ./nix/tests/remote.nix {
