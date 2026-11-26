@@ -160,6 +160,11 @@ impl FirmwareAssumed {
 #[serde(rename_all = "camelCase")]
 pub struct Facter {
     pub report_path: Option<String>,
+    #[serde(default)]
+    pub mode: crate::facter::Mode,
+    /// Fields to leave out when comparing, besides [`crate::facter::VOLATILE`].
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 /// A machine whose hints match a target, and why.

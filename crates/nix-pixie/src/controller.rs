@@ -36,8 +36,6 @@ use crate::ui::{self, Tone};
 const SETTLE: Duration = Duration::from_millis(600);
 /// For the target's hello and inventory (lsblk and sysfs reads).
 const INTRODUCTION_TIMEOUT: Duration = Duration::from_secs(30);
-/// nixos-facter takes a few seconds; give slow machines plenty of room.
-const FACTER_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub fn print_id(identity_path: &Path) -> Result<()> {
     println!("{}", identity::load_or_create(identity_path)?.public());
@@ -574,34 +572,7 @@ async fn review(
 /// Asks the target for a facter report and writes it into the flake's
 /// repository. Returns the path, relative to the flake.
 pub async fn fetch_facter_report(link: &Link, flake: &str, report_path: &str) -> Result<String> {
-    let root = metadata::local_flake_dir(flake).with_context(|| {
-        format!("{flake} is not a local checkout, so the report can't be written")
-    })?;
-    let path = metadata::repo_path(&root, report_path)?;
-    let reply = link
-        .request(
-            &ControllerMsg::RequestFacterReport,
-            FACTER_TIMEOUT,
-            "the facter report",
-        )
-        .await?;
-    let json = match reply {
-        TargetMsg::FacterReport { json } => json,
-        TargetMsg::FacterFailed { error } => {
-            bail!(
-                "the target could not run nixos-facter: {}",
-                sanitise(&error, 500)
-            )
-        }
-        _ => bail!("unexpected reply to the facter request"),
-    };
-    // It goes into the user's repository and gets imported by Nix: insist on
-    // a JSON object.
-    let value: serde_json::Value =
-        serde_json::from_slice(&json).context("the facter report is not valid JSON")?;
-    anyhow::ensure!(value.is_object(), "the facter report is not a JSON object");
-    metadata::write_into_repo(&root, &path, &json).await?;
-    info!(path = %path.display(), "wrote facter report");
+    crate::facter::fetch(link, flake, report_path, crate::facter::Mode::Write, &[]).await?;
     Ok(report_path.to_string())
 }
 

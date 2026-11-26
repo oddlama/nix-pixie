@@ -286,7 +286,34 @@ let
           example = "machines/web1/facter.json";
           description = ''
             Where the controller writes the nixos-facter report, relative to
-            the flake root. `null` disables facter for this machine.
+            the flake root. `null` disables facter for this machine. `{id}`
+            makes it one per device (`controller install --id`).
+          '';
+        };
+
+        facter.mode = mkOption {
+          type = types.enum [
+            "write"
+            "missing"
+            "compare"
+          ];
+          default = "write";
+          description = ''
+            What the controller does with the report: `write` it on every
+            install; only if it is `missing` from the repository, so devices
+            of identical hardware share one; or `compare`: run nixos-facter,
+            write nothing, and report where this device's hardware differs
+            (written if there is none yet).
+          '';
+        };
+
+        facter.ignore = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          description = ''
+            Fields `compare` leaves out at any depth, besides those that
+            differ between identical devices anyway (serial numbers, MAC
+            addresses, UUIDs).
           '';
         };
 

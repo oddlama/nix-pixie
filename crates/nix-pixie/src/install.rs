@@ -16,12 +16,13 @@ use nix_pixie_proto::ctrl::{
     ControllerMsg, DiskAssignment, KeyFile, Secret, Shutdown, StreamRequest, TargetMsg,
 };
 use nix_pixie_proto::inventory::Disk;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 use zeroize::Zeroizing;
 
 use crate::controller::{self, Approved, describe_disk, show_disk};
 use crate::discovery::{Method, Peer};
 use crate::exit;
+use crate::facter;
 use crate::hooks::{self, Step};
 use crate::hostkey::{self, PublicKey};
 use crate::link::Link;
@@ -677,14 +678,7 @@ async fn prepare(
     let mut hooks = start_hooks(args, &name, machine, target, programs).await?;
     step.done(name.clone());
     hooks_after(&mut hooks, Step::Approve, link, None).await?;
-    if let Some(path) = &machine.facter.report_path {
-        let path = metadata::with_id(path, hooks.context.id.as_deref(), "facter.reportPath")?;
-        let step = ui::start("facter");
-        controller::fetch_facter_report(link, &args.flake, &path)
-            .await
-            .context("getting the facter report")?;
-        step.done(path);
-    }
+    facter_step(link, &args.flake, machine, &mut hooks).await?;
     hooks_after(&mut hooks, Step::Facter, link, None).await?;
     // Before building: the configuration (or a rekeying hook) may use it.
     let pulled = machine_host_key(link, &args.flake, &name, machine, &mut hooks).await?;
@@ -746,6 +740,49 @@ async fn prepare(
         key_files,
         hooks,
     })
+}
+
+/// The `facter` step, if the machine wants a report.
+async fn facter_step(
+    link: &Link,
+    flake: &str,
+    machine: &Machine,
+    hooks: &mut hooks::Runner,
+) -> Result<()> {
+    if let Some(path) = &machine.facter.report_path {
+        let path = metadata::with_id(path, hooks.context.id.as_deref(), "facter.reportPath")?;
+        let step = ui::start("facter");
+        let facter = &machine.facter;
+        let outcome = facter::fetch(link, flake, &path, facter.mode, &facter.ignore)
+            .await
+            .context("getting the facter report")?;
+        match outcome {
+            facter::Outcome::Written => step.done(path),
+            facter::Outcome::Kept => step.done(format!("{path}, kept")),
+            facter::Outcome::Compared(differences) if differences.is_empty() => {
+                step.done(format!("{path}, the same"));
+            }
+            facter::Outcome::Compared(differences) => {
+                warn!(
+                    path,
+                    ?differences,
+                    "the target's hardware differs from the facter report"
+                );
+                ui::show(
+                    std::iter::once(format!(
+                        "This target's hardware differs from {path} in {} place(s):",
+                        differences.len()
+                    ))
+                    .chain(differences.iter().map(|d| format!("  {d}")))
+                    .collect(),
+                );
+                ui::commit();
+                step.done(format!("{path}, {} difference(s)", differences.len()));
+                hooks.context.facter_differences = Some(differences);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Builds the system and the disko script. A failed build can be fixed

@@ -327,6 +327,9 @@ pub struct Context {
     /// The install's id (`--id`, or a hook's `$PIXIE_OUT/id`): which of
     /// many devices of one configuration this is.
     pub id: Option<String>,
+    /// With `facter.mode = "compare"`: where the target's hardware differs
+    /// from the report in the repository (JSON pointers).
+    pub facter_differences: Option<Vec<String>>,
 }
 
 /// Runs a machine's hooks as the install passes its steps.

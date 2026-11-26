@@ -21,6 +21,7 @@ pub mod dns;
 pub mod events;
 pub mod exec;
 pub mod exit;
+pub mod facter;
 pub mod hooks;
 pub mod hostkey;
 pub mod identity;
