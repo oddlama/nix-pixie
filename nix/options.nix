@@ -175,6 +175,14 @@ let
             default = [ ];
             description = "DMI system serial numbers that pre-select this machine. A hint only.";
           };
+          serial = mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            description = ''
+              Serial numbers, from DMI or the device tree (boards without
+              DMI), that pre-select this machine. A hint only.
+            '';
+          };
         };
 
         disks.file = mkOption {

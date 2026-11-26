@@ -95,6 +95,7 @@ let
         match = {
           mac = [ "aa:bb:cc:dd:ee:ff" ];
           dmiSerial = [ ];
+          serial = [ ];
         };
         disks.file = null;
         hostKey = {
@@ -114,6 +115,7 @@ let
         match = {
           mac = [ ];
           dmiSerial = [ ];
+          serial = [ ];
         };
         disks.file = null;
         hostKey = {
@@ -128,6 +130,7 @@ let
         match = {
           mac = [ ];
           dmiSerial = [ ];
+          serial = [ ];
         };
         disks.file = null;
         hostKey = {
@@ -142,6 +145,7 @@ let
         match = {
           mac = [ ];
           dmiSerial = [ ];
+          serial = [ ];
         };
         disks.file = "machines/db1/disks.json";
         hostKey = {

@@ -53,6 +53,9 @@ pub struct Hook {
 pub struct Hints {
     pub mac: Vec<String>,
     pub dmi_serial: Vec<String>,
+    /// Serial numbers from DMI or the device tree.
+    #[serde(default)]
+    pub serial: Vec<String>,
 }
 
 /// Where the installed system's SSH host key comes from.
@@ -159,9 +162,15 @@ impl Metadata {
                     .map(|nic| format!("MAC {} ({})", nic.mac, nic.name))
                     .collect();
                 if let Some(serial) = &inventory.dmi.serial
-                    && machine.hints.dmi_serial.contains(serial)
+                    && (machine.hints.dmi_serial.contains(serial)
+                        || machine.hints.serial.contains(serial))
                 {
                     reasons.push(format!("DMI serial {serial}"));
+                }
+                if let Some(serial) = &inventory.device_tree.serial
+                    && machine.hints.serial.contains(serial)
+                {
+                    reasons.push(format!("device-tree serial {serial}"));
                 }
                 (!reasons.is_empty()).then(|| Suggestion {
                     machine: name.clone(),

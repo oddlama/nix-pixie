@@ -14,11 +14,26 @@ pub struct Inventory {
     pub system: String,
     pub hostname: String,
     pub dmi: Dmi,
+    /// What the device tree says, on boards that have one (most ARM
+    /// boards, which have no DMI).
+    #[serde(default)]
+    pub device_tree: DeviceTree,
     pub cpu: Cpu,
     pub memory_bytes: u64,
     pub firmware: Firmware,
     pub nics: Vec<Nic>,
     pub disks: Vec<Disk>,
+}
+
+/// A device tree's identification (`/proc/device-tree`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceTree {
+    /// The board, e.g. "Raspberry Pi 4 Model B Rev 1.4".
+    pub model: Option<String>,
+    /// What the board is compatible with, most specific first.
+    pub compatible: Vec<String>,
+    /// The board's serial number, if its firmware fills it in.
+    pub serial: Option<String>,
 }
 
 /// SMBIOS identification; absent on many ARM boards.

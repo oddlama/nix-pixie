@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nix_pixie_proto::inventory::{
-    Content, Cpu, Disk, Dmi, Firmware, Inventory, Nic, is_valid_disk_id, nix_system,
+    Content, Cpu, DeviceTree, Disk, Dmi, Firmware, Inventory, Nic, is_valid_disk_id, nix_system,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -18,6 +18,8 @@ use crate::net::{hostname, sanitise};
 const EFI_GLOBAL: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 /// Longest string we keep from sysfs or lsblk.
 const MAX_FIELD: usize = 128;
+/// `compatible` entries kept: real boards have a handful.
+const MAX_COMPATIBLE: usize = 8;
 /// Mount points listed per disk: enough to tell what holds it.
 const MAX_MOUNTS: usize = 16;
 
@@ -35,6 +37,7 @@ pub async fn collect(formatted: &BTreeSet<String>) -> Inventory {
         system: nix_system(std::env::consts::ARCH),
         hostname: hostname(),
         dmi: dmi(Path::new("/sys/class/dmi/id")),
+        device_tree: device_tree(Path::new("/proc/device-tree")),
         cpu: Cpu {
             model: std::fs::read_to_string("/proc/cpuinfo")
                 .ok()
@@ -107,6 +110,30 @@ pub fn dmi(dir: &Path) -> Dmi {
         product: field("product_name"),
         serial: field("product_serial"),
         uuid: field("product_uuid"),
+    }
+}
+
+/// The identification in the device tree at `dir` (`/proc/device-tree`).
+/// Its properties are NUL-terminated strings, `compatible` a list of them.
+pub fn device_tree(dir: &Path) -> DeviceTree {
+    let strings = |name: &str| -> Vec<String> {
+        let Ok(bytes) = std::fs::read(dir.join(name)) else {
+            return Vec::new();
+        };
+        bytes
+            .split(|&b| b == 0)
+            .map(|s| sanitise(String::from_utf8_lossy(s).trim(), MAX_FIELD))
+            .filter(|s| !s.is_empty())
+            .take(MAX_COMPATIBLE)
+            .collect()
+    };
+    DeviceTree {
+        model: strings("model").into_iter().next(),
+        compatible: strings("compatible"),
+        serial: strings("serial-number")
+            .into_iter()
+            .next()
+            .filter(|s| !is_placeholder(s)),
     }
 }
 

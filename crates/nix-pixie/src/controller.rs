@@ -668,6 +668,12 @@ fn summary(
             opt(&inventory.dmi.serial).map_or_else(String::new, |s| format!(" (serial {s})"));
         lines.push(format!("  hardware  {}{serial}", hardware.join(" ")));
     }
+    let tree = &inventory.device_tree;
+    if tree.model.is_some() || tree.serial.is_some() {
+        let model = opt(&tree.model).unwrap_or_else(|| "device tree".into());
+        let serial = opt(&tree.serial).map_or_else(String::new, |s| format!(" (serial {s})"));
+        lines.push(format!("  board     {model}{serial}"));
+    }
     for nic in &inventory.nics {
         let link = if nic.link_up { "up" } else { "down" };
         lines.push(format!(
