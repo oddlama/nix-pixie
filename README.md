@@ -272,7 +272,9 @@ or none at all:
   network.
 - **A known address:** `--target HOST` asks that host instead of searching,
   for targets you can reach but which aren't on your network. This uses no
-  relay either and needs UDP ports 47011 and 47012 to get to the target.
+  relay either and needs UDP ports 47011 and 47012 to get to the target. On a
+  direct link (a cable, a USB network gadget) give the link-local address with
+  its interface: `--target 'fe80::2%usb0'`.
 
 <details>
 <summary>A direct cable and NetworkManager</summary>

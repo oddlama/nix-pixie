@@ -137,7 +137,8 @@ pub enum ControllerCommand {
         /// Instead of searching the local network, probe this host (an IP
         /// address or a name; repeatable), e.g. a server on the internet
         /// running `nix run github:oddlama/nix-pixie#agent`. Needs UDP 47011
-        /// and 47012 to it.
+        /// and 47012 to it. On a direct link, a link-local address with its
+        /// interface: `fe80::2%usb0`.
         #[arg(long = "target", value_name = "HOST")]
         targets: Vec<String>,
         #[command(flatten)]
@@ -207,7 +208,8 @@ pub enum ControllerCommand {
         /// Instead of searching the local network, probe this host (an IP
         /// address or a name; repeatable), e.g. a server on the internet
         /// running `nix run github:oddlama/nix-pixie#agent`. Needs UDP 47011
-        /// and 47012 to it.
+        /// and 47012 to it. On a direct link, a link-local address with its
+        /// interface: `fe80::2%usb0`.
         #[arg(long = "target", value_name = "HOST")]
         targets: Vec<String>,
         #[command(flatten)]
@@ -228,7 +230,8 @@ pub enum ControllerCommand {
         /// Instead of searching the local network, probe this host (an IP
         /// address or a name; repeatable), e.g. a server on the internet
         /// running `nix run github:oddlama/nix-pixie#agent`. Needs UDP 47011
-        /// and 47012 to it.
+        /// and 47012 to it. On a direct link, a link-local address with its
+        /// interface: `fe80::2%usb0`.
         #[arg(long = "target", value_name = "HOST")]
         targets: Vec<String>,
     },

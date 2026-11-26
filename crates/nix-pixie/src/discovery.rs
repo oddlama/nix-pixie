@@ -3,7 +3,8 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -320,8 +321,8 @@ pub async fn resolve_targets(hosts: &[String]) -> Result<Vec<SocketAddr>> {
     let mut targets = Vec::new();
     for host in hosts {
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = bare.parse::<IpAddr>() {
-            targets.push(SocketAddr::new(ip, PROBE_PORT));
+        if let Some(addr) = literal(bare, Path::new("/sys/class/net"))? {
+            targets.push(addr);
             continue;
         }
         let found: Vec<SocketAddr> = tokio::net::lookup_host((bare, PROBE_PORT))
@@ -338,7 +339,67 @@ pub async fn resolve_targets(hosts: &[String]) -> Result<Vec<SocketAddr>> {
     Ok(targets)
 }
 
-/// Addresses worth dialing or probing.
+/// The probe address of `host` if it is an IP address. An IPv6 link-local
+/// one needs its interface, by name or index (`fe80::2%usb0`): the same
+/// address can be on every link. Interfaces are looked up under `sys_net`
+/// (`/sys/class/net`), where they show up before they have addresses.
+pub fn literal(host: &str, sys_net: &Path) -> Result<Option<SocketAddr>> {
+    let (ip, zone) = match host.split_once('%') {
+        Some((ip, zone)) => (ip, Some(zone)),
+        None => (host, None),
+    };
+    let Ok(ip) = ip.parse::<IpAddr>() else {
+        return Ok(None);
+    };
+    let IpAddr::V6(v6) = ip else {
+        if zone.is_some() {
+            bail!("{host}: only IPv6 link-local addresses take an interface");
+        }
+        return Ok(Some(SocketAddr::new(ip, PROBE_PORT)));
+    };
+    let scope = match zone {
+        None if v6.is_unicast_link_local() => bail!(
+            "{host} is a link-local address, which every link has: add the interface the \
+             target is on, e.g. {host}%eth0"
+        ),
+        None => 0,
+        Some(zone) => interface_index(zone, sys_net).with_context(|| format!("--target {host}"))?,
+    };
+    Ok(Some(SocketAddr::V6(SocketAddrV6::new(
+        v6, PROBE_PORT, 0, scope,
+    ))))
+}
+
+/// The index of the network interface `zone` (a name, or already an index).
+fn interface_index(zone: &str, sys_net: &Path) -> Result<u32> {
+    if let Ok(index) = zone.parse::<u32>() {
+        return Ok(index);
+    }
+    let plain = !zone.is_empty()
+        && zone.len() <= 15
+        && zone
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@'));
+    if plain && let Ok(text) = std::fs::read_to_string(sys_net.join(zone).join("ifindex")) {
+        return text
+            .trim()
+            .parse()
+            .with_context(|| format!("the index of interface {zone}"));
+    }
+    let mut known: Vec<String> = std::fs::read_dir(sys_net)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    known.sort();
+    bail!(
+        "there is no network interface {zone:?} (there are: {}); is the cable plugged in?",
+        known.join(", ")
+    )
+}
+
+/// Addresses worth dialing or probing./// Addresses worth dialing or probing.
 pub fn is_usable(ip: IpAddr) -> bool {
     !(ip.is_loopback()
         || ip.is_unspecified()
