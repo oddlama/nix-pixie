@@ -467,19 +467,35 @@ attached, so it can ask for a YubiKey touch.
 
 - **`$PIXIE_CONTEXT`** is a JSON file with what is known so far: the machine,
   the target's inventory, the pulled host key, the chosen disks, the built
-  system.
+  system, the install's `id`, and the `outputs` of earlier hooks.
 - **`$PIXIE_OUT/files/<path>`** is copied to `<path>` on the installed system,
   owned by root and with the mode you gave it.
+- **`$PIXIE_OUT/files.json`** gives files a mode and an owner, and creates
+  directories: `{ "/var/lib/sbctl": { "mode": "0700" }, "/var/lib/foo/id":
+  { "user": "foo", "group": 0 } }`. Users and groups are numbers, or names,
+  which exist once the system is installed (in hooks after `install`).
 - **`$PIXIE_OUT/disk-keys/<path>`** is a key that disko will read at `<path>`
   on the target, see below.
 - **`$PIXIE_OUT/host-key`** is the private host key in push mode.
+- **`$PIXIE_OUT/context.json`** goes to later hooks as `outputs.<hook>` in their
+  `$PIXIE_CONTEXT`, and into the result.
+- **`$PIXIE_OUT/encrypted/<path>`** goes into your repository at `<path>`,
+  encrypted with age to the machine's `secrets.recipients` (age or SSH public
+  keys), e.g. a recovery key.
+- **`$PIXIE_OUT/id`** is the install's id (see [Many devices, one
+  configuration](#many-devices-one-configuration)).
 - **`"$PIXIE" target exec -- PROGRAM ARGS...`** runs a program on the target,
   from `approve` until `finish`, with `--chroot` inside the installed system
   (from `install` on). Its output and exit code come back to your hook, as if
-  it ran locally.
+  it ran locally. `--stdin` passes your hook's stdin on, e.g. a key.
+
+`$PIXIE_OUT` is in RAM (`$XDG_RUNTIME_DIR`, `/run/user/<uid>` or `/dev/shm`), so
+what a hook writes there never touches a disk.
 
 Programs on the target must be files in the Nix store, like
-`${pkgs.sbctl}/bin/sbctl`. nix-pixie copies them there with their closure and
+`${pkgs.sbctl}/bin/sbctl`, built for the target: for a device of another
+architecture take them from its configuration's packages
+(`self.nixosConfigurations.<name>.pkgs.sbctl`). nix-pixie copies them there with their closure and
 runs them without a shell, without input and with nothing of the installer's
 environment (`PATH` leads nowhere). So a program behaves the same on every
 target, and whatever it needs comes with it:
@@ -616,6 +632,94 @@ ssh root@<ip> cat /run/nix-pixie/code
 
 </details>
 
+### Devices without a screen
+
+Boards that boot over USB or the network rather than from a USB stick, often
+without a screen, keyboard or even a serial console, get an installer that is
+just a kernel and an initrd: `nixosModules.installer-initrd`, built from a
+NixOS configuration with the device's platform and kernel.
+
+```nix
+installer = nixpkgs.lib.nixosSystem {
+  modules = [
+    nix-pixie.nixosModules.installer-initrd
+    {
+      nixpkgs.hostPlatform = "aarch64-linux";
+      boot.kernelPackages = pkgs.linuxPackagesFor myBoardKernel;
+      boot.initrd.availableKernelModules = [ "nvme" /* the board's drivers */ ];
+      # A USB gadget: a network interface (fe80::2) and a serial port
+      boot.initrd.nix-pixie-agent.usbGadget.enable = true;
+    }
+  ];
+};
+# installer.config.system.build.nixPixieInstaller: kernel, initrd, cmdline
+```
+
+The agent runs in the initrd itself (systemd stage 1, no root to switch to),
+with Nix and `nixos-install` in a second archive of the initrd. With the USB
+gadget, the host sees a network interface and a serial port; the board's end
+of the link has the fixed address `fe80::2`, and the serial port gets the
+agent's status line by line (`statusTty.json = true` for JSON lines). It also
+takes commands such as `relay URL` there.
+
+Whatever boots the device hands it a code, so nobody types one:
+
+```console
+$ code=$(nix-pixie controller new-code)
+$ # boot the device with this on its kernel command line:
+$ #   systemd.set_credential=pixie.code:$code
+$ echo "$code" > code
+$ nix-pixie controller install --controller-code-file code \
+    --target 'fe80::2%usb0' --machine board --yes --wipe \
+    --events /dev/fd/3 3>events.jsonl
+```
+
+Both sides prove the code to each other like a target's, without relays or any
+discovery. For programs that drive the controller:
+
+- **`--events FILE`** writes JSON lines as things happen: the steps, Nix's
+  progress in bytes, notices, questions, the result and how it exits.
+- **Exit codes** say how far it got: `3` no pairing, `4` failed before anything
+  was erased, `5` failed after formatting began, `6` installed but the boot
+  check failed, `130` interrupted.
+- **`--offline`** keeps Nix from fetching anything, for stations without
+  internet.
+- **`firmware.uefi`** and **`firmware.setupMode`** tell the controller what the
+  device boots with when its installer can't see the firmware.
+- **`bootCheck = "hooks"`** leaves the check after the reboot to your hooks
+  after `boot`, for devices that report on a serial port rather than over
+  SSH; a hook can hand over the host key it saw in `$PIXIE_OUT/seen-host-key`.
+
+Closures travel compressed (zstd; `--no-compression` turns it off), and with
+`--substituter URL --trusted-public-key KEY` the device copies them from a
+binary cache on its own network first, the controller sending what is missing.
+
+### Many devices, one configuration
+
+A fleet of identical devices is one machine, installed many times, each time
+with an id: `--id SN1234`, or a hook that writes it to `$PIXIE_OUT/id` (after
+looking it up in an inventory, say).
+
+```nix
+machines.board = {
+  hostKey = {
+    mode = "pull";
+    publicKeyPath = "devices/{id}/ssh_host_ed25519_key.pub";
+  };
+  # "The only NVMe", rather than a disks.json per device
+  disks.rules.main.transport = [ "nvme" ];
+  # One report for identical hardware; show where a device differs
+  facter = { reportPath = "hardware/board.json"; mode = "compare"; };
+  secrets.recipients = [ "age1..." ];
+};
+```
+
+`{id}` makes `hostKey.publicKeyPath` and `facter.reportPath` per device, and
+hooks get the id in `$PIXIE_CONTEXT`. The system itself is built once, as long
+as nothing per device goes into the configuration: per-device keys and files
+come from hooks instead. Several installs can run side by side, one controller
+per device.
+
 ## 🔐 Security
 
 The pairing code has two parts. The number is public and only says where to
@@ -657,7 +761,7 @@ There is still a lot I am going to add.
 - PXE boot, so the target doesn't even need a USB stick
 - kexec into the installer from any running Linux
 - Resuming an install after the controller itself was stopped
-- Installing a batch of machines in one go, with a single code that the controller shows
+- Installing a batch of machines from one controller process, with a single approval (today: one process per device, side by side)
 
 ## ❤️ Contributing
 
