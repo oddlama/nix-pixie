@@ -41,7 +41,7 @@ we build on them.
 | A driving program's interface: JSON events (`--events`), exit codes by phase, the agent's status on a serial terminal (`console --plain`/`--json`), `--offline` | implemented, not yet VM-tested | unit tests of the console |
 | Many devices, one configuration: `--id`/`$PIXIE_OUT/id`, `{id}` paths, `disks.rules`, `facter.mode`, side-by-side installs | implemented, not yet VM-tested | unit tests of the disk plan |
 | Hooks: owners and directory modes (`files.json`), `target exec --stdin`, `context.json` to later hooks, `encrypted/` into the repo with age, `seen-host-key` and `bootCheck = "hooks"`, outputs in RAM only | implemented, not yet VM-tested | unit tests of the outputs |
-| Store streams compressed with zstd; substitution on the target from binary caches it can reach | implemented, not yet VM-tested | — |
+| Store streams compressed with zstd | implemented, not yet VM-tested | — |
 
 ## Goal
 

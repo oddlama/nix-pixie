@@ -690,9 +690,7 @@ discovery. For programs that drive the controller:
   after `boot`, for devices that report on a serial port rather than over
   SSH; a hook can hand over the host key it saw in `$PIXIE_OUT/seen-host-key`.
 
-Closures travel compressed (zstd; `--no-compression` turns it off), and with
-`--substituter URL --trusted-public-key KEY` the device copies them from a
-binary cache on its own network first, the controller sending what is missing.
+Closures travel compressed (zstd; `--no-compression` turns it off).
 
 ### Many devices, one configuration
 

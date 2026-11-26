@@ -58,8 +58,6 @@ pub struct InstallArgs {
     /// Which of many devices of one configuration this is: for `{id}` in
     /// the machine's paths, and for hooks.
     pub id: Option<String>,
-    /// Binary caches the target substitutes from first.
-    pub caches: Caches,
     /// How to check the first boot, instead of the machine's `bootCheck`.
     pub boot_check: Option<BootCheck>,
     pub timeout: Duration,
@@ -1060,7 +1058,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
     hooks_after(&mut hooks, Step::Format, link, None).await?;
     place_files(link, &root, &mut hooks).await?;
 
-    let (fstype, copied) = send_system(link, &root, &built.toplevel, &args.caches).await?;
+    let (fstype, copied) = send_system(link, &root, &built.toplevel).await?;
     hooks_after(&mut hooks, Step::Copy, link, None).await?;
     place_files(link, &root, &mut hooks).await?;
     let step = ui::start("install");
@@ -1214,20 +1212,10 @@ async fn format_disks(
 
 /// Copies the system into the store under `root` on the target. Returns
 /// that store's filesystem type and what was copied.
-async fn send_system(
-    link: &Link,
-    root: &str,
-    toplevel: &str,
-    caches: &Caches,
-) -> Result<(String, push::Copied)> {
+async fn send_system(link: &Link, root: &str, toplevel: &str) -> Result<(String, push::Copied)> {
     let fstype = push::prepare_disk_store(link, root).await?;
     let into = format!("into {root}, {fstype}");
     let step = ui::start_with("copy", into.clone());
-    if !caches.from.is_empty() {
-        step.detail(format!("substituting from {}", caches.from.join(", ")));
-        substitute(link, root, toplevel, caches).await?;
-        step.detail(into.clone());
-    }
     push::warn_if_relayed(&link.connection());
     let copied = push::send(
         link,
@@ -1241,42 +1229,6 @@ async fn send_system(
         format!("{} {into}", copied.what)
     });
     Ok((fstype, copied))
-}
-
-/// Binary caches the target substitutes from (`--substituter`), before
-/// the controller pushes what is missing.
-#[derive(Debug, Clone, Default)]
-pub struct Caches {
-    pub from: Vec<String>,
-    /// Keys whose signatures the target trusts for them.
-    pub keys: Vec<String>,
-}
-
-/// Has the target substitute `toplevel` from the caches. A failure is only
-/// a warning: the push brings what is missing.
-async fn substitute(link: &Link, root: &str, toplevel: &str, caches: &Caches) -> Result<()> {
-    let request = ControllerMsg::Substitute {
-        root: root.into(),
-        from: caches.from.clone(),
-        keys: caches.keys.clone(),
-        paths: vec![toplevel.to_string()],
-    };
-    let (reply, tail) = follow(link, &request).await?;
-    match reply {
-        TargetMsg::Substituted { error: None } => info!(caches = ?caches.from, "substituted"),
-        TargetMsg::Substituted { error: Some(error) } => {
-            warn!(
-                "substituting on the target: {}; the controller sends what is missing",
-                sanitise(&error, 600)
-            );
-            debug!(
-                output = tail.lines(OUTPUT_TAIL_LINES),
-                "nix copy on the target"
-            );
-        }
-        _ => bail!("unexpected reply to substituting"),
-    }
-    Ok(())
 }
 
 /// The result so far, as printed at the end.

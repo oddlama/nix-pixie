@@ -891,12 +891,6 @@ async fn answer(
             addrs: net::own_addresses(),
         },
         ControllerMsg::PrepareStore { root } => prepare_store(&root),
-        ControllerMsg::Substitute {
-            root,
-            from,
-            keys,
-            paths,
-        } => store::substitute(stream, &root, &from, &keys, &paths).await?,
         ControllerMsg::PrepareDisks { disks, labels } => {
             session.prepared = None;
             prepare_disks(state, disks, &labels, &mut session.prepared).await
@@ -1010,9 +1004,6 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::Exec { .. } => Some(TargetMsg::ExecFailed { error: reason }),
         // None, rather than a message just for refusing this.
         ControllerMsg::RequestAddresses => Some(TargetMsg::Addresses { addrs: Vec::new() }),
-        ControllerMsg::Substitute { .. } => Some(TargetMsg::Substituted {
-            error: Some(reason),
-        }),
     }
 }
 

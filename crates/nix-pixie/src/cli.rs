@@ -163,20 +163,6 @@ pub struct InstallCli {
     /// hooks. A hook can give it instead, in `$PIXIE_OUT/id`.
     #[arg(long)]
     id: Option<String>,
-    /// A binary cache the target copies the system from first (e.g. one
-    /// on its own network, faster than through the controller; it needs
-    /// a network to it); the controller sends what is missing.
-    /// Repeatable.
-    #[arg(long = "substituter", value_name = "URL")]
-    substituters: Vec<String>,
-    /// A key whose signatures the target trusts for the substituters,
-    /// e.g. cache.example.org-1:AbC...=. Repeatable.
-    #[arg(
-        long = "trusted-public-key",
-        value_name = "KEY",
-        requires = "substituters"
-    )]
-    trusted_public_keys: Vec<String>,
     /// Don't compress what goes to the target: for links faster than
     /// zstd on this machine, or contents that don't compress.
     #[arg(long)]
@@ -235,8 +221,6 @@ impl InstallCli {
             code,
             controller_code_file,
             id,
-            substituters,
-            trusted_public_keys,
             no_compression,
             boot_check,
             flake,
@@ -260,10 +244,6 @@ impl InstallCli {
             code,
             controller_code_file,
             id,
-            caches: install::Caches {
-                from: substituters,
-                keys: trusted_public_keys,
-            },
             boot_check,
             timeout: Duration::from_secs(timeout),
             method: discovery,

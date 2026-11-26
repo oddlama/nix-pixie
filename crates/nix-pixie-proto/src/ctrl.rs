@@ -142,9 +142,6 @@ pub enum TargetMsg {
     /// has answered. If that is one more than the controller has replies
     /// for, the last reply follows.
     Resumed { answered: u64 },
-    /// `Substitute` is over: what failed, if anything. Whatever arrived
-    /// stays; the controller pushes the rest.
-    Substituted { error: Option<String> },
 }
 
 /// Messages the controller sends to the target.
@@ -225,16 +222,6 @@ pub enum ControllerMsg {
     /// First frame after the controller came back (ALPN
     /// [`crate::ALPN_RESUME`]): how many replies it has got.
     Resume { answered: u64 },
-    /// Copy `paths` with their closures from the binary caches `from` into
-    /// the store under `root`, trusting signatures by `keys`: e.g. from a
-    /// cache on the target's own network, faster than through the
-    /// controller. `Output` frames, then `Substituted`. After `Approve`.
-    Substitute {
-        root: String,
-        from: Vec<String>,
-        keys: Vec<String>,
-        paths: Vec<String>,
-    },
 }
 
 /// Secret bytes: wiped from memory when dropped, never shown by `Debug`.
