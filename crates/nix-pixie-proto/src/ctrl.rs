@@ -216,6 +216,8 @@ pub enum ControllerMsg {
         program: String,
         args: Vec<String>,
         root: Option<String>,
+        /// Its stdin, e.g. a key; `None`: none.
+        input: Option<Secret>,
     },
     /// First frame after the controller came back (ALPN
     /// [`crate::ALPN_RESUME`]): how many replies it has got.

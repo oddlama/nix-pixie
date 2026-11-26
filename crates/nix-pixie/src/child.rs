@@ -10,6 +10,7 @@ use nix_pixie_proto::frame::write_frame;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tracing::{info, trace};
+use zeroize::Zeroizing;
 
 use crate::net::Stream;
 
@@ -52,7 +53,14 @@ pub async fn run(
 
 /// Runs a hook's program (see [`crate::exec`]), its stdout and stderr
 /// going as `ExecOutput` frames. Returns the frame that ends it.
-pub async fn exec(mut command: Command, stream: &mut Stream) -> Result<TargetMsg> {
+pub async fn exec(
+    mut command: Command,
+    stream: &mut Stream,
+    input: Option<Zeroizing<Vec<u8>>>,
+) -> Result<TargetMsg> {
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
     let mut child = match command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -71,6 +79,13 @@ pub async fn exec(mut command: Command, stream: &mut Stream) -> Result<TargetMsg
             error: "its output is not connected".into(),
         });
     };
+    // Its stdin, then the end of it; a program that doesn't read it isn't
+    // waited for.
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        tokio::spawn(async move {
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, &input).await;
+        });
+    }
     forward(stream, stdout, stderr, |stderr, chunk| {
         TargetMsg::ExecOutput { stderr, chunk }
     })

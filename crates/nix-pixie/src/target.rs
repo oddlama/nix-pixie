@@ -10,12 +10,13 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
-use nix_pixie_proto::ctrl::{ControllerMsg, StreamRequest, TargetMsg};
+use nix_pixie_proto::ctrl::{ControllerMsg, Secret, StreamRequest, TargetMsg};
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tracing::{debug, info};
+use zeroize::Zeroizing;
 
 use crate::exec;
 use crate::link::Link;
@@ -35,7 +36,12 @@ pub struct Request {
     pub args: Vec<String>,
     /// Inside the installed system rather than on the installer.
     pub chroot: bool,
+    /// Its stdin; `None`: none.
+    pub input: Option<Secret>,
 }
+
+/// The most a hook can give a program on its stdin.
+pub const MAX_INPUT: usize = 512 * 1024;
 
 /// What the controller tells the hook while and after the program runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,7 +71,12 @@ pub struct Target<'a> {
 
 /// The `nix-pixie target exec` command: runs `program` with `args` on the
 /// target of the install whose hook calls it, and exits like it.
-pub async fn exec(program: String, args: Vec<String>, chroot: bool) -> Result<ExitCode> {
+pub async fn exec(
+    program: String,
+    args: Vec<String>,
+    chroot: bool,
+    stdin: bool,
+) -> Result<ExitCode> {
     let socket = std::env::var_os(SOCKET_ENV).with_context(|| {
         format!(
             "${SOCKET_ENV} isn't set: `nix-pixie target exec` is for hooks, while the \
@@ -76,10 +87,25 @@ pub async fn exec(program: String, args: Vec<String>, chroot: bool) -> Result<Ex
     let mut controller = UnixStream::connect(&socket)
         .await
         .context("connecting to the controller")?;
+    let input = if stdin {
+        let mut input = Zeroizing::new(Vec::new());
+        tokio::io::stdin()
+            .take(u64::try_from(MAX_INPUT).unwrap_or(u64::MAX) + 1)
+            .read_to_end(&mut input)
+            .await
+            .context("reading stdin")?;
+        if input.len() > MAX_INPUT {
+            bail!("more than {MAX_INPUT} bytes on stdin");
+        }
+        Some(Secret(input))
+    } else {
+        None
+    };
     let request = Request {
         program,
         args,
         chroot,
+        input,
     };
     write_frame(&mut controller, &request).await?;
     let (mut stdout, mut stderr) = (tokio::io::stdout(), tokio::io::stderr());
@@ -146,6 +172,7 @@ pub async fn serve(mut hook: UnixStream, target: Target<'_>) -> Result<()> {
         program: request.program,
         args: request.args,
         root,
+        input: request.input,
     };
     // Read to the end even if the hook is gone, to keep the session in step.
     let mut listening = true;

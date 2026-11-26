@@ -59,6 +59,47 @@ pub fn store_path(program: &str) -> Result<&str, String> {
     program.get(..end).map_or_else(refuse, Ok)
 }
 
+/// Refuses a program built for another machine than this one, as when a
+/// hook on an x86 controller names `${pkgs.foo}` for an ARM device: the
+/// kernel would only say "Exec format error". Checks ELF files only, at
+/// `file`; scripts and anything unreadable go on.
+fn check_machine(program: &str, file: &Path) -> Result<(), String> {
+    let mut header = [0_u8; 20];
+    let Ok(mut opened) = std::fs::File::open(file) else {
+        return Ok(());
+    };
+    if std::io::Read::read_exact(&mut opened, &mut header).is_err()
+        || header.get(..4) != Some(b"\x7fELF")
+    {
+        return Ok(());
+    }
+    let machine = match header.get(5) {
+        // e_machine, in the file's byte order.
+        Some(1) => u16::from_le_bytes([header[18], header[19]]),
+        Some(2) => u16::from_be_bytes([header[18], header[19]]),
+        _ => return Ok(()),
+    };
+    let built_for = match machine {
+        3 => "i686",
+        40 => "arm",
+        62 => "x86_64",
+        183 => "aarch64",
+        243 => "riscv64",
+        _ => return Ok(()),
+    };
+    let here = std::env::consts::ARCH;
+    let fits = built_for == here || (built_for == "i686" && here == "x86_64");
+    if fits {
+        Ok(())
+    } else {
+        Err(format!(
+            "{program} is built for {built_for}, but this machine is {here}: take it from the \
+             target configuration's packages (e.g. self.nixosConfigurations.<name>.pkgs), not \
+             the controller's"
+        ))
+    }
+}
+
 /// The command that runs `program` with `args`: on the live system, or with
 /// `root` inside the system installed there. Checks that the program is
 /// there, as the controller pushed it.
@@ -69,6 +110,7 @@ pub fn command(program: &str, args: &[String], root: Option<&str>) -> Result<Com
             if !Path::new(program).is_file() {
                 return Err(format!("{program} isn't in the target's store"));
             }
+            check_machine(program, Path::new(program))?;
             let mut command = Command::new(program);
             command.args(args).env_clear().envs(ENV);
             command
@@ -78,12 +120,14 @@ pub fn command(program: &str, args: &[String], root: Option<&str>) -> Result<Com
             if !root.join("etc/NIXOS").exists() {
                 return Err(format!("{} holds no installed system yet", root.display()));
             }
-            if !root.join(program.trim_start_matches('/')).is_file() {
+            let file = root.join(program.trim_start_matches('/'));
+            if !file.is_file() {
                 return Err(format!(
                     "{program} isn't in the store under {}",
                     root.display()
                 ));
             }
+            check_machine(program, &file)?;
             // nixos-enter mounts /dev, /proc and /sys and activates the
             // system (for /etc), with the agent's PATH for its own tools.
             let mut command = Command::new("nixos-enter");

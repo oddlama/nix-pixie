@@ -130,6 +130,10 @@ pub enum TargetCommand {
         /// after `install`.
         #[arg(long)]
         chroot: bool,
+        /// Give the program this command's stdin (up to 512 KiB), e.g. a
+        /// key, rather than none. It is read to the end first.
+        #[arg(long)]
+        stdin: bool,
         /// The program, then its arguments.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -334,11 +338,16 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         },
         Command::Netboot => bail!("netboot is not implemented yet"),
         Command::Target {
-            command: TargetCommand::Exec { chroot, command },
+            command:
+                TargetCommand::Exec {
+                    chroot,
+                    stdin,
+                    command,
+                },
         } => {
             let mut command = command.into_iter();
             let program = command.next().unwrap_or_default();
-            return target::exec(program, command.collect(), chroot).await;
+            return target::exec(program, command.collect(), chroot, stdin).await;
         }
     };
     result.map(|()| ExitCode::SUCCESS)

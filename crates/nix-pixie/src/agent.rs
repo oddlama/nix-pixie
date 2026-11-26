@@ -15,8 +15,8 @@ use mdns_sd::ServiceEvent;
 use nix_pixie_proto::announce::{Announcement, Pairing};
 use nix_pixie_proto::code::{Code, NameplateSpace};
 use nix_pixie_proto::ctrl::{
-    ControllerMsg, DiskAssignment, KeyFile, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, Shutdown,
-    StreamRequest, TargetMsg,
+    ControllerMsg, DiskAssignment, KeyFile, MAX_CONTROLLER_FRAME, MAX_STREAM_REQUEST, Secret,
+    Shutdown, StreamRequest, TargetMsg,
 };
 use nix_pixie_proto::frame::{FrameError, read_frame, write_frame};
 use nix_pixie_proto::pair::Side;
@@ -887,7 +887,8 @@ async fn serve_controller(
                 program,
                 args,
                 root,
-            } => exec(stream, &program, &args, root.as_deref()).await?,
+                input,
+            } => exec(stream, &program, &args, root.as_deref(), input).await?,
             ControllerMsg::Finish { root, zpools, then } => {
                 let reply = finish(&root, &zpools).await;
                 if matches!(reply, TargetMsg::Finished { .. }) {
@@ -979,6 +980,7 @@ async fn exec(
     program: &str,
     args: &[String],
     root: Option<&str>,
+    input: Option<Secret>,
 ) -> Result<TargetMsg> {
     let command = match exec::command(program, args, root) {
         Ok(command) => command,
@@ -996,7 +998,7 @@ async fn exec(
         ?root,
         "running a hook's program"
     );
-    child::exec(command, stream).await
+    child::exec(command, stream, input.map(|secret| secret.0)).await
 }
 
 async fn facter_report(state: &StateDir) -> TargetMsg {

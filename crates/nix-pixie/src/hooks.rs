@@ -322,6 +322,8 @@ pub struct Context {
     /// Where the installed system is mounted on the target (`format` to
     /// `install`).
     pub root: Option<String>,
+    /// What earlier hooks wrote into `$PIXIE_OUT/context.json`, by hook.
+    pub outputs: BTreeMap<String, serde_json::Value>,
 }
 
 /// Runs a machine's hooks as the install passes its steps.
@@ -406,6 +408,9 @@ impl Runner {
 
     /// Keeps what a hook produced, if it's not too late for it.
     fn take_outputs(&mut self, name: &str, step: Step, outputs: Outputs) -> Result<()> {
+        if let Some(value) = outputs.context {
+            self.context.outputs.insert(name.to_string(), value);
+        }
         if let Some(key) = outputs.host_key {
             if step >= Step::HostKey {
                 bail!(
@@ -456,6 +461,7 @@ impl Runner {
                     "name": name,
                     "after": step.name(),
                     "ran": self.reached.is_some_and(|reached| step <= reached),
+                    "output": self.context.outputs.get(name),
                 })
             })
             .collect()
@@ -471,7 +477,12 @@ pub struct Outputs {
     pub disk_keys: BTreeMap<String, Zeroizing<Vec<u8>>>,
     /// `host-key`: the host's private key (push mode).
     pub host_key: Option<Zeroizing<Vec<u8>>>,
+    /// `context.json`: for later hooks, and the result.
+    pub context: Option<serde_json::Value>,
 }
+
+/// The largest `context.json` a hook may write.
+const MAX_CONTEXT_BYTES: u64 = 1024 * 1024;
 
 /// Reads a hook's output directory. Anything but `files/`, `disk-keys/`
 /// and `host-key` is a mistake and refused.
@@ -486,6 +497,14 @@ pub fn collect_outputs(out: &Path) -> Result<Outputs> {
             Some("files.json") if entry.file_type()?.is_file() => {
                 manifest = Some(std::fs::read(entry.path())?);
             }
+            Some("context.json") if entry.file_type()?.is_file() => {
+                if entry.metadata()?.len() > MAX_CONTEXT_BYTES {
+                    bail!("context.json is larger than {MAX_CONTEXT_BYTES} bytes");
+                }
+                let json = std::fs::read(entry.path())?;
+                outputs.context =
+                    Some(serde_json::from_slice(&json).context("context.json is not JSON")?);
+            }
             Some("disk-keys") => {
                 outputs.disk_keys = collect_files(&entry.path())?
                     .into_iter()
@@ -496,7 +515,8 @@ pub fn collect_outputs(out: &Path) -> Result<Outputs> {
                 outputs.host_key = Some(Zeroizing::new(std::fs::read(entry.path())?));
             }
             _ => bail!(
-                "{}: a hook's outputs are files/, files.json, disk-keys/ and host-key",
+                "{}: a hook's outputs are files/, files.json, disk-keys/, host-key and \
+                 context.json",
                 name.to_string_lossy()
             ),
         }
