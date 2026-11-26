@@ -34,6 +34,8 @@ pub struct Machine {
     pub firmware: FirmwareAssumed,
     #[serde(default)]
     pub secrets: Secrets,
+    #[serde(default)]
+    pub boot_check: BootCheck,
     /// Enabled hooks, by name (see `crate::hooks`).
     pub hooks: BTreeMap<String, Hook>,
 }
@@ -135,6 +137,23 @@ pub fn with_id(path: &str, id: Option<&str>, option: &str) -> Result<String> {
         )
     })?;
     Ok(path.replace(ID, id))
+}
+
+/// How the controller checks that the installed system came up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum BootCheck {
+    /// Ask its SSH server for the host key (if it runs one).
+    #[default]
+    Ssh,
+    /// The hooks after `boot` are the check: they wait for the machine
+    /// their own way, e.g. on a serial port, and may report the host key
+    /// they saw.
+    Hooks,
+    /// Don't check.
+    #[serde(rename = "none")]
+    #[value(name = "none")]
+    Nothing,
 }
 
 /// Where secrets hooks give the controller for the repository go.

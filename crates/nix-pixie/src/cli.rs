@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::net::Relays;
 use crate::{agent, console, control, controller, discovery, events, identity, install, target};
@@ -140,6 +140,147 @@ pub enum TargetCommand {
     },
 }
 
+/// `nix-pixie controller install`.
+#[derive(Debug, Args)]
+pub struct InstallCli {
+    /// The code shown on the target, e.g. 482913-acid-acorn-acre. Asked
+    /// for on the terminal if left out, which keeps it out of the
+    /// shell's history.
+    #[arg(long)]
+    code: Option<String>,
+    /// Pair with a target waiting for this controller's code (three
+    /// words, from `nix-pixie controller new-code`), which was handed to
+    /// it some other way, e.g. on the kernel command line of an
+    /// installer booted over USB. For targets without a screen.
+    #[arg(long, value_name = "FILE", conflicts_with = "code")]
+    controller_code_file: Option<PathBuf>,
+    /// Flake with the `pixie` output and the configurations.
+    #[arg(long, default_value = ".")]
+    flake: String,
+    /// Which of many devices installed from one machine this is, e.g. a
+    /// serial number or an id from an inventory: `{id}` in the machine's
+    /// paths (hostKey.publicKeyPath, facter.reportPath), and `id` for
+    /// hooks. A hook can give it instead, in `$PIXIE_OUT/id`.
+    #[arg(long)]
+    id: Option<String>,
+    /// A binary cache the target copies the system from first (e.g. one
+    /// on its own network, faster than through the controller; it needs
+    /// a network to it); the controller sends what is missing.
+    /// Repeatable.
+    #[arg(long = "substituter", value_name = "URL")]
+    substituters: Vec<String>,
+    /// A key whose signatures the target trusts for the substituters,
+    /// e.g. cache.example.org-1:AbC...=. Repeatable.
+    #[arg(
+        long = "trusted-public-key",
+        value_name = "KEY",
+        requires = "substituters"
+    )]
+    trusted_public_keys: Vec<String>,
+    /// Don't compress what goes to the target: for links faster than
+    /// zstd on this machine, or contents that don't compress.
+    #[arg(long)]
+    no_compression: bool,
+    /// How to check that the installed system came up, instead of the
+    /// machine's bootCheck: ask its SSH server, leave it to the hooks
+    /// after `boot`, or not at all.
+    #[arg(long, value_enum)]
+    boot_check: Option<crate::metadata::BootCheck>,
+    /// Install this machine (default: the one whose hints match).
+    #[arg(long)]
+    machine: Option<String>,
+    /// Put ROLE (a disko disk) onto DISK: a kernel name like nvme0n1,
+    /// a /dev/disk/by-id name, or a serial number (repeatable).
+    #[arg(long = "disk", value_name = "ROLE=DISK")]
+    disks: Vec<String>,
+    /// Approve the target and format empty disks without asking.
+    #[arg(long)]
+    yes: bool,
+    /// Erase disks that hold data without asking.
+    #[arg(long)]
+    wipe: bool,
+    /// What the target does once the system is installed. After a
+    /// reboot or power-off, the controller waits for the installed
+    /// system's SSH server and checks its host key.
+    #[arg(long, value_enum, default_value_t = install::Then::Reboot)]
+    then: install::Then,
+    /// How long to wait for the installed system, in seconds.
+    #[arg(long, default_value_t = 600)]
+    boot_timeout: u64,
+    /// How often to ask the installed system for its host key while
+    /// waiting, in seconds. Pressing Enter asks right away.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    boot_check_interval: u64,
+    /// Give up pairing after this many seconds.
+    #[arg(long, default_value_t = 30)]
+    timeout: u64,
+    /// How to find targets.
+    #[arg(long, value_enum, default_value_t = discovery::Method::Both)]
+    discovery: discovery::Method,
+    /// Instead of searching the local network, probe this host (an IP
+    /// address or a name; repeatable), e.g. a server on the internet
+    /// running `nix run github:oddlama/nix-pixie#agent`. Needs UDP 47011
+    /// and 47012 to it. On a direct link, a link-local address with its
+    /// interface: `fe80::2%usb0`.
+    #[arg(long = "target", value_name = "HOST")]
+    targets: Vec<String>,
+    #[command(flatten)]
+    relay: RelayArgs,
+}
+
+impl InstallCli {
+    /// What `install` runs with.
+    fn into_args(self, identity: PathBuf) -> Result<install::InstallArgs> {
+        let Self {
+            code,
+            controller_code_file,
+            id,
+            substituters,
+            trusted_public_keys,
+            no_compression,
+            boot_check,
+            flake,
+            machine,
+            disks,
+            yes,
+            wipe,
+            then,
+            boot_timeout,
+            boot_check_interval,
+            timeout,
+            discovery,
+            targets,
+            relay,
+        } = self;
+        if no_compression {
+            crate::push::no_compression();
+        }
+        Ok(install::InstallArgs {
+            identity,
+            code,
+            controller_code_file,
+            id,
+            caches: install::Caches {
+                from: substituters,
+                keys: trusted_public_keys,
+            },
+            boot_check,
+            timeout: Duration::from_secs(timeout),
+            method: discovery,
+            flake,
+            machine,
+            disks,
+            yes,
+            wipe,
+            then,
+            boot_timeout: Duration::from_secs(boot_timeout),
+            boot_check_interval: Duration::from_secs(boot_check_interval),
+            targets,
+            relays: relay.relays()?,
+        })
+    }
+}
+
 /// What the controller can do.
 #[derive(Debug, Subcommand)]
 pub enum ControllerCommand {
@@ -199,86 +340,7 @@ pub enum ControllerCommand {
     /// Pair with the target showing CODE and install a machine of FLAKE onto
     /// it: choose disks, build, format with disko, and send the system.
     /// Prints the result as JSON.
-    Install {
-        /// The code shown on the target, e.g. 482913-acid-acorn-acre. Asked
-        /// for on the terminal if left out, which keeps it out of the
-        /// shell's history.
-        #[arg(long)]
-        code: Option<String>,
-        /// Pair with a target waiting for this controller's code (three
-        /// words, from `nix-pixie controller new-code`), which was handed to
-        /// it some other way, e.g. on the kernel command line of an
-        /// installer booted over USB. For targets without a screen.
-        #[arg(long, value_name = "FILE", conflicts_with = "code")]
-        controller_code_file: Option<PathBuf>,
-        /// Flake with the `pixie` output and the configurations.
-        #[arg(long, default_value = ".")]
-        flake: String,
-        /// Which of many devices installed from one machine this is, e.g. a
-        /// serial number or an id from an inventory: `{id}` in the machine's
-        /// paths (hostKey.publicKeyPath, facter.reportPath), and `id` for
-        /// hooks. A hook can give it instead, in `$PIXIE_OUT/id`.
-        #[arg(long)]
-        id: Option<String>,
-        /// A binary cache the target copies the system from first (e.g. one
-        /// on its own network, faster than through the controller; it needs
-        /// a network to it); the controller sends what is missing.
-        /// Repeatable.
-        #[arg(long = "substituter", value_name = "URL")]
-        substituters: Vec<String>,
-        /// A key whose signatures the target trusts for the substituters,
-        /// e.g. cache.example.org-1:AbC...=. Repeatable.
-        #[arg(
-            long = "trusted-public-key",
-            value_name = "KEY",
-            requires = "substituters"
-        )]
-        trusted_public_keys: Vec<String>,
-        /// Don't compress what goes to the target: for links faster than
-        /// zstd on this machine, or contents that don't compress.
-        #[arg(long)]
-        no_compression: bool,
-        /// Install this machine (default: the one whose hints match).
-        #[arg(long)]
-        machine: Option<String>,
-        /// Put ROLE (a disko disk) onto DISK: a kernel name like nvme0n1,
-        /// a /dev/disk/by-id name, or a serial number (repeatable).
-        #[arg(long = "disk", value_name = "ROLE=DISK")]
-        disks: Vec<String>,
-        /// Approve the target and format empty disks without asking.
-        #[arg(long)]
-        yes: bool,
-        /// Erase disks that hold data without asking.
-        #[arg(long)]
-        wipe: bool,
-        /// What the target does once the system is installed. After a
-        /// reboot or power-off, the controller waits for the installed
-        /// system's SSH server and checks its host key.
-        #[arg(long, value_enum, default_value_t = install::Then::Reboot)]
-        then: install::Then,
-        /// How long to wait for the installed system, in seconds.
-        #[arg(long, default_value_t = 600)]
-        boot_timeout: u64,
-        /// How often to ask the installed system for its host key while
-        /// waiting, in seconds. Pressing Enter asks right away.
-        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
-        boot_check_interval: u64,
-        /// Give up pairing after this many seconds.
-        #[arg(long, default_value_t = 30)]
-        timeout: u64,
-        /// How to find targets.
-        #[arg(long, value_enum, default_value_t = discovery::Method::Both)]
-        discovery: discovery::Method,
-        /// Instead of searching the local network, probe this host (an IP
-        /// address or a name; repeatable), e.g. a server on the internet
-        /// running `nix run github:oddlama/nix-pixie#agent`. Needs UDP 47011
-        /// and 47012 to it. On a direct link, a link-local address with its
-        /// interface: `fe80::2%usb0`.
-        #[arg(long = "target", value_name = "HOST")]
-        targets: Vec<String>,
-        #[command(flatten)]
-        relay: RelayArgs,
-    },
+    Install(Box<InstallCli>),
     /// Show a controller code for targets to type in; prints one JSON line
     /// per paired target.
     Serve {
@@ -434,53 +496,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
             })
             .await
         }
-        ControllerCommand::Install {
-            code,
-            controller_code_file,
-            id,
-            substituters,
-            trusted_public_keys,
-            no_compression,
-            flake,
-            machine,
-            disks,
-            yes,
-            wipe,
-            then,
-            boot_timeout,
-            boot_check_interval,
-            timeout,
-            discovery,
-            targets,
-            relay,
-        } => {
-            if no_compression {
-                crate::push::no_compression();
-            }
-            install::install(install::InstallArgs {
-                identity,
-                code,
-                controller_code_file,
-                id,
-                caches: install::Caches {
-                    from: substituters,
-                    keys: trusted_public_keys,
-                },
-                timeout: Duration::from_secs(timeout),
-                method: discovery,
-                flake,
-                machine,
-                disks,
-                yes,
-                wipe,
-                then,
-                boot_timeout: Duration::from_secs(boot_timeout),
-                boot_check_interval: Duration::from_secs(boot_check_interval),
-                targets,
-                relays: relay.relays()?,
-            })
-            .await
-        }
+        ControllerCommand::Install(install) => install::install(install.into_args(identity)?).await,
         ControllerCommand::Serve {
             code_file,
             max_targets,

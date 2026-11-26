@@ -331,6 +331,10 @@ pub struct Context {
     /// With `facter.mode = "compare"`: where the target's hardware differs
     /// from the report in the repository (JSON pointers).
     pub facter_differences: Option<Vec<String>>,
+    /// For hooks after `boot` that check it (`bootCheck = "hooks"`): the
+    /// host key the install put there, and how long they may take.
+    pub expected_host_key: Option<String>,
+    pub boot_timeout_secs: Option<u64>,
 }
 
 /// Runs a machine's hooks as the install passes its steps.
@@ -352,6 +356,8 @@ pub struct Runner {
     reached: Option<Step>,
     /// For `$PIXIE_OUT/encrypted/`.
     recipients: Vec<String>,
+    /// From a hook after `boot`.
+    seen_host_key: Option<String>,
 }
 
 impl Runner {
@@ -372,7 +378,13 @@ impl Runner {
             host_key: None,
             reached: None,
             recipients: Vec::new(),
+            seen_host_key: None,
         })
+    }
+
+    /// The host key a hook after `boot` saw, if one did.
+    pub fn take_seen_host_key(&mut self) -> Option<String> {
+        self.seen_host_key.take()
     }
 
     /// Encrypt what hooks put into `$PIXIE_OUT/encrypted/` to these age
@@ -426,6 +438,14 @@ impl Runner {
     async fn take_outputs(&mut self, name: &str, step: Step, outputs: Outputs) -> Result<()> {
         if let Some(value) = outputs.context {
             self.context.outputs.insert(name.to_string(), value);
+        }
+        if let Some(key) = outputs.seen_host_key {
+            if step != Step::Boot {
+                bail!(
+                    "hook {name} wrote seen-host-key after `{step}`; only hooks after `boot` see it"
+                );
+            }
+            self.seen_host_key = Some(key);
         }
         for secret in &outputs.encrypted {
             let path = secret.path.trim_start_matches('/');
@@ -518,6 +538,9 @@ pub struct Outputs {
     pub id: Option<String>,
     /// `encrypted/<path>`: for the repository at `<path>`, encrypted.
     pub encrypted: Vec<PlacedFile>,
+    /// `seen-host-key`: the installed system's public host key, as a hook
+    /// after `boot` saw it (with `bootCheck = "hooks"`).
+    pub seen_host_key: Option<String>,
 }
 
 /// The largest `context.json` a hook may write.
@@ -537,6 +560,11 @@ pub fn collect_outputs(out: &Path) -> Result<Outputs> {
                 manifest = Some(std::fs::read(entry.path())?);
             }
             Some("encrypted") => outputs.encrypted = collect_files(&entry.path())?,
+            Some("seen-host-key") if entry.file_type()?.is_file() => {
+                let key =
+                    std::fs::read_to_string(entry.path()).context("seen-host-key is not UTF-8")?;
+                outputs.seen_host_key = Some(key.trim().to_string());
+            }
             Some("id") if entry.file_type()?.is_file() => {
                 let id = std::fs::read_to_string(entry.path()).context("id is not UTF-8")?;
                 let id = id.trim().to_string();
@@ -562,7 +590,7 @@ pub fn collect_outputs(out: &Path) -> Result<Outputs> {
             }
             _ => bail!(
                 "{}: a hook's outputs are files/, files.json, disk-keys/, host-key, \
-                 context.json, id and encrypted/",
+                 context.json, id, encrypted/ and seen-host-key",
                 name.to_string_lossy()
             ),
         }

@@ -26,7 +26,7 @@ use crate::facter;
 use crate::hooks::{self, Step};
 use crate::hostkey::{self, PublicKey};
 use crate::link::Link;
-use crate::metadata::{self, HostKeyMode, Machine, Metadata};
+use crate::metadata::{self, BootCheck, HostKeyMode, Machine, Metadata};
 use crate::net::{self, Relays, Route, sanitise};
 use crate::plan::{self, Choice, Resolution};
 use crate::preflight;
@@ -60,6 +60,8 @@ pub struct InstallArgs {
     pub id: Option<String>,
     /// Binary caches the target substitutes from first.
     pub caches: Caches,
+    /// How to check the first boot, instead of the machine's `bootCheck`.
+    pub boot_check: Option<BootCheck>,
     pub timeout: Duration,
     pub method: Method,
     /// Flake with the `pixie` output and the configurations.
@@ -163,11 +165,11 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     endpoint.close().await;
     let Installed {
         mut report,
-        check,
+        after,
         mut hooks,
     } = result?;
-    let done = match check {
-        Some(check) => tokio::select! {
+    let done = match after {
+        After::Ssh(check) => tokio::select! {
             r = async {
                 verify(check, &args, &mut report).await?;
                 hooks.after(Step::Boot, None).await?;
@@ -175,7 +177,11 @@ pub async fn install(args: InstallArgs) -> Result<()> {
             } => r,
             () = crate::shutdown_signal() => Err(anyhow!("interrupted")),
         },
-        None => Ok(()),
+        After::Hooks(check) => tokio::select! {
+            r = boot_by_hooks(&check, &args, &mut hooks, &mut report) => r,
+            () = crate::shutdown_signal() => Err(anyhow!("interrupted")),
+        },
+        After::Nothing => Ok(()),
     };
     report.insert("hooks".into(), hooks.report());
     ui::finish();
@@ -256,7 +262,16 @@ fn step_list(args: &InstallArgs, known: Known<'_>) -> Vec<(String, String)> {
     if let Some(finish) = finish {
         list.add("finish", finish);
         list.hooks(Step::Finish);
-        if known.ssh != Some(false) {
+        let check = args
+            .boot_check
+            .or(machine.map(|m| m.boot_check))
+            .unwrap_or_default();
+        let boot = match check {
+            BootCheck::Ssh => known.ssh != Some(false),
+            BootCheck::Hooks => true,
+            BootCheck::Nothing => false,
+        };
+        if boot {
             list.add("boot", "Wait for the first boot");
             list.hooks(Step::Boot);
         }
@@ -294,6 +309,16 @@ async fn check_machine(
 ) -> Result<BTreeMap<String, PathBuf>> {
     check_push(name, machine)?;
     crate::encrypt::check_recipients(&machine.secrets.recipients)?;
+    if args.boot_check.unwrap_or(machine.boot_check) == BootCheck::Hooks
+        && hooks::schedule(&machine.hooks)?
+            .after(Step::Boot)
+            .is_empty()
+    {
+        bail!(
+            "{name} checks its first boot with hooks (bootCheck = \"hooks\"), but no hook runs \
+             after `boot`"
+        );
+    }
     if let Some(report) = missing_facter_report(&args.flake, machine, args.id.as_deref()) {
         // A configuration that reads its facter report can't evaluate
         // before the first one arrives (after approval); check it then.
@@ -354,10 +379,19 @@ fn no_files_left(hooks: &mut hooks::Runner, step: Step) -> Result<()> {
 /// What the session leaves for after the connection is closed.
 struct Installed {
     report: serde_json::Map<String, serde_json::Value>,
-    /// How to check the installed system's host key, if it can be.
-    check: Option<Check>,
+    after: After,
     /// For the hooks after `boot`.
     hooks: hooks::Runner,
+}
+
+/// What checks the first boot.
+enum After {
+    /// Nothing: no reboot, or nothing to check it with.
+    Nothing,
+    /// The installed system's SSH server, asked for its host key.
+    Ssh(Check),
+    /// The hooks after `boot` (`bootCheck = "hooks"`).
+    Hooks(Check),
 }
 
 /// Where and what to ask the installed system's SSH server.
@@ -424,6 +458,64 @@ impl Check {
         report.insert("hostKey".into(), entry.into());
         None
     }
+}
+
+/// The first boot, checked by the hooks after `boot`: they wait for it
+/// their own way, and may report the host key they saw, which then must be
+/// the expected one. Records the result in `report`.
+async fn boot_by_hooks(
+    check: &Check,
+    args: &InstallArgs,
+    hooks: &mut hooks::Runner,
+    report: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let step = ui::start("boot");
+    ui::show(boot_notice(check, args));
+    hooks.context.expected_host_key = check.expected.as_ref().map(ToString::to_string);
+    hooks.context.boot_timeout_secs = Some(args.boot_timeout.as_secs());
+    let ran = async {
+        hooks.after(Step::Boot, None).await?;
+        no_files_left(hooks, Step::Boot)
+    }
+    .await;
+    if let Err(e) = ran {
+        report.insert(
+            "hostKey".into(),
+            serde_json::json!({ "verified": false, "through": "hooks", "error": format!("{e:#}") }),
+        );
+        return Err(e);
+    }
+    let seen = hooks
+        .take_seen_host_key()
+        .map(|key| PublicKey::parse(&key).context("the host key a hook saw (seen-host-key)"))
+        .transpose()?;
+    let (entry, done) = match (&seen, &check.expected) {
+        (Some(seen), Some(expected)) if seen != expected => {
+            report.insert(
+                "hostKey".into(),
+                serde_json::json!({ "verified": false, "through": "hooks", "seen": seen.to_string() }),
+            );
+            bail!(
+                "HOST KEY MISMATCH: a hook saw {seen} on {}, but the install put {expected} there",
+                check.machine
+            );
+        }
+        (Some(seen), Some(_)) => (
+            serde_json::json!({ "verified": true, "through": "hooks", "seen": seen.to_string() }),
+            "up, host key verified".to_string(),
+        ),
+        (Some(seen), None) => (
+            serde_json::json!({ "verified": false, "through": "hooks", "seen": seen.to_string() }),
+            "up, new host key".to_string(),
+        ),
+        (None, _) => (
+            serde_json::json!({ "verified": false, "through": "hooks" }),
+            "up, as the hooks say".to_string(),
+        ),
+    };
+    report.insert("hostKey".into(), entry);
+    step.done(done);
+    Ok(())
 }
 
 /// Waits for the installed system and compares its host key; records the
@@ -643,6 +735,7 @@ struct Plan {
     /// Passphrases disko reads from files while formatting.
     key_files: Vec<KeyFile>,
     hooks: hooks::Runner,
+    boot_check: BootCheck,
 }
 
 /// Approval, the facter report and host key, the disk plan, the build.
@@ -742,6 +835,7 @@ async fn prepare(
         host_key,
         key_files,
         hooks,
+        boot_check: args.boot_check.unwrap_or(machine.boot_check),
     })
 }
 
@@ -957,6 +1051,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
         host_key,
         key_files,
         mut hooks,
+        boot_check,
     } = plan;
     confirm_erase(&disks, &choices, args.yes, args.wipe).await?;
     format_disks(link, &choices, &disko, &built.disko_script, key_files).await?;
@@ -990,28 +1085,75 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
     if let Some(id) = &hooks.context.id {
         report.insert("id".into(), id.clone().into());
     }
+    let leaving = Leaving {
+        name,
+        root,
+        zpools: disko.zpools,
+        ssh,
+        expected,
+        boot_check,
+        encrypted: !(disko.encryption.luks.is_empty() && disko.encryption.zfs.is_empty()),
+        enrolls_keys: boot.enroll_keys.then_some(boot.enroll_reboots),
+    };
+    let after = leave(link, peer, args, &mut hooks, &mut report, leaving).await?;
+    Ok(Installed {
+        report,
+        after,
+        hooks,
+    })
+}
+
+/// What leaving the target needs from the install.
+struct Leaving {
+    name: String,
+    root: String,
+    zpools: Vec<String>,
+    ssh: Ssh,
+    /// The host key the install put there.
+    expected: Option<PublicKey>,
+    boot_check: BootCheck,
+    encrypted: bool,
+    enrolls_keys: Option<bool>,
+}
+
+/// Leaves the target ready to boot (or mounted, with `--then stay`), and
+/// says what checks the first boot.
+async fn leave(
+    link: &Link,
+    peer: &Peer,
+    args: &InstallArgs,
+    hooks: &mut hooks::Runner,
+    report: &mut serde_json::Map<String, serde_json::Value>,
+    leaving: Leaving,
+) -> Result<After> {
+    let Leaving {
+        name,
+        root,
+        zpools,
+        ssh,
+        expected,
+        boot_check,
+        encrypted,
+        enrolls_keys,
+    } = leaving;
     let shutdown = match args.then {
         Then::Stay => {
             ui::show(vec![format!(
                 "Installed; {root} stays mounted on the target."
             )]);
-            return Ok(Installed {
-                report,
-                check: None,
-                hooks,
-            });
+            return Ok(After::Nothing);
         }
         Then::Reboot => Shutdown::Reboot,
         Then::Poweroff => Shutdown::PowerOff,
     };
     // Asked while the target still answers.
-    let ssh_at = if ssh.enable {
+    let ssh_at = if ssh.enable && boot_check == BootCheck::Ssh {
         Some(ssh_addrs(link, peer).await?)
     } else {
         None
     };
     let step = ui::start("finish");
-    let live = finish(link, &root, &disko.zpools, shutdown).await?;
+    let live = finish(link, &root, &zpools, shutdown).await?;
     exit::reached(exit::Phase::Installed);
     step.done(match shutdown {
         Shutdown::Reboot => "rebooting",
@@ -1019,21 +1161,28 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
     });
     hooks.context.root = None;
     hooks.after(Step::Finish, None).await?;
-    no_files_left(&mut hooks, Step::Finish)?;
+    no_files_left(hooks, Step::Finish)?;
     let check = Check {
         addrs: Vec::new(),
         port: ssh.ports.first().copied().unwrap_or(22),
         expected,
         live,
         machine: name,
-        encrypted: !(disko.encryption.luks.is_empty() && disko.encryption.zfs.is_empty()),
-        enrolls_keys: boot.enroll_keys.then_some(boot.enroll_reboots),
+        encrypted,
+        enrolls_keys,
     };
-    let check = check.at(ssh_at, &hooks, &mut report);
-    Ok(Installed {
-        report,
-        check,
-        hooks,
+    Ok(match boot_check {
+        BootCheck::Ssh => check
+            .at(ssh_at, hooks, report)
+            .map_or(After::Nothing, After::Ssh),
+        BootCheck::Hooks => After::Hooks(check),
+        BootCheck::Nothing => {
+            report.insert(
+                "hostKey".into(),
+                serde_json::json!({ "skipped": "bootCheck = none" }),
+            );
+            After::Nothing
+        }
     })
 }
 

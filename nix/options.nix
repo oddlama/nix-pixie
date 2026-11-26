@@ -317,6 +317,22 @@ let
           '';
         };
 
+        bootCheck = mkOption {
+          type = types.enum [
+            "ssh"
+            "hooks"
+            "none"
+          ];
+          default = "ssh";
+          description = ''
+            How the controller checks that the installed system came up: by
+            asking its SSH server for the host key; by the hooks after
+            `boot`, which wait for it their own way (a status line on a
+            serial port, say) and may report the host key they saw in
+            `$PIXIE_OUT/seen-host-key`; or not at all.
+          '';
+        };
+
         secrets.recipients = mkOption {
           type = types.listOf types.str;
           default = [ ];
