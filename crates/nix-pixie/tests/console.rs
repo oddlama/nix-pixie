@@ -34,6 +34,7 @@ fn status(messages: usize) -> Status {
         }),
         relay: Some("Relay: https://relay.example.org/ is reachable.".into()),
         messages: (1..=messages).map(|n| format!("message {n}")).collect(),
+        said: u64::try_from(messages).unwrap(),
     }
 }
 

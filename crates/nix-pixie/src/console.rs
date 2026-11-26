@@ -332,3 +332,167 @@ fn draw(view: &View) -> Result<()> {
         .and_then(|()| out.flush())
         .context("drawing the console")
 }
+
+/// How [`run_lines`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lines {
+    /// For people: `code …`, `relay …`, the messages, and answers after `>`.
+    Plain,
+    /// One JSON object per line, for programs: `{"v":1,"event":…}` with
+    /// `status` (`code`, `command`, `relay`), `message` (`text`) and
+    /// `answer` (`text`) events.
+    Json,
+}
+
+/// The console for a line-based terminal, e.g. a serial port a program
+/// reads: no screen to redraw, just what changes, a line each. Commands
+/// come in as lines. Runs until stdin ends.
+pub async fn run_lines(state_dir: PathBuf, format: Lines) -> Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    // A program on the other end doesn't want its commands echoed back.
+    let _quiet = (format == Lines::Json).then(Quiet::enter).transpose()?;
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut out = Out::new(format);
+    let mut watching: Option<Watching> = None;
+    let mut seen: Option<Status> = None;
+    let mut open = true;
+    loop {
+        if watching.is_none() {
+            watching = control::watch(&state_dir).await.ok();
+        }
+        tokio::select! {
+            status = async {
+                if let Some(watching) = &mut watching {
+                    watching.next().await
+                } else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Err(anyhow::anyhow!("not connected"))
+                }
+            } => match status {
+                Ok(status) => {
+                    out.changes(seen.as_ref(), &status)?;
+                    seen = Some(status);
+                }
+                Err(_) => watching = None,
+            },
+            line = input.next_line(), if open => match line {
+                Ok(Some(line)) => {
+                    let answer = command(&state_dir, line.trim()).await;
+                    if !answer.is_empty() {
+                        out.answer(&answer)?;
+                    }
+                }
+                // Without input, it still reports.
+                Ok(None) | Err(_) => open = false,
+            },
+        }
+    }
+}
+
+/// Writes [`run_lines`]' lines.
+struct Out {
+    format: Lines,
+}
+
+impl Out {
+    fn new(format: Lines) -> Self {
+        Self { format }
+    }
+
+    fn line(text: &str) -> Result<()> {
+        let mut out = std::io::stdout().lock();
+        // A serial line wants CR LF.
+        out.write_all(text.as_bytes())
+            .and_then(|()| out.write_all(b"\r\n"))
+            .and_then(|()| out.flush())
+            .context("writing to the console")
+    }
+
+    fn json(event: &str, mut fields: serde_json::Value) -> Result<()> {
+        if let Some(object) = fields.as_object_mut() {
+            object.insert("v".into(), 1.into());
+            object.insert("event".into(), event.into());
+        }
+        Self::line(&fields.to_string())
+    }
+
+    /// What changed from `before` to `now`.
+    fn changes(&mut self, before: Option<&Status>, now: &Status) -> Result<()> {
+        let code_changed = before.is_none_or(|b| b.code != now.code);
+        let relay_changed = before.is_none_or(|b| b.relay != now.relay);
+        match self.format {
+            Lines::Json if code_changed || relay_changed => Self::json(
+                "status",
+                serde_json::json!({
+                    "code": now.code.as_ref().map(|c| &c.code),
+                    "command": now.code.as_ref().map(|c| &c.command),
+                    "relay": now.relay,
+                }),
+            )?,
+            Lines::Json => {}
+            Lines::Plain => {
+                if code_changed {
+                    match &now.code {
+                        Some(shown) => {
+                            Self::line(&format!("code {}: {}", shown.code, shown.command))?;
+                        }
+                        None => Self::line("code none")?,
+                    }
+                }
+                if relay_changed && let Some(relay) = &now.relay {
+                    Self::line(relay)?;
+                }
+            }
+        }
+        // A restarted agent counts anew: then everything it has is new.
+        let new = now
+            .said
+            .checked_sub(before.map_or(0, |b| b.said))
+            .unwrap_or(now.said);
+        let new = usize::try_from(new)
+            .unwrap_or(usize::MAX)
+            .min(now.messages.len());
+        let first = now.messages.len().saturating_sub(new);
+        for text in now.messages.get(first..).unwrap_or_default() {
+            match self.format {
+                Lines::Json => Self::json("message", serde_json::json!({ "text": text }))?,
+                Lines::Plain => Self::line(text)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn answer(&mut self, text: &str) -> Result<()> {
+        match self.format {
+            Lines::Json => Self::json("answer", serde_json::json!({ "text": text })),
+            Lines::Plain => Self::line(&format!("> {text}")),
+        }
+    }
+}
+
+/// Echo off on the terminal until dropped, if stdin is one.
+struct Quiet {
+    saved: Option<Termios>,
+}
+
+impl Quiet {
+    fn enter() -> Result<Self> {
+        let stdin = std::io::stdin();
+        let Ok(saved) = termios::tcgetattr(&stdin) else {
+            return Ok(Self { saved: None });
+        };
+        let mut quiet = saved.clone();
+        quiet.local_modes.remove(termios::LocalModes::ECHO);
+        termios::tcsetattr(&stdin, OptionalActions::Now, &quiet)
+            .context("turning the terminal's echo off")?;
+        Ok(Self { saved: Some(saved) })
+    }
+}
+
+impl Drop for Quiet {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.saved {
+            let _ = termios::tcsetattr(std::io::stdin(), OptionalActions::Now, saved);
+        }
+    }
+}

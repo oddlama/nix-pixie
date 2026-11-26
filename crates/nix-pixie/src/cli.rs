@@ -99,6 +99,13 @@ pub enum Command {
         /// The agent's state directory.
         #[arg(long, default_value = "/run/nix-pixie")]
         state_dir: PathBuf,
+        /// Line by line instead of a screen, for a serial port: changes as
+        /// they come, commands as lines.
+        #[arg(long)]
+        plain: bool,
+        /// Like --plain, as JSON lines, for a program on the other end.
+        #[arg(long, conflicts_with = "plain")]
+        json: bool,
     },
     /// Serve DHCP and PXE for the installer image (needs root).
     Netboot,
@@ -316,7 +323,15 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             .await
         }
         Command::Relay { setting, state_dir } => relay(&state_dir, &setting).await,
-        Command::Console { state_dir } => console::run(state_dir).await,
+        Command::Console {
+            state_dir,
+            plain,
+            json,
+        } => match (plain, json) {
+            (false, false) => console::run(state_dir).await,
+            (_, true) => console::run_lines(state_dir, console::Lines::Json).await,
+            (true, false) => console::run_lines(state_dir, console::Lines::Plain).await,
+        },
         Command::Netboot => bail!("netboot is not implemented yet"),
         Command::Target {
             command: TargetCommand::Exec { chroot, command },

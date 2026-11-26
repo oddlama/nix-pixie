@@ -62,6 +62,25 @@ in
       '';
     };
 
+    statusTty = {
+      device = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "ttyGS0";
+        description = ''
+          A serial terminal (a USB gadget's, a UART) where the agent's status
+          goes line by line: its code, its relay, its messages. Commands
+          such as `relay URL` come back the same way. For whoever, or
+          whatever, is on the other end of a device without a screen.
+        '';
+      };
+      json = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "JSON lines (`nix-pixie console --json`) rather than text, for a program to read.";
+      };
+    };
+
     relay = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -166,6 +185,32 @@ in
       };
     };
     systemd.services."getty@tty1".enable = lib.mkIf cfg.console.enable false;
+
+    systemd.services.nix-pixie-status = lib.mkIf (cfg.statusTty.device != null) (
+      let
+        device = "dev-${cfg.statusTty.device}.device";
+      in
+      {
+        description = "nix-pixie on ${cfg.statusTty.device}";
+        # The terminal may show up later, e.g. once a USB host connects.
+        wantedBy = [ device ];
+        bindsTo = [ device ];
+        after = [
+          device
+          "nix-pixie-agent.service"
+        ];
+        conflicts = [ "serial-getty@${cfg.statusTty.device}.service" ];
+        serviceConfig = {
+          ExecStart = "${exe} console ${if cfg.statusTty.json then "--json" else "--plain"}";
+          StandardInput = "tty";
+          StandardOutput = "tty";
+          TTYPath = "/dev/${cfg.statusTty.device}";
+          TTYReset = true;
+          Restart = "always";
+          RestartSec = 1;
+        };
+      }
+    );
     systemd.services."autovt@tty1".enable = lib.mkIf cfg.console.enable false;
 
     networking.firewall = lib.mkIf cfg.openFirewall {

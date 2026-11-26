@@ -21,6 +21,9 @@ pub struct Status {
     pub relay: Option<String>,
     /// The latest messages, oldest first.
     pub messages: Vec<String>,
+    /// How many messages were said in all, kept or not: the last
+    /// `said - previous said` of `messages` are new.
+    pub said: u64,
 }
 
 /// A pairing code on the screen.
@@ -41,6 +44,7 @@ pub fn say(text: impl Into<String>) {
     let text = text.into();
     println!("\n    {text}\n");
     status().send_modify(|status| {
+        status.said += 1;
         status.messages.push(text);
         let excess = status.messages.len().saturating_sub(MAX_MESSAGES);
         status.messages.drain(..excess);
