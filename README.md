@@ -186,6 +186,10 @@ your normal user:
 $ nix run github:oddlama/nix-pixie -- controller install --machine web1 --code 482913-acid-acorn-acre
 ```
 
+Leave out `--code` to type it in when it is needed, with Tab completing the
+words. That also keeps the code out of your shell's history and the process
+list.
+
 From here on it runs by itself, apart from approving the machine and the disks
 it erases, and leaves you with a fully set up machine. The steps happening in
 between are:

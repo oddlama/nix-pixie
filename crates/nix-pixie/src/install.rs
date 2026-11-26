@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use nix_pixie_proto::code::Code;
 use nix_pixie_proto::ctrl::{
     ControllerMsg, DiskAssignment, KeyFile, Secret, Shutdown, StreamRequest, TargetMsg,
 };
@@ -49,7 +48,8 @@ const OUTPUT_TAIL_LINES: usize = 40;
 /// How `nix-pixie controller install` was invoked.
 pub struct InstallArgs {
     pub identity: PathBuf,
-    pub code: String,
+    /// `None`: asked for on the terminal, right before pairing.
+    pub code: Option<String>,
     pub timeout: Duration,
     pub method: Method,
     /// Flake with the `pixie` output and the configurations.
@@ -88,10 +88,12 @@ pub enum Then {
 
 /// Pairs with the target showing the code, and installs the machine onto it.
 pub async fn install(args: InstallArgs) -> Result<()> {
-    let code = Code::parse(&args.code)?;
-    let nameplate = code.nameplate().context(
-        "target codes start with the number shown on the target, e.g. 482913-acid-acorn-acre",
-    )?;
+    // A typo in a given code fails at once.
+    let given = args
+        .code
+        .as_deref()
+        .map(controller::target_code)
+        .transpose()?;
     let requested = parse_disk_args(&args.disks)?;
     ui::steps(step_list(&args, Known::default()));
     // Check what we can before pairing: a mistake shouldn't cost the code.
@@ -110,6 +112,11 @@ pub async fn install(args: InstallArgs) -> Result<()> {
         None
     };
 
+    let code = match given {
+        Some(code) => code,
+        None => ui::code::ask_target_code().await?,
+    };
+    let nameplate = code.nameplate().context(ui::code::NAMEPLATE_NEEDED)?;
     let search = controller::Search {
         identity: &args.identity,
         method: args.method,

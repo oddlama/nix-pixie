@@ -18,6 +18,7 @@
 //! redraw. Programs that need the terminal for themselves (hooks, passphrase
 //! prompts) get it with [`suspend`].
 
+pub mod code;
 mod input;
 pub mod render;
 

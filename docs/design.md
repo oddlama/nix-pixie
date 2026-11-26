@@ -416,7 +416,13 @@ Implemented in `crates/nix-pixie-proto/src/pair.rs`.
   keyboard machines.
 - **Keyboard layouts.** The installer console defaults to US. On QWERTZ, y and
   z are swapped; AZERTY also swaps a/q and w/z. Mitigations:
-  - Tab-completion against the wordlist.
+  - Tab-completion against the wordlist. **Implemented on the controller**
+    (`ui/code.rs`): without `--code`, it asks right before pairing, completes
+    words with Tab, marks tokens no word starts with, and refuses an
+    invalid code on Enter without losing the line. Completion only consults
+    the public list, so it reveals nothing, and nothing typed is kept (no
+    history). Typed in, the code also stays out of the shell's history and
+    `/proc/*/cmdline`, which `--code` doesn't.
   - Normalizing layout confusions before the PAKE (map the input through
     QWERTZ/AZERTY inverses and keep the variant made of valid words).
     **Implemented:** a unit test checks that every word, typed on US, QWERTZ

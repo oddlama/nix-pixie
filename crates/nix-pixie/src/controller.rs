@@ -44,7 +44,8 @@ pub fn print_id(identity_path: &Path) -> Result<()> {
 /// How `nix-pixie controller pair` was invoked.
 pub struct PairArgs {
     pub identity: PathBuf,
-    pub code: String,
+    /// `None`: asked for on the terminal, right before pairing.
+    pub code: Option<String>,
     pub timeout: Duration,
     pub method: Method,
     /// Flake with the `pixie` output, for matching and writing reports.
@@ -66,10 +67,8 @@ pub struct PairArgs {
 /// Pairs with the target showing a code (default mode), shows what it is,
 /// asks the operator to approve it, and prints one JSON object describing it.
 pub async fn pair(args: PairArgs) -> Result<()> {
-    let code = Code::parse(&args.code)?;
-    let nameplate = code.nameplate().context(
-        "target codes start with the number shown on the target, e.g. 482913-acid-acorn-acre",
-    )?;
+    // A typo in a given code fails at once.
+    let given = args.code.as_deref().map(target_code).transpose()?;
     // Check everything we can first: a mistake shouldn't cost a pairing code.
     push::check_local_paths(&args.push).await?;
     let flake = match &args.flake {
@@ -89,6 +88,11 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     }
 
     ui::steps(pair_steps(false, !args.push.is_empty()));
+    let code = match given {
+        Some(code) => code,
+        None => ui::code::ask_target_code().await?,
+    };
+    let nameplate = code.nameplate().context(ui::code::NAMEPLATE_NEEDED)?;
     let search = Search {
         identity: &args.identity,
         method: args.method,
@@ -112,6 +116,17 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     discovery.shutdown();
     endpoint.close().await;
     result
+}
+
+/// A target's code as given on the command line.
+///
+/// # Errors
+///
+/// If it doesn't parse, or has no nameplate (a controller's code).
+pub fn target_code(given: &str) -> Result<Code> {
+    let code = Code::parse(given)?;
+    code.nameplate().context(ui::code::NAMEPLATE_NEEDED)?;
+    Ok(code)
 }
 
 /// The steps of `controller pair`: with the facter report once the

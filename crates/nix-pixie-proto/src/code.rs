@@ -74,6 +74,19 @@ pub fn wordlist() -> &'static [&'static str] {
     })
 }
 
+/// The words starting with `prefix` (in any case), for completing a code
+/// while it is typed. The list is public, so this gives nothing away.
+#[must_use]
+pub fn completions(prefix: &str) -> &'static [&'static str] {
+    let prefix = prefix.to_ascii_lowercase();
+    let list = wordlist();
+    // The list is sorted; the tests check that.
+    let start = list.partition_point(|word| *word < prefix.as_str());
+    let rest = list.get(start..).unwrap_or_default();
+    let end = start + rest.partition_point(|word| word.starts_with(&prefix));
+    list.get(start..end).unwrap_or_default()
+}
+
 /// The list's own spelling of `word`, if it is on the list.
 fn lookup(word: &str) -> Option<&'static str> {
     // The list is sorted; the tests check that.

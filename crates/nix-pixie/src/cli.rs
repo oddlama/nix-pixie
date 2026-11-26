@@ -104,9 +104,11 @@ pub enum ControllerCommand {
     Id,
     /// Pair with the target showing CODE; prints the paired target as JSON.
     Pair {
-        /// The code shown on the target, e.g. 482913-acid-acorn-acre.
+        /// The code shown on the target, e.g. 482913-acid-acorn-acre. Asked
+        /// for on the terminal if left out, which keeps it out of the
+        /// shell's history.
         #[arg(long)]
-        code: String,
+        code: Option<String>,
         /// Give up after this many seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -144,9 +146,11 @@ pub enum ControllerCommand {
     /// it: choose disks, build, format with disko, and send the system.
     /// Prints the result as JSON.
     Install {
-        /// The code shown on the target, e.g. 482913-acid-acorn-acre.
+        /// The code shown on the target, e.g. 482913-acid-acorn-acre. Asked
+        /// for on the terminal if left out, which keeps it out of the
+        /// shell's history.
         #[arg(long)]
-        code: String,
+        code: Option<String>,
         /// Flake with the `pixie` output and the configurations.
         #[arg(long, default_value = ".")]
         flake: String,

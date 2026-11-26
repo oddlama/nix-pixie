@@ -46,6 +46,7 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import json
+    import re
 
     def as_alice(cmd):
         return f"su - alice -c '{cmd}'"
@@ -119,6 +120,42 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the rotated code pairs"):
         pair(code)
+        code = next_code(code)
+
+    with subtest("without --code the controller asks for it, completing words with Tab"):
+        words = [w.strip() for w in open("${../../crates/nix-pixie-proto/src/wordlist.txt}") if w.strip() and not w.startswith("#")]
+
+        def shortest(word):
+            # As few letters as name only this word.
+            return next(word[:n] for n in range(1, len(word) + 1) if [w for w in words if w.startswith(word[:n])] == [word])
+
+        nameplate, first, second, third = code.split("-")
+        # For printf: Tab, Enter (\\r) and Backspace (\\177).
+        keys = (
+            f"{nameplate}-{shortest(first)}\\t{shortest(second)}\\t"
+            # A typo: Enter refuses it, and it is taken back.
+            + "zzz\\r\\177\\177\\177"
+            + f"{shortest(third)}\\t\\r"
+        )
+        # Typed once the prompt is there, into a pipe held open for it.
+        controller.succeed("mkfifo -m 666 /tmp/keys && systemd-run --unit=hold-keys -E PATH=$PATH sh -c 'exec sleep infinity > /tmp/keys'")
+        controller.succeed(
+            "systemd-run --unit=typed-pair --uid=alice -E HOME=/home/alice -E PATH=/run/current-system/sw/bin"
+            + " -E TERM=xterm -p StandardInput=file:/tmp/keys -p StandardOutput=file:/tmp/typed.out"
+            + " script --quiet --return --flush --command 'nix-pixie controller pair --yes' /dev/null"
+        )
+        controller.wait_until_succeeds("grep -q 'Code shown on the target' /tmp/typed.out", timeout=60)
+        controller.succeed(f"printf '{keys}' 1<>/tmp/keys")
+        try:
+            controller.wait_until_succeeds("systemctl show -P SubState typed-pair | grep -qx -e exited -e failed -e dead", timeout=60)
+        finally:
+            out = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", controller.succeed("cat /tmp/typed.out"))
+            print(out)
+        assert controller.succeed("systemctl show -P Result typed-pair").strip() == "success", out
+        assert "`zzz` is not a code word" in out, out
+        report = json.loads(next(l for l in reversed(out.splitlines()) if l.lstrip().startswith("{")))
+        assert report["target"] == target_id, report
+        controller.succeed("systemctl stop hold-keys")
         code = next_code(code)
 
     with subtest("a typo in the nameplate finds nobody, and the error says where it looked"):
