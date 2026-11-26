@@ -434,7 +434,10 @@ pub async fn fetch_facter_report(link: &Link, flake: &str, report_path: &str) ->
 
 /// The paired target, for the operator: its label and how we reach it.
 pub fn describe_peer(conn: &Connection, peer: &Peer) -> String {
-    format!("{} at {}", peer.label, describe_route(conn, peer))
+    match net::route(conn) {
+        Route::Relayed(relay) => format!("{}, relayed through {relay}", peer.label),
+        _ => format!("{} at {}", peer.label, describe_route(conn, peer)),
+    }
 }
 
 /// How we talk to the paired target, for the operator: the address in use,
