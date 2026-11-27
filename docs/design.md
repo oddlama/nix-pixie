@@ -42,6 +42,12 @@ we build on them.
 | Many devices, one configuration: `--id`/`$PIXIE_OUT/id`, `{id}` paths, `disks.rules`, `facter.mode`, side-by-side installs | implemented, not yet VM-tested | unit tests of the disk plan |
 | Hooks: owners and directory modes (`files.json`), `target exec --stdin`, `context.json` to later hooks, `encrypted/` into the repo with age, `seen-host-key` and `bootCheck = "hooks"`, outputs in RAM only | implemented, not yet VM-tested | unit tests of the outputs |
 | Store streams compressed with zstd | implemented, not yet VM-tested | — |
+| Netboot installer (`nixosModules.installer-netboot`): nothing needed on the command line (no `init=`, any `root=` ignored), only chosen kernel modules | implemented; boots in QEMU from kernel and initrd alone | by hand: `console=ttyS0 root=/dev/vda` |
+| USB gadget (`nix-pixie.usbGadget`: NCM with `fe80::2`, ACM for the status), added to a vendor's gadget if there is one | implemented; works on `dummy_hcd` | by hand, in QEMU |
+| A controller's code at the console, as `nix-pixie code`, or from a credential; `--serial` to hand it over | implemented; pairs over `dummy_hcd`'s serial port and network | by hand, in QEMU; unit tests |
+| Status terminals: replay on an empty line, echoes ignored, reopened after a hang-up | implemented | unit tests, by hand |
+| The target's clock set from the controller's | implemented | — |
+| Link-local `--target` and reconnects following an interface's new index | implemented | unit tests |
 
 ## Goal
 
@@ -718,11 +724,13 @@ Push means the target never gets read access to the controller. It receives
 exactly the closures the controller sends: the diskoScript closure into
 tmpfs, and the toplevel plus `pixie.extraClosures` into `/mnt`.
 
-### Optional upstream substitution (per-session toggle)
+### No substitution on the target
 
-The target first runs `nix copy --from https://cache.nixos.org --to /mnt
-<paths>`, checking signatures with the config's `trusted-public-keys`. Then
-the controller pushes the full closure; paths already valid are skipped.
+Dropped: having the target fetch paths from a binary cache it can reach
+first (`nix copy --from <cache>`), the controller pushing the rest. Devices
+on a bench or a factory floor should need neither DNS nor a cache; the
+controller serving its own store over the session, compressed, is what they
+get.
 
 ### Still to verify
 
@@ -1001,6 +1009,21 @@ enter), so either restarts without the other. Kernel messages go to tty12
 nothing scribbles over the screen; tty2 keeps its shell. Messages are what
 the agent prints anyway, kept as a list (`screen.rs`), not a second channel
 of its own.
+
+**Controllers' codes at runtime** (implemented): `code CODE|default`, typed
+on tty1 or a serial status terminal, or `nix-pixie code`, goes over the same
+socket: the agent then waits for that controller instead of showing a code.
+Kept in the state directory for the boot, and forgotten after three rejected
+attempts, so it can't be guessed at for longer than a code of the agent's own.
+For devices without a screen, the controller writes it to the serial port
+(`--serial`), or it comes as the credential `pixie.code`.
+
+**Status terminals on serial ports** (implemented): a USB gadget's port drops
+what nobody read, so an empty line has the console write everything again; a
+hang-up ends it, for systemd to open the port anew. A host that opens the
+port echoes until it turns that off, and both ends echoing would loop: lines
+with escape sequences, and lines the console wrote lately, aren't commands.
+Answers name their command, so a program can tell its own.
 
 **Relays at runtime** (implemented): `relay URL…|off|n0|default`, typed on
 tty1 or as `pixie relay …` (`nix-pixie relay`, through `sudo` for the

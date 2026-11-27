@@ -635,44 +635,53 @@ ssh root@<ip> cat /run/nix-pixie/code
 ### Devices without a screen
 
 Boards that boot over USB or the network rather than from a USB stick, often
-without a screen, keyboard or even a serial console, get an installer that is
-just a kernel and an initrd: `nixosModules.installer-initrd`, built from a
-NixOS configuration with the device's platform and kernel.
+without a screen or keyboard, get the installer as netboot media: a kernel and
+an initrd with the whole system inside, built from a NixOS configuration with
+the device's platform and kernel.
 
 ```nix
 installer = nixpkgs.lib.nixosSystem {
   modules = [
-    nix-pixie.nixosModules.installer-initrd
+    nix-pixie.nixosModules.installer-netboot
     {
       nixpkgs.hostPlatform = "aarch64-linux";
       boot.kernelPackages = pkgs.linuxPackagesFor myBoardKernel;
-      boot.initrd.availableKernelModules = [ "nvme" /* the board's drivers */ ];
+      boot.extraModulePackages = [ /* out-of-tree drivers, e.g. the NIC's */ ];
+      # Only these modules and what they need, for boot images with a limit
+      nix-pixie.netboot.kernelModules = [ "nvme" "r8168" /* the board's */ ];
       # A USB gadget: a network interface (fe80::2) and a serial port
-      boot.initrd.nix-pixie-agent.usbGadget.enable = true;
+      nix-pixie.usbGadget.enable = true;
     }
   ];
 };
-# installer.config.system.build.nixPixieInstaller: kernel, initrd, cmdline
+# installer.config.system.build.nixPixieNetboot: kernel, initrd, cmdline
 ```
 
-The agent runs in the initrd itself (systemd stage 1, no root to switch to),
-with Nix and `nixos-install` in a second archive of the initrd. With the USB
-gadget, the host sees a network interface and a serial port; the board's end
-of the link has the fixed address `fe80::2`, and the serial port gets the
-agent's status line by line (`statusTty.json = true` for JSON lines). It also
-takes commands such as `relay URL` there.
+It needs nothing on the kernel command line, which some boot chains keep
+short: it finds its system without `init=`, and its root is a RAM disk
+whatever `root=` says. With the USB gadget, the host sees a network interface
+and a serial port. The device's end of the link has the fixed address
+`fe80::2`; the serial port shows the agent's status line by line
+(`services.nix-pixie-agent.statusTty.json = true` for JSON lines), writes it
+all again for an empty line, and takes commands such as `relay URL` and
+`code CODE`.
 
-Whatever boots the device hands it a code, so nobody types one:
+The controller hands the device a code over that serial port, so nobody types
+one:
 
 ```console
-$ code=$(nix-pixie controller new-code)
-$ # boot the device with this on its kernel command line:
-$ #   systemd.set_credential=pixie.code:$code
-$ echo "$code" > code
-$ nix-pixie controller install --controller-code-file code \
+$ nix-pixie controller install --serial /dev/serial/by-id/usb-nix-pixie_... \
     --target 'fe80::2%usb0' --machine board --yes --wipe \
     --events /dev/fd/3 3>events.jsonl
 ```
+
+`usb0` stands for the host's interface to the device. The controller waits for
+the port and the interface to show up, and follows the interface when the host
+enumerates the device anew. The code can also come from whatever boots the
+device, as `systemd.set_credential=pixie.code:CODE` on its kernel command line
+(and `--controller-code-file` here, with a code from `nix-pixie controller
+new-code`), or be typed at the serial port. Once it approved the device, the
+controller sets its clock, which on boards often starts months off.
 
 Both sides prove the code to each other like a target's, without relays or any
 discovery. For programs that drive the controller:
