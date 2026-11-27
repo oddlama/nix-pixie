@@ -19,7 +19,7 @@ use nix_pixie_proto::frame::read_frame;
 use nix_pixie_proto::inventory::{Disk, Inventory};
 use nix_pixie_proto::pair::{PairError, Side};
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::MAX_FAILURES;
 use crate::discovery::{self, Discovery, Method, Peer};
@@ -36,6 +36,8 @@ use crate::ui::{self, Tone};
 const SETTLE: Duration = Duration::from_millis(600);
 /// For the target's hello and inventory (lsblk and sysfs reads).
 const INTRODUCTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long setting the target's clock may take (and `hwclock` with it).
+const CLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn print_id(identity_path: &Path) -> Result<()> {
     println!("{}", identity::load_or_create(identity_path)?.public());
@@ -508,12 +510,38 @@ pub async fn approve(
     })
     .await?;
     info!(target = %link.target(), ?machine, "approved");
+    set_clock(link).await?;
     Ok(Approved {
         label,
         inventory,
         suggestions,
         machine,
     })
+}
+
+/// Sets the target's clock from ours, if it is off: before anything there
+/// goes by the date (TLS, certificates, signed UEFI variables).
+async fn set_clock(link: &Link) -> Result<()> {
+    let request = ControllerMsg::SetClock {
+        unix_ms: crate::clock::now_ms(),
+    };
+    match link
+        .request(&request, CLOCK_TIMEOUT, "the target's clock")
+        .await?
+    {
+        TargetMsg::Clock { off_ms, set: true } => {
+            let off = crate::clock::describe(off_ms);
+            info!(target = %link.target(), %off, "set the target's clock, which was off");
+        }
+        TargetMsg::Clock { off_ms, set: false } => {
+            debug!(target = %link.target(), off_ms, "the target's clock is right");
+        }
+        TargetMsg::ClockFailed { error } => {
+            warn!(target = %link.target(), "the target's clock may be off: {error}");
+        }
+        _ => bail!("unexpected reply to setting the clock"),
+    }
+    Ok(())
 }
 
 /// Tells the target it was rejected; it goes back to pairing.

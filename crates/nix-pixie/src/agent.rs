@@ -1009,6 +1009,7 @@ async fn answer(
         ControllerMsg::RequestAddresses => TargetMsg::Addresses {
             addrs: net::own_addresses(),
         },
+        ControllerMsg::SetClock { unix_ms } => crate::clock::set(unix_ms).await,
         ControllerMsg::PrepareStore { root } => prepare_store(&root),
         ControllerMsg::PrepareDisks { disks, labels } => {
             session.prepared = None;
@@ -1121,6 +1122,7 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::Finish { .. } => Some(TargetMsg::FinishFailed { error: reason }),
         ControllerMsg::PlaceFiles { .. } => Some(TargetMsg::FilesRefused { reason }),
         ControllerMsg::Exec { .. } => Some(TargetMsg::ExecFailed { error: reason }),
+        ControllerMsg::SetClock { .. } => Some(TargetMsg::ClockFailed { error: reason }),
         // None, rather than a message just for refusing this.
         ControllerMsg::RequestAddresses => Some(TargetMsg::Addresses { addrs: Vec::new() }),
     }

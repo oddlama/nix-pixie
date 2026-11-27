@@ -142,6 +142,11 @@ pub enum TargetMsg {
     /// has answered. If that is one more than the controller has replies
     /// for, the last reply follows.
     Resumed { answered: u64 },
+    /// How far the target's clock was off the controller's time
+    /// (milliseconds, ahead if positive), and whether it was set to it.
+    Clock { off_ms: i64, set: bool },
+    /// Why the clock could not be set.
+    ClockFailed { error: String },
 }
 
 /// Messages the controller sends to the target.
@@ -222,6 +227,11 @@ pub enum ControllerMsg {
     /// First frame after the controller came back (ALPN
     /// [`crate::ALPN_RESUME`]): how many replies it has got.
     Resume { answered: u64 },
+    /// The controller's time (milliseconds since 1970, UTC). A target whose
+    /// clock is off sets it to that, for whatever checks certificates or
+    /// dates from now on: installers often boot without a clock, or with
+    /// one months off. Answered with `Clock`. Only after `Approve`.
+    SetClock { unix_ms: u64 },
 }
 
 /// Secret bytes: wiped from memory when dropped, never shown by `Debug`.

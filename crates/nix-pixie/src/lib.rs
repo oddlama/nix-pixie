@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod child;
 pub mod cli;
+pub mod clock;
 pub mod console;
 pub mod control;
 pub mod controller;
