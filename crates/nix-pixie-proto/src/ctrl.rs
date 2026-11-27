@@ -147,6 +147,12 @@ pub enum TargetMsg {
     Clock { off_ms: i64, set: bool },
     /// Why the clock could not be set.
     ClockFailed { error: String },
+    /// The firmware boots the installed system next: the boot entry
+    /// (`Boot####`, by its hex number), which comes first in the boot order
+    /// now, and whether it was made for this, rather than there already.
+    BootEntry { number: String, created: bool },
+    /// Why the boot entry could not be made, or put first.
+    BootEntryFailed { error: String },
 }
 
 /// Messages the controller sends to the target.
@@ -227,6 +233,14 @@ pub enum ControllerMsg {
     /// First frame after the controller came back (ALPN
     /// [`crate::ALPN_RESUME`]): how many replies it has got.
     Resume { answered: u64 },
+    /// Make the firmware boot the installed systemd-boot, whose EFI system
+    /// partition is mounted at `esp`: a boot entry for it ("Linux Boot
+    /// Manager", as `bootctl install` makes), first in the boot order. For
+    /// boot loaders that make none themselves (lanzaboote), when the
+    /// configuration allows writing EFI variables; otherwise the firmware
+    /// may boot the installer again. Answered with `BootEntry`. Only after
+    /// `Install`.
+    AddBootEntry { esp: String },
     /// The controller's time (milliseconds since 1970, UTC). A target whose
     /// clock is off sets it to that, for whatever checks certificates or
     /// dates from now on: installers often boot without a clock, or with

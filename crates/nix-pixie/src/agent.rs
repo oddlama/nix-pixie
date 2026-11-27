@@ -3,7 +3,7 @@
 //! leaves.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1010,6 +1010,7 @@ async fn answer(
             addrs: net::own_addresses(),
         },
         ControllerMsg::SetClock { unix_ms } => crate::clock::set(unix_ms).await,
+        ControllerMsg::AddBootEntry { esp } => add_boot_entry(&esp).await,
         ControllerMsg::PrepareStore { root } => prepare_store(&root),
         ControllerMsg::PrepareDisks { disks, labels } => {
             session.prepared = None;
@@ -1062,6 +1063,32 @@ async fn answer(
             error: "unexpected".into(),
         },
     })
+}
+
+/// A boot entry for the installed system's systemd-boot, first in the
+/// firmware's boot order (see [`crate::bootentry`]).
+async fn add_boot_entry(esp: &str) -> TargetMsg {
+    let esp = Path::new(esp);
+    if !esp.is_absolute() {
+        return TargetMsg::BootEntryFailed {
+            error: format!("{} is not an absolute path", esp.display()),
+        };
+    }
+    match crate::bootentry::add(esp).await {
+        Ok((number, created)) => {
+            screen::say(format!(
+                "The firmware boots the installed system next (Boot{number}, \"{}\").",
+                crate::bootentry::LABEL
+            ));
+            TargetMsg::BootEntry { number, created }
+        }
+        Err(e) => {
+            warn!("boot entry: {e:#}");
+            TargetMsg::BootEntryFailed {
+                error: format!("{e:#}"),
+            }
+        }
+    }
 }
 
 /// Checks the disks the controller chose, and keeps them for `RunDisko`.
@@ -1123,6 +1150,7 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::PlaceFiles { .. } => Some(TargetMsg::FilesRefused { reason }),
         ControllerMsg::Exec { .. } => Some(TargetMsg::ExecFailed { error: reason }),
         ControllerMsg::SetClock { .. } => Some(TargetMsg::ClockFailed { error: reason }),
+        ControllerMsg::AddBootEntry { .. } => Some(TargetMsg::BootEntryFailed { error: reason }),
         // None, rather than a message just for refusing this.
         ControllerMsg::RequestAddresses => Some(TargetMsg::Addresses { addrs: Vec::new() }),
     }

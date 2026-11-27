@@ -78,6 +78,7 @@ const FACTS: &str = r#"config: {
       grubEfi = loader.grub.efiSupport;
       grubBios = builtins.any (d: d != "nodev") grubDevices;
       efiVariables = loader.efi.canTouchEfiVariables;
+      espMountPoint = loader.efi.efiSysMountPoint;
     };
   ssh = {
     inherit (config.services.openssh) enable ports;
@@ -138,8 +139,11 @@ pub struct Boot {
     /// GRUB installs to at least one disk's boot sector (BIOS).
     pub grub_bios: bool,
     /// `boot.loader.efi.canTouchEfiVariables`: writes boot entries into the
-    /// firmware's variables.
+    /// firmware's variables. lanzaboote doesn't, whatever this says.
     pub efi_variables: bool,
+    /// `boot.loader.efi.efiSysMountPoint`: where the EFI system partition is
+    /// mounted, below the root.
+    pub esp_mount_point: String,
 }
 
 /// The configuration's SSH server.

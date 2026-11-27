@@ -76,9 +76,10 @@ let
   bootEntry = body (
     if secureBoot then
       [
-        "# lanzaboote writes no boot entry: the firmware boots the disk's"
-        "# default path, EFI/BOOT/BOOTX64.EFI (see the README)."
-        "assert \"No boot loaders listed in EFI Variables\" in status, status"
+        "# lanzaboote writes no boot entry; nix-pixie made one, as the"
+        "# configuration lets it (canTouchEfiVariables), for its systemd-boot."
+        "assert \"Linux Boot Manager\" in status, status"
+        "assert \"/EFI/systemd/systemd-bootx64.efi\" in status, status"
       ]
     else
       [
@@ -101,6 +102,7 @@ let
   toldAboutKeys = lib.optionalString secureBoot (body [
     "# Told while it waited."
     "assert \"prepares its Secure Boot keys and reboots by itself\" in output, output"
+    "assert report[\"bootEntry\"][\"created\"], report"
   ]);
 
   install = lib.concatStringsSep " " [
@@ -136,6 +138,10 @@ pkgs.testers.runNixOSTest {
         };
         qemu.options = [
           "-drive file=${iso},if=none,id=installer,media=cdrom,readonly=on,format=raw"
+          # Second: OVMF puts QEMU's order (bootindex) before any other on
+          # every boot, so a USB stick left in, first in the firmware's own
+          # boot order, can't be had here. That nix-pixie's boot entry comes
+          # first, the agent checks itself.
           "-device ide-cd,drive=installer,bus=ide.0,bootindex=2"
         ];
       };

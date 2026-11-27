@@ -575,6 +575,8 @@ boot.lanzaboote = {
     autoReboot = true;
   };
 };
+# For the boot entry nix-pixie makes, since lanzaboote makes none.
+boot.loader.efi.canTouchEfiVariables = true;
 ```
 
 Keys can only be enrolled while the firmware is in Setup Mode, that is without
@@ -585,15 +587,20 @@ The controller checks this before it erases anything. On its first boot the
 machine creates its keys and reboots, systemd-boot enrolls them, and from then
 on it boots with Secure Boot on. Microsoft's keys are enrolled as well,
 because the firmware of some graphics and network cards is signed with them
-(`autoEnrollKeys.includeMicrosoftKeys`). lanzaboote adds no boot entry to the
-firmware: the machine starts whatever its disk boots by default, so that disk
-has to come first in the boot order.
+(`autoEnrollKeys.includeMicrosoftKeys`).
 
-The controller checks the installed system after the reboot that enrolls the
-keys, with Secure Boot on: `nixosModules.default` has the SSH server wait for
-the keys, so the boot that prepares them never answers. Without the module, the
-controller refuses a configuration with `autoReboot` before it erases anything,
-unless it checks the first boot some other way (`bootCheck`).
+lanzaboote adds no boot entry to the firmware, so nix-pixie does: "Linux Boot
+Manager", first in the boot order, as systemd-boot itself would. Then the
+machine boots its disk even with the installer still plugged in, also after
+the reboot that enrolls the keys. That needs
+`boot.loader.efi.canTouchEfiVariables = true`; without it nix-pixie leaves the
+firmware alone, and you take the installer out before the machine reboots.
+
+The controller checks the installed system after that reboot, with Secure Boot
+on: `nixosModules.default` has the SSH server wait for the keys, so the boot
+that prepares them never answers. Without the module, the controller refuses a
+configuration with `autoReboot` before it erases anything, unless it checks the
+first boot some other way (`bootCheck`).
 
 To bring your own keys instead, for example the same ones for a whole fleet,
 leave out `autoGenerateKeys` and have a hook write them to

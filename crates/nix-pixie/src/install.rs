@@ -19,6 +19,7 @@ use nix_pixie_proto::inventory::Disk;
 use tracing::{debug, info, trace, warn};
 use zeroize::Zeroizing;
 
+use crate::bootentry;
 use crate::controller::{self, Approved, describe_disk, show_disk};
 use crate::discovery::{Method, Peer};
 use crate::exit;
@@ -42,6 +43,8 @@ const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
 const FINISH_TIMEOUT: Duration = Duration::from_secs(120);
 /// For the target to list its addresses.
 const ADDRESSES_TIMEOUT: Duration = Duration::from_secs(10);
+/// For the target to make its boot entry (efibootmgr, a few times).
+const BOOT_ENTRY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How much of disko's and nixos-install's output to keep for showing a
 /// failure.
 const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
@@ -742,6 +745,8 @@ struct Plan {
     key_files: Vec<KeyFile>,
     hooks: hooks::Runner,
     boot_check: BootCheck,
+    /// Whether the target boots with UEFI.
+    uefi: bool,
 }
 
 /// Approval, the facter report and host key, the disk plan, the build.
@@ -842,6 +847,7 @@ async fn prepare(
         key_files,
         hooks,
         boot_check: args.boot_check.unwrap_or(machine.boot_check),
+        uefi: machine.firmware.apply(&inventory.firmware).uefi,
     })
 }
 
@@ -1064,6 +1070,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
         key_files,
         mut hooks,
         boot_check,
+        uefi,
     } = plan;
     confirm_erase(&disks, &choices, args.yes, args.wipe).await?;
     format_disks(link, &choices, &disko, &built.disko_script, key_files).await?;
@@ -1097,6 +1104,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
     if let Some(id) = &hooks.context.id {
         report.insert("id".into(), id.clone().into());
     }
+    let boot_entry = bootentry::Plan::of(&boot, uefi, &root);
     let leaving = Leaving {
         name,
         root,
@@ -1106,6 +1114,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
         boot_check,
         encrypted: !(disko.encryption.luks.is_empty() && disko.encryption.zfs.is_empty()),
         enrolls_keys: boot.enroll_keys.then_some(boot.enroll_reboots),
+        boot_entry,
     };
     let after = leave(link, peer, args, &mut hooks, &mut report, leaving).await?;
     Ok(Installed {
@@ -1126,6 +1135,8 @@ struct Leaving {
     boot_check: BootCheck,
     encrypted: bool,
     enrolls_keys: Option<bool>,
+    /// What the firmware needs to boot the installed system next.
+    boot_entry: bootentry::Plan,
 }
 
 /// Leaves the target ready to boot (or mounted, with `--then stay`), and
@@ -1147,7 +1158,9 @@ async fn leave(
         boot_check,
         encrypted,
         enrolls_keys,
+        boot_entry,
     } = leaving;
+    add_boot_entry(link, &boot_entry, &name, args.then, report).await?;
     let shutdown = match args.then {
         Then::Stay => {
             ui::show(vec![format!(
@@ -1196,6 +1209,64 @@ async fn leave(
             After::Nothing
         }
     })
+}
+
+/// Has the target's firmware boot the installed system next, if its boot
+/// loader doesn't see to that, or says what to mind. Failing that isn't
+/// failing the install: the system is there, and a reboot into the
+/// installer only needs it taken out.
+async fn add_boot_entry(
+    link: &Link,
+    plan: &bootentry::Plan,
+    machine: &str,
+    then: Then,
+    report: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let poweroff = if then == Then::Reboot {
+        ", or install with --then poweroff"
+    } else {
+        ""
+    };
+    let entry = match plan {
+        bootentry::Plan::Nothing => return Ok(()),
+        bootentry::Plan::NotAllowed => {
+            ui::show(vec![format!(
+                "lanzaboote makes no boot entry, and nixosConfigurations.{machine} doesn't let \
+                 nix-pixie make one (boot.loader.efi.canTouchEfiVariables = false): the firmware \
+                 boots whatever comes first in its boot order. If that is the installer, take \
+                 it out before the machine reboots{poweroff}."
+            )]);
+            serde_json::json!({ "skipped": "canTouchEfiVariables = false" })
+        }
+        bootentry::Plan::Add { esp } => {
+            let request = ControllerMsg::AddBootEntry { esp: esp.clone() };
+            match link
+                .request(&request, BOOT_ENTRY_TIMEOUT, "the boot entry")
+                .await?
+            {
+                TargetMsg::BootEntry { number, created } => {
+                    info!(
+                        entry = %format!("Boot{number}"),
+                        created,
+                        "the firmware boots the installed system next"
+                    );
+                    serde_json::json!({ "number": number, "created": created })
+                }
+                TargetMsg::BootEntryFailed { error } => {
+                    warn!("no boot entry for the installed system: {error}");
+                    ui::show(vec![format!(
+                        "No boot entry for the installed system ({error}). lanzaboote makes \
+                         none, so the firmware boots whatever comes first in its boot order: if \
+                         that is the installer, take it out before the machine reboots{poweroff}."
+                    )]);
+                    serde_json::json!({ "failed": error })
+                }
+                _ => bail!("unexpected reply to the boot entry"),
+            }
+        }
+    };
+    report.insert("bootEntry".into(), entry);
+    Ok(())
 }
 
 /// Formats the confirmed disks: sends the disko script, has the target

@@ -144,6 +144,8 @@ in
         pkgs.openssh
         pkgs.nixos-install
         pkgs.nixos-enter
+        # Boot entries for boot loaders that make none (lanzaboote).
+        pkgs.efibootmgr
       ]
       ++ lib.optional (config.boot.supportedFilesystems.zfs or false) config.boot.zfs.package;
       serviceConfig = {

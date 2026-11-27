@@ -20,6 +20,7 @@
   nixos-install,
   nixos-enter,
   nixos-facter,
+  efibootmgr,
 }:
 writeShellApplication {
   name = "nix-pixie-agent";
@@ -36,6 +37,7 @@ writeShellApplication {
         nixos-install
         nixos-enter
         nixos-facter
+        efibootmgr
       ]
     }"
 
