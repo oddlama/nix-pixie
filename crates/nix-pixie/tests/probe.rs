@@ -69,8 +69,7 @@ async fn responder_answers_probes_while_announcing() {
     let responder = tokio::spawn(Responder::bind().await.unwrap().run(rx));
     let prober = Prober::new().await.unwrap();
 
-    let to = SocketAddr::from((Ipv4Addr::LOCALHOST, PROBE_PORT));
-    let reply = async {
+    let reply = async |to| {
         loop {
             prober.probe(to).await;
             if let Ok(r) = tokio::time::timeout(Duration::from_millis(100), prober.recv()).await {
@@ -78,11 +77,24 @@ async fn responder_answers_probes_while_announcing() {
             }
         }
     };
-    let (got, from) = tokio::time::timeout(Duration::from_secs(5), reply)
+    let to = SocketAddr::from((Ipv4Addr::LOCALHOST, PROBE_PORT));
+    let (got, from) = tokio::time::timeout(Duration::from_secs(5), reply(to))
         .await
         .unwrap();
     assert_eq!(got, announcement);
     assert_eq!(from, SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)));
+
+    // From the address probed, though the kernel would pick 127.0.0.1 to
+    // reply to 127.0.0.1: a reply from elsewhere is nothing the prober sent
+    // to, and a stateful firewall in front of it drops that.
+    let other = Ipv4Addr::new(127, 0, 0, 2);
+    let (_, from) = tokio::time::timeout(
+        Duration::from_secs(5),
+        reply(SocketAddr::from((other, PROBE_PORT))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(from, SocketAddr::from((other, 4242)));
 
     // Paired targets stop answering.
     tx.send_replace(None);

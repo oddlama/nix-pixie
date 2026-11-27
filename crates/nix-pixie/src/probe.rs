@@ -58,10 +58,26 @@ const MAX_REPLIES_PER_SECOND: u32 = 50;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 /// How many probers' flush times a target remembers.
 const MAX_FLUSH_ENTRIES: usize = 256;
+/// Room for a receive, which may hold several coalesced datagrams.
+const RECV_BUF: usize = 64 * 1024;
 
-/// The target's side: answers probes with the current announcement.
+/// A datagram the responder received.
+struct Received {
+    from: SocketAddr,
+    /// The address it was sent to, where the platform says.
+    to: Option<IpAddr>,
+    data: Vec<u8>,
+}
+
+/// The target's side: answers probes with the current announcement, from
+/// the address each probe was sent to. A machine has several on a link (a
+/// fixed one and one of its own making, say), and a reply from another than
+/// the prober asked would be nothing it sent to: a stateful firewall in
+/// front of it drops that.
 pub struct Responder {
     socket: UdpSocket,
+    /// Says where each probe went, and replies from there.
+    state: noq_udp::UdpSocketState,
 }
 
 impl Responder {
@@ -74,20 +90,86 @@ impl Responder {
                 .await
                 .with_context(|| format!("binding probe port {PROBE_PORT}"))?,
         };
-        Ok(Self { socket })
+        let state = noq_udp::UdpSocketState::new((&socket).into())
+            .context("asking for the addresses probes are sent to")?;
+        Ok(Self { socket, state })
+    }
+
+    /// The next datagram: where it came from, where it went (if the
+    /// platform says), and its bytes. Coalesced ones come one by one.
+    async fn recv(&self, buf: &mut [u8], pending: &mut Vec<Received>) -> Received {
+        loop {
+            if let Some(received) = pending.pop() {
+                return received;
+            }
+            let mut meta = [noq_udp::RecvMeta::default()];
+            let received = self
+                .socket
+                .async_io(tokio::io::Interest::READABLE, || {
+                    let mut bufs = [std::io::IoSliceMut::new(&mut *buf)];
+                    self.state.recv((&self.socket).into(), &mut bufs, &mut meta)
+                })
+                .await;
+            let [meta] = meta;
+            if received.is_err() || meta.len == 0 {
+                continue;
+            }
+            let data = buf.get(..meta.len.min(buf.len())).unwrap_or_default();
+            for chunk in data.chunks(meta.stride.max(1)).rev() {
+                pending.push(Received {
+                    from: meta.addr,
+                    to: meta.dst_ip,
+                    data: chunk.to_vec(),
+                });
+            }
+        }
+    }
+
+    /// Sends `reply` to `to`, from `from` if that is an address of ours to
+    /// send from; from whatever the kernel picks if not, or if that fails.
+    async fn send(
+        &self,
+        reply: &[u8],
+        to: SocketAddr,
+        from: Option<IpAddr>,
+    ) -> std::io::Result<()> {
+        let from = from.filter(|ip| {
+            !(ip.is_multicast()
+                || ip.is_unspecified()
+                || matches!(ip.to_canonical(), IpAddr::V4(v4) if v4.is_broadcast()))
+        });
+        let transmit = |src_ip| noq_udp::Transmit {
+            destination: to,
+            ecn: None,
+            contents: reply,
+            segment_size: None,
+            src_ip,
+        };
+        let sent = self
+            .socket
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                self.state.try_send((&self.socket).into(), &transmit(from))
+            })
+            .await;
+        match sent {
+            Err(e) if from.is_some() => {
+                debug!(%to, ?from, "probe reply from the address probed: {e}; from any");
+                self.socket.send_to(reply, to).await.map(|_| ())
+            }
+            other => other,
+        }
     }
 
     /// Answers until dropped. Sends nothing while `announcement` is `None`
     /// (e.g. while paired).
     pub async fn run(self, announcement: watch::Receiver<Option<Announcement>>) {
-        let mut buf = vec![0; PROBE_LEN + 1];
+        let mut buf = vec![0; RECV_BUF];
+        let mut pending = Vec::new();
         let mut window = (Instant::now(), 0u32);
         let mut flushed: HashMap<IpAddr, Instant> = HashMap::new();
         loop {
-            let Ok((len, from)) = self.socket.recv_from(&mut buf).await else {
-                continue;
-            };
-            let Some(nonce) = buf.get(..len).and_then(decode_probe) else {
+            let Received { from, to, data } = self.recv(&mut buf, &mut pending).await;
+            let Some(nonce) = decode_probe(&data) else {
                 continue;
             };
             debug!(%from, "probe received");
@@ -127,8 +209,8 @@ impl Responder {
                     forget_neighbour(prober).await;
                 }
             }
-            match self.socket.send_to(&reply, from).await {
-                Ok(_) => debug!(%from, "probe answered"),
+            match self.send(&reply, from, to).await {
+                Ok(()) => debug!(%from, ?to, "probe answered"),
                 Err(e) => debug!(%from, "probe reply: {e}"),
             }
         }

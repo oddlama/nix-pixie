@@ -2464,6 +2464,7 @@ dependencies = [
  "mdns-sd",
  "n0-error",
  "nix-pixie-proto",
+ "noq-udp",
  "rand 0.10.4",
  "rpassword",
  "rustix",

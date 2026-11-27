@@ -12,6 +12,9 @@ async-compression = { version = "0.4.54", features = ["tokio", "zstd"] }
 clap.workspace = true
 if-addrs = "0.15"
 iroh = { version = "1.4.1", default-features = false, features = ["tls-ring"] }
+# The probe responder's source addresses (IPV6_PKTINFO), as iroh's own
+# sockets do it.
+noq-udp = { version = "1.4.0", default-features = false }
 mdns-sd = "0.21.7"
 n0-error = "1.0.3"
 nix-pixie-proto = { version = "0.1.0", path = "../nix-pixie-proto" }
