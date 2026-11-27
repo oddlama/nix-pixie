@@ -221,6 +221,11 @@
                   package = config.packages.default;
                   agentModule = ./nix/nixos/agent.nix;
                 };
+                vm-netboot = import ./nix/tests/netboot.nix {
+                  inherit pkgs;
+                  inherit (inputs) nixpkgs;
+                  package = config.packages.default;
+                };
                 vm-link-local = import ./nix/tests/link-local.nix {
                   inherit pkgs;
                   inherit (inputs) nixpkgs disko;

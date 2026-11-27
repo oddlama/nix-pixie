@@ -42,12 +42,12 @@ we build on them.
 | Many devices, one configuration: `--id`/`$PIXIE_OUT/id`, `{id}` paths, `disks.rules`, `facter.mode`, side-by-side installs | implemented, not yet VM-tested | unit tests of the disk plan |
 | Hooks: owners and directory modes (`files.json`), `target exec --stdin`, `context.json` to later hooks, `encrypted/` into the repo with age, `seen-host-key` and `bootCheck = "hooks"`, outputs in RAM only | implemented, not yet VM-tested | unit tests of the outputs |
 | Store streams compressed with zstd | done | `checks.vm-install-*` (compressed by default), `checks.vm-push` (incompressible, under the memory cap); `checks.vm-link-local` sends uncompressed |
-| Netboot installer (`nixosModules.installer-netboot`): nothing needed on the command line (no `init=`, any `root=` ignored), only chosen kernel modules | implemented; boots in QEMU from kernel and initrd alone | by hand: `console=ttyS0 root=/dev/vda` |
-| USB gadget (`nix-pixie.usbGadget`: NCM with `fe80::2`, ACM for the status), added to a vendor's gadget if there is one | implemented; works on `dummy_hcd` | by hand, in QEMU |
-| A controller's code at the console, as `nix-pixie code`, or from a credential; `--serial` to hand it over | implemented; pairs over `dummy_hcd`'s serial port and network | by hand, in QEMU; unit tests |
-| Status terminals: replay on an empty line, echoes ignored, reopened after a hang-up | implemented | unit tests, by hand |
+| Netboot installer (`nixosModules.installer-netboot`): nothing needed on the command line (no `init=`, any `root=` ignored), only chosen kernel modules | done in QEMU; not yet on a board | `checks.vm-netboot` (kernel and initrd alone, `console=ttyS0 root=/dev/vda` with that disk there) |
+| USB gadget (`nix-pixie.usbGadget`: NCM with `fe80::2`, ACM for the status), added to a vendor's gadget if there is one | done on `dummy_hcd`; not yet on a board, nor into a vendor's gadget | `checks.vm-netboot` (the host's side in the same machine) |
+| A controller's code at the console, as `nix-pixie code`, or from a credential; `--serial` to hand it over | done; the credential only by unit tests | `checks.vm-netboot` (a controller started before the device is plugged in), unit tests |
+| Status terminals: replay on an empty line, echoes ignored, reopened after a hang-up | done | `checks.vm-netboot`, unit tests |
 | The target's clock set from the controller's | implemented | — |
-| Link-local `--target` and reconnects following an interface's new index | implemented | unit tests |
+| Link-local `--target` and reconnects following an interface's new index | the first done, reconnects implemented | `checks.vm-netboot` (an interface that shows up late, under a new index), unit tests |
 
 ## Goal
 
@@ -1215,7 +1215,7 @@ Running them: `checks [PATTERN]` in the devshell builds the matching checks
 `nix flake check` evaluates all of them in one process, which needs more
 memory than a busy machine has; `checks` evaluates each on its own first.
 A layout test takes 2 to 4 minutes and about 3 GiB while it runs; all
-twenty-six checks take about 30 minutes with `JOBS=2`. The install tests fail
+twenty-seven checks take about 30 minutes with `JOBS=2`. The install tests fail
 as soon as the install fails instead of waiting out their timeouts.
 
 On a machine that is busy with other things, use `JOBS=1`. NixOS test VMs run
