@@ -52,6 +52,9 @@ struct Shared {
     state: Mutex<State>,
     /// The connection in use, without waiting for a request to finish.
     current: watch::Sender<Connection>,
+    /// A connection to the target's bulk endpoint, for store copies (see
+    /// [`crate::bulk`]).
+    bulk: std::sync::Mutex<Option<Connection>>,
 }
 
 /// The session as the controller knows it. Locked for a whole request,
@@ -95,6 +98,7 @@ impl Link {
                 Path::new(discovery::SYS_NET),
             ),
             current: watch::Sender::new(conn.clone()),
+            bulk: std::sync::Mutex::new(None),
             state: Mutex::new(State {
                 conn,
                 stream,
@@ -115,6 +119,48 @@ impl Link {
     /// The connection in use now: for store streams, and to see the route.
     pub fn connection(&self) -> Connection {
         self.shared.current.borrow().clone()
+    }
+
+    /// The controller's endpoint, for connections of its own to the target.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.shared.endpoint
+    }
+
+    /// Copies go over `conn`, to the target's bulk endpoint, from now on.
+    pub fn set_bulk(&self, conn: Connection) {
+        if let Ok(mut bulk) = self.shared.bulk.lock()
+            && let Some(old) = bulk.replace(conn)
+        {
+            old.close(VarInt::from_u32(0), b"replaced");
+        }
+    }
+
+    /// Runs `op` with the bulk connection if there is one, and with the
+    /// session's ([`Self::on_connection`]) if not, or once it broke.
+    pub async fn on_bulk_connection<T>(
+        &self,
+        mut op: impl AsyncFnMut(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let bulk = self
+            .shared
+            .bulk
+            .lock()
+            .ok()
+            .and_then(|bulk| bulk.clone())
+            .filter(|conn| conn.close_reason().is_none());
+        if let Some(conn) = bulk {
+            match op(&conn).await {
+                Ok(done) => return Ok(done),
+                Err(e) if conn.close_reason().is_some() => {
+                    warn!("the bulk path to the target broke ({e:#}); copying over the session's");
+                    if let Ok(mut bulk) = self.shared.bulk.lock() {
+                        *bulk = None;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.on_connection(op).await
     }
 
     /// Reads the target's hello and inventory, the first two messages after
@@ -234,6 +280,9 @@ impl Link {
     /// Ends the session: the target shuts down if it was asked to.
     pub async fn close(self) {
         self.keeper.abort();
+        if let Some(bulk) = self.shared.bulk.lock().ok().and_then(|mut b| b.take()) {
+            bulk.close(VarInt::from_u32(0), b"done");
+        }
         let mut state = self.shared.state.lock().await;
         // Closing right away would drop what is still in flight.
         net::finish(&mut state.stream).await;

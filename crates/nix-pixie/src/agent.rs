@@ -3,6 +3,7 @@
 //! leaves.
 
 use std::fmt::Write as _;
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -638,7 +639,10 @@ async fn session(
     state.write("paired-controller", &controller.to_string())?;
     screen::say(format!("Paired with controller {controller}."));
 
-    let mut session = Session::default();
+    let mut session = Session {
+        controller: Some(controller),
+        ..Session::default()
+    };
     let (comebacks, mut returns) = tokio::sync::mpsc::channel(4);
     let acceptor = tokio::spawn(accept_resumes(endpoint.clone(), controller, comebacks));
     let (mut conn, mut stream) = (conn.clone(), stream);
@@ -708,6 +712,9 @@ async fn session(
             warn!(%controller, "controller did not disconnect");
         }
     }
+    if let Some(bulk) = session.bulk.take() {
+        bulk.close().await;
+    }
     state.remove("paired-controller");
     state.remove("approved");
     result?;
@@ -727,6 +734,10 @@ struct Session {
     shutdown: Option<Shutdown>,
     /// The key files disko read, until `Finish` or the session's end.
     keys: disko::KeyFiles,
+    /// The controller it serves, once paired.
+    controller: Option<EndpointId>,
+    /// The bulk endpoint (`OpenBulk`), until `Finish` or the session's end.
+    bulk: Option<Bulk>,
     /// Requests answered so far, and the last reply: a controller that
     /// comes back gets it again if it never saw it.
     answered: u64,
@@ -1023,7 +1034,29 @@ async fn answer(
         ControllerMsg::RequestFacterReport => facter_report(state).await,
         ControllerMsg::RequestAddresses => TargetMsg::Addresses {
             addrs: net::own_addresses(),
+            nics: inventory::nics_now(),
         },
+        ControllerMsg::OpenBulk { addr } => {
+            if let Some(old) = session.bulk.take() {
+                old.close().await;
+            }
+            match open_bulk(addr, session).await {
+                Ok(bulk) => {
+                    let reply = TargetMsg::Bulk {
+                        id: *bulk.endpoint.id().as_bytes(),
+                        port: nix_pixie_proto::BULK_PORT,
+                    };
+                    session.bulk = Some(bulk);
+                    reply
+                }
+                Err(e) => {
+                    warn!(%addr, "bulk endpoint: {e:#}");
+                    TargetMsg::BulkFailed {
+                        error: format!("{e:#}"),
+                    }
+                }
+            }
+        }
         ControllerMsg::SetClock { unix_ms } => crate::clock::set(unix_ms).await,
         ControllerMsg::AddBootEntry { esp } => add_boot_entry(&esp).await,
         ControllerMsg::PrepareStore { root } => prepare_store(&root),
@@ -1065,8 +1098,12 @@ async fn answer(
             input,
         } => exec(stream, &program, &args, root.as_deref(), input).await?,
         ControllerMsg::Finish { root, zpools, then } => {
-            // The install is done: so is what the keys were kept for.
+            // The install is done: so is what the keys were kept for, and
+            // there is nothing left to copy.
             session.keys.wipe();
+            if let Some(bulk) = session.bulk.take() {
+                bulk.close().await;
+            }
             let reply = finish(&root, &zpools).await;
             if matches!(reply, TargetMsg::Finished { .. }) {
                 session.shutdown = Some(then);
@@ -1079,6 +1116,68 @@ async fn answer(
         | ControllerMsg::Resume { .. } => TargetMsg::ExecFailed {
             error: "unexpected".into(),
         },
+    })
+}
+
+/// A bulk endpoint of a session: another iroh endpoint, bound to one of the
+/// target's addresses alone, for store copies from the session's controller
+/// over another network (see `ControllerMsg::OpenBulk`).
+struct Bulk {
+    endpoint: Endpoint,
+    accepting: tokio::task::JoinHandle<()>,
+}
+
+impl Bulk {
+    async fn close(self) {
+        self.accepting.abort();
+        self.endpoint.close().await;
+    }
+}
+
+/// Opens the bulk endpoint at `addr`, which must be one of ours, for the
+/// session's controller alone.
+async fn open_bulk(addr: IpAddr, session: &Session) -> Result<Bulk> {
+    let Some(controller) = session.controller else {
+        bail!("no controller to open it for");
+    };
+    let own = if_addrs::get_if_addrs().context("listing our addresses")?;
+    let Some(interface) = own.iter().find(|interface| interface.ip() == addr) else {
+        bail!("{addr} is not an address of this machine");
+    };
+    let bind = match addr {
+        IpAddr::V6(v6) if v6.is_unicast_link_local() => SocketAddr::V6(SocketAddrV6::new(
+            v6,
+            nix_pixie_proto::BULK_PORT,
+            0,
+            interface.index.unwrap_or(0),
+        )),
+        _ => SocketAddr::new(addr, nix_pixie_proto::BULK_PORT),
+    };
+    let endpoint = net::bind_at(SecretKey::generate(), bind).await?;
+    info!(%bind, "bulk endpoint listening");
+    let approved = session.approved.clone();
+    let accepting = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let approved = approved.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else {
+                        return;
+                    };
+                    if conn.remote_id() != controller {
+                        conn.close(VarInt::from_u32(1), b"not this session's controller");
+                        return;
+                    }
+                    debug!(%controller, "bulk connection");
+                    accept_streams(conn, approved).await;
+                });
+            }
+        }
+    });
+    Ok(Bulk {
+        endpoint,
+        accepting,
     })
 }
 
@@ -1169,7 +1268,11 @@ fn refusal(message: &ControllerMsg) -> Option<TargetMsg> {
         ControllerMsg::SetClock { .. } => Some(TargetMsg::ClockFailed { error: reason }),
         ControllerMsg::AddBootEntry { .. } => Some(TargetMsg::BootEntryFailed { error: reason }),
         // None, rather than a message just for refusing this.
-        ControllerMsg::RequestAddresses => Some(TargetMsg::Addresses { addrs: Vec::new() }),
+        ControllerMsg::RequestAddresses => Some(TargetMsg::Addresses {
+            addrs: Vec::new(),
+            nics: Vec::new(),
+        }),
+        ControllerMsg::OpenBulk { .. } => Some(TargetMsg::BulkFailed { error: reason }),
     }
 }
 

@@ -45,7 +45,9 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Open the agent's port, its probe port (UDP 47012) and mDNS (UDP 5353).
+        Open the agent's port, its probe port (UDP 47012), its bulk port (UDP
+        47013, for copies over another network than the session's) and mDNS
+        (UDP 5353).
         Controllers on the same network find the agent through these; one
         that finds it at a relay needs none of them.
       '';
@@ -238,6 +240,8 @@ in
         cfg.port
         # Discovery probes; fixed in the protocol (announce::PROBE_PORT).
         47012
+        # Bulk copies over another network (BULK_PORT), when asked for.
+        47013
         5353
       ];
     };

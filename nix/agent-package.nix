@@ -48,7 +48,7 @@ writeShellApplication {
     # on the internet, and mdns-sd answers unicast queries from anywhere
     # with more than it got, a reflector. Probes find us on a LAN anyway.
     if command -v nixos-firewall-tool >/dev/null; then
-      for port in 47011 47012; do
+      for port in 47011 47012 47013; do
         nixos-firewall-tool open udp "$port"
       done
     else

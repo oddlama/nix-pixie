@@ -62,6 +62,18 @@ pub enum Command {
         /// target's CPU; through relays and the internet), always, or never.
         #[arg(long, global = true, value_enum, default_value_t)]
         compression: crate::push::Compression,
+        /// Where store copies go: over the session's path (`session`), or
+        /// to another of the target's addresses, over a faster network than
+        /// the session's (the session over a USB cable, the copy over
+        /// Ethernet): this one, or with `auto` the first that works, of its
+        /// NICs but the session's. Needs UDP 47013 to the target.
+        #[arg(
+            long,
+            global = true,
+            value_name = "auto|session|ADDR",
+            default_value = "session"
+        )]
+        bulk_via: crate::bulk::Via,
         #[command(subcommand)]
         command: Box<ControllerCommand>,
     },
@@ -389,9 +401,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             events,
             offline,
             compression,
+            bulk_via,
             command,
         } => {
             crate::push::set_compression(compression);
+            crate::bulk::set_via(bulk_via);
             if let Some(path) = &events {
                 events::open(path)?;
             }

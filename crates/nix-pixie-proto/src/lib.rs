@@ -18,8 +18,8 @@ pub mod rendezvous;
 /// installer older than its controller would fail on the first new one.
 /// Bump it with every change to the messages (see the proto's tests).
 ///
-/// 2: `SetClock`, `AddBootEntry`, `Exec` with input, compressed stores, the
-/// NICs' addresses in the inventory.
+/// 2: `SetClock`, `AddBootEntry`, `OpenBulk`, `Exec` with input, compressed
+/// stores, the NICs' addresses in the inventory and in `Addresses`.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// DNS-SD service type that controllers and targets advertise on the LAN.
@@ -28,6 +28,11 @@ pub const DNS_SD_SERVICE: &str = "_nix-pixie._udp.local.";
 /// UDP port for the iroh endpoint unless configured otherwise. Fixed so that
 /// firewalls can allow it; the installer image opens it.
 pub const DEFAULT_PORT: u16 = 47_011;
+
+/// UDP port of a target's bulk endpoint (`OpenBulk`): store copies over
+/// another network than the session's. Fixed, for firewalls; the installer
+/// image opens it.
+pub const BULK_PORT: u16 = 47_013;
 
 /// iroh ALPN for control messages, starting with pairing.
 pub const ALPN_CTRL: &[u8] = b"nix-pixie/ctrl/2";

@@ -601,9 +601,10 @@ async fn review(
         None
     } else {
         let step = ui::start_with("push", format!("into {}", args.store_root));
+        let via = crate::bulk::open(link).await?;
         let pushed = push::push(link, &args.store_root, &args.push).await?;
         step.done(pushed.copied.what.clone());
-        Some(pushed)
+        Some((pushed, via))
     };
 
     let report = serde_json::json!({
@@ -620,8 +621,9 @@ async fn review(
             .zip(machine.as_ref())
             .and_then(|((_, metadata), machine)| metadata.machines.get(machine))
             .map(|m| m.configuration.clone()),
-        "push": pushed.map(|p| serde_json::json!({
+        "push": pushed.map(|(p, via)| serde_json::json!({
             "root": args.store_root, "fstype": p.fstype, "paths": args.push, "seconds": p.copied.seconds,
+            "via": via.map(|ip| ip.to_string()),
         })),
         "facterReport": facter.map(|f| match f {
             Ok(path) => serde_json::json!({ "path": path }),

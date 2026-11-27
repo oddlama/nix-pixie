@@ -19,7 +19,7 @@ use iroh::endpoint::{BindOpts, Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use nix_pixie_proto::code::Code;
 use nix_pixie_proto::pair::{PairError, PairFailure, PairParams, Role, Side, pair};
-use nix_pixie_proto::{ALPN_CTRL, ALPN_RESUME};
+use nix_pixie_proto::{ALPN_CTRL, ALPN_RESUME, ALPN_STORE};
 use tokio::io::Join;
 
 use crate::discovery::Peer;
@@ -117,6 +117,22 @@ pub async fn bind(secret: SecretKey, port: u16, relays: &Relays) -> Result<Endpo
         .await
         .with_context(|| format!("binding UDP port {port}"))?;
     Ok(endpoint)
+}
+
+/// A bulk endpoint (see `ControllerMsg::OpenBulk`): bound to `addr` alone,
+/// so that its connections can only go there; no relays; store streams
+/// only.
+pub async fn bind_at(secret: SecretKey, addr: SocketAddr) -> Result<Endpoint> {
+    Endpoint::builder(presets::Minimal)
+        .secret_key(secret)
+        .alpns(vec![ALPN_STORE.to_vec()])
+        .relay_mode(Relays::Disabled.mode())
+        .dns_resolver(dns::resolver())
+        .clear_ip_transports()
+        .bind_addr(addr)?
+        .bind()
+        .await
+        .with_context(|| format!("binding {addr}"))
 }
 
 /// The port the endpoint's IPv4 socket is bound to.

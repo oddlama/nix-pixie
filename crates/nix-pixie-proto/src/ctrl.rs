@@ -128,8 +128,12 @@ pub enum TargetMsg {
     FilesPlaced,
     /// Why the files could not be placed.
     FilesRefused { reason: String },
-    /// The addresses of the target's own network interfaces, as requested.
-    Addresses { addrs: Vec<IpAddr> },
+    /// The addresses of the target's own network interfaces, as requested:
+    /// all of them, and those of its physical NICs, by NIC.
+    Addresses {
+        addrs: Vec<IpAddr>,
+        nics: Vec<crate::inventory::Nic>,
+    },
     /// Output of the program `Exec` runs, as it comes: from its stderr, or
     /// else its stdout.
     ExecOutput { stderr: bool, chunk: Vec<u8> },
@@ -153,6 +157,11 @@ pub enum TargetMsg {
     BootEntry { number: String, created: bool },
     /// Why the boot entry could not be made, or put first.
     BootEntryFailed { error: String },
+    /// The bulk endpoint listens at the address asked for, on `port`, as
+    /// `id` (a raw ed25519 public key, as iroh's endpoint ids are).
+    Bulk { id: [u8; 32], port: u16 },
+    /// Why there is no bulk endpoint at that address.
+    BulkFailed { error: String },
 }
 
 /// Messages the controller sends to the target.
@@ -241,6 +250,14 @@ pub enum ControllerMsg {
     /// may boot the installer again. Answered with `BootEntry`. Only after
     /// `Install`.
     AddBootEntry { esp: String },
+    /// Open a bulk endpoint: another iroh endpoint of the target's, bound
+    /// to `addr` (one of its own) alone, so that its connections can only go
+    /// there, and accepting nobody but this controller. Store streams on
+    /// such a connection are served like those on the session's: for big
+    /// copies over a faster network than the session's (Ethernet, with the
+    /// session on a USB cable). Replaces an earlier one; closed with the
+    /// session or by `Finish`. Answered with `Bulk`. Only after `Approve`.
+    OpenBulk { addr: IpAddr },
     /// The controller's time (milliseconds since 1970, UTC). A target whose
     /// clock is off sets it to that, for whatever checks certificates or
     /// dates from now on: installers often boot without a clock, or with

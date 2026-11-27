@@ -196,7 +196,7 @@ pub async fn prepare_disk_store(link: &Link, root: &str) -> Result<String> {
 /// on the running step. If the connection is lost meanwhile, the copy
 /// starts over once it is back, skipping what arrived.
 pub async fn send(link: &Link, request: &StreamRequest, paths: &[String]) -> Result<Copied> {
-    link.on_connection(async |conn| copy(conn, request, paths).await)
+    link.on_bulk_connection(async |conn| copy(conn, request, paths).await)
         .await
 }
 

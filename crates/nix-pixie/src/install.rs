@@ -20,6 +20,7 @@ use tracing::{debug, info, trace, warn};
 use zeroize::Zeroizing;
 
 use crate::bootentry;
+use crate::bulk;
 use crate::controller::{self, Approved, describe_disk, show_disk};
 use crate::discovery::{Method, Peer};
 use crate::exit;
@@ -1086,6 +1087,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
     hooks_after(&mut hooks, Step::Format, link, None).await?;
     place_files(link, &root, &mut hooks).await?;
 
+    let bulk = bulk::open(link).await?;
     let (fstype, copied) = send_system(link, &root, &built.toplevel).await?;
     hooks_after(&mut hooks, Step::Copy, link, None).await?;
     place_files(link, &root, &mut hooks).await?;
@@ -1110,6 +1112,9 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
     )?;
     if let Some(id) = &hooks.context.id {
         report.insert("id".into(), id.clone().into());
+    }
+    if let Some(addr) = bulk {
+        report.insert("pushVia".into(), addr.to_string().into());
     }
     // A lease may have come since pairing (a NIC whose driver is slow).
     let addrs = own_addresses(link).await?;
@@ -1572,7 +1577,7 @@ async fn own_addresses(link: &Link) -> Result<Vec<IpAddr>> {
         )
         .await?;
     match reply {
-        TargetMsg::Addresses { addrs } => Ok(addrs),
+        TargetMsg::Addresses { addrs, .. } => Ok(addrs),
         _ => bail!("unexpected reply to asking for the target's addresses"),
     }
 }

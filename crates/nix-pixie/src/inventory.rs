@@ -51,14 +51,7 @@ pub async fn collect(formatted: &BTreeSet<String>) -> Inventory {
             .and_then(|text| mem_total(&text))
             .unwrap_or(0),
         firmware: firmware(Path::new("/sys/firmware/efi")),
-        nics: with_addresses(
-            nics(Path::new("/sys/class/net")),
-            &if_addrs::get_if_addrs()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|interface| (interface.name.clone(), interface.ip()))
-                .collect::<Vec<_>>(),
-        ),
+        nics: nics_now(),
         disks,
     }
 }
@@ -191,6 +184,17 @@ pub fn nics(dir: &Path) -> Vec<Nic> {
         .collect();
     nics.sort_by(|a, b| a.name.cmp(&b.name));
     nics
+}
+
+/// The physical NICs, with their addresses now.
+#[must_use]
+pub fn nics_now() -> Vec<Nic> {
+    let addresses: Vec<(String, IpAddr)> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|interface| (interface.name.clone(), interface.ip()))
+        .collect();
+    with_addresses(nics(Path::new("/sys/class/net")), &addresses)
 }
 
 /// `nics` with their addresses from `addresses` (interface, address),

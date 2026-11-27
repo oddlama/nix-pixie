@@ -40,7 +40,9 @@ fn controller_msg_since(message: &ControllerMsg) -> u32 {
         | ControllerMsg::RequestAddresses
         | ControllerMsg::Exec { .. }
         | ControllerMsg::Resume { .. } => 1,
-        ControllerMsg::AddBootEntry { .. } | ControllerMsg::SetClock { .. } => 2,
+        ControllerMsg::AddBootEntry { .. }
+        | ControllerMsg::SetClock { .. }
+        | ControllerMsg::OpenBulk { .. } => 2,
     }
 }
 
@@ -74,7 +76,9 @@ fn target_msg_since(message: &TargetMsg) -> u32 {
         TargetMsg::Clock { .. }
         | TargetMsg::ClockFailed { .. }
         | TargetMsg::BootEntry { .. }
-        | TargetMsg::BootEntryFailed { .. } => 2,
+        | TargetMsg::BootEntryFailed { .. }
+        | TargetMsg::Bulk { .. }
+        | TargetMsg::BulkFailed { .. } => 2,
     }
 }
 

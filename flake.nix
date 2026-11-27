@@ -188,6 +188,11 @@
                   package = config.packages.default;
                   agentModule = ./nix/nixos/agent.nix;
                 };
+                vm-bulk = import ./nix/tests/bulk.nix {
+                  inherit pkgs;
+                  package = config.packages.default;
+                  agentModule = ./nix/nixos/agent.nix;
+                };
                 vm-push = import ./nix/tests/push.nix {
                   inherit pkgs;
                   package = config.packages.default;

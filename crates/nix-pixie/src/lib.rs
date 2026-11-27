@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod bootentry;
+pub mod bulk;
 pub mod child;
 pub mod cli;
 pub mod clock;
