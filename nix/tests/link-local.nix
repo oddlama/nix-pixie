@@ -144,7 +144,8 @@ pkgs.testers.runNixOSTest {
     with subtest("a whole install over the cable"):
         # Throttled, so that sending the system takes about two minutes: two
         # of NetworkManager's 45 s rounds, which would have dropped the
-        # address and the session without the advertisements.
+        # address and the session without the advertisements. Uncompressed,
+        # since the throttle is worked out from the closure's size.
         size = int(laptop.succeed(
             "nix --extra-experimental-features nix-command path-info -S"
             " ${flake.prebuilt.web1.system.build.toplevel} | awk '{print $2}'"
@@ -156,7 +157,8 @@ pkgs.testers.runNixOSTest {
         failures, deletions = failed_activations(), link_local_deletions()
         status, _ = laptop.execute(
             f"su - alice -c 'cd repo && nix-pixie controller install --code {code} --machine web1"
-            " --disk main=vdb --yes --then stay --timeout 90 >/tmp/install.json 2>/tmp/install.err'"
+            " --disk main=vdb --yes --then stay --timeout 90 --no-compression"
+            " >/tmp/install.json 2>/tmp/install.err'"
         )
         print(laptop.succeed("cat /tmp/install.err"))
         assert status == 0, f"the install failed ({status})"

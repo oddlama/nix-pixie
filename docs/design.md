@@ -41,7 +41,7 @@ we build on them.
 | A driving program's interface: JSON events (`--events`), exit codes by phase, the agent's status on a serial terminal (`console --plain`/`--json`), `--offline` | implemented, not yet VM-tested | unit tests of the console |
 | Many devices, one configuration: `--id`/`$PIXIE_OUT/id`, `{id}` paths, `disks.rules`, `facter.mode`, side-by-side installs | implemented, not yet VM-tested | unit tests of the disk plan |
 | Hooks: owners and directory modes (`files.json`), `target exec --stdin`, `context.json` to later hooks, `encrypted/` into the repo with age, `seen-host-key` and `bootCheck = "hooks"`, outputs in RAM only | implemented, not yet VM-tested | unit tests of the outputs |
-| Store streams compressed with zstd | implemented, not yet VM-tested | — |
+| Store streams compressed with zstd | done | `checks.vm-install-*` (compressed by default), `checks.vm-push` (incompressible, under the memory cap); `checks.vm-link-local` sends uncompressed |
 | Netboot installer (`nixosModules.installer-netboot`): nothing needed on the command line (no `init=`, any `root=` ignored), only chosen kernel modules | implemented; boots in QEMU from kernel and initrd alone | by hand: `console=ttyS0 root=/dev/vda` |
 | USB gadget (`nix-pixie.usbGadget`: NCM with `fe80::2`, ACM for the status), added to a vendor's gadget if there is one | implemented; works on `dummy_hcd` | by hand, in QEMU |
 | A controller's code at the console, as `nix-pixie code`, or from a credential; `--serial` to hand it over | implemented; pairs over `dummy_hcd`'s serial port and network | by hand, in QEMU; unit tests |

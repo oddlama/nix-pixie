@@ -10,8 +10,13 @@
   agentModule,
 }:
 let
-  # One big path: the case where buffering a NAR would hurt most.
-  blob = pkgs.runCommand "nix-pixie-test-blob" { } "head -c 512M /dev/zero > $out";
+  # One big path: the case where buffering a NAR would hurt most. Pseudorandom
+  # (zeros through AES-CTR with a fixed key: the same every build), so it
+  # doesn't compress on the wire, and pushing it takes as long as its size says.
+  blob = pkgs.runCommand "nix-pixie-test-blob" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    head -c 512M /dev/zero \
+      | openssl enc -aes-256-ctr -nosalt -K 0000000000000000000000000000000000000000000000000000000000000000 -iv 00000000000000000000000000000000 > $out
+  '';
   # Many small paths with dependencies.
   inherit (pkgs) hello;
 in
