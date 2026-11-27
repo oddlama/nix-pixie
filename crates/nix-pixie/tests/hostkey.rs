@@ -142,3 +142,53 @@ fn asks_each_address_once() {
     assert_eq!(hosts.len(), 2);
     assert_eq!(describe_hosts(&hosts), "192.168.1.3, fe80::1%2");
 }
+
+#[test]
+fn macs_make_eui64_link_local_addresses() {
+    use nix_pixie::hostkey::eui64_link_local;
+    // As the kernel made them, in the VM tests and on a laptop's USB NIC.
+    assert_eq!(
+        eui64_link_local("52:54:00:12:01:02"),
+        Some("fe80::5054:ff:fe12:102".parse().unwrap())
+    );
+    assert_eq!(
+        eui64_link_local("c0:ea:c3:69:08:3d"),
+        Some("fe80::c2ea:c3ff:fe69:83d".parse().unwrap())
+    );
+    assert_eq!(eui64_link_local("not a mac"), None);
+    assert_eq!(eui64_link_local("52:54:00:12:01"), None);
+}
+
+#[test]
+fn derived_addresses_are_only_on_links_shared_with_the_target() {
+    use std::collections::BTreeSet;
+    use std::net::SocketAddr;
+
+    use nix_pixie::hostkey::{from_macs, shared_links};
+    let found: Vec<SocketAddr> = [
+        "[fe80::2%5]:22",
+        "192.168.1.2:22",
+        "[2001:db8::1]:22",
+        "203.0.113.9:22",
+    ]
+    .map(|a| a.parse().unwrap())
+    .to_vec();
+    let own = [
+        (
+            3,
+            "192.168.1.1".parse().unwrap(),
+            "255.255.255.0".parse().unwrap(),
+        ),
+        (4, "10.0.0.1".parse().unwrap(), "255.0.0.0".parse().unwrap()),
+    ];
+    let links = shared_links(&found, &own);
+    assert_eq!(links, BTreeSet::from([3, 5]));
+    let derived = from_macs(&["52:54:00:12:01:02".into(), "bad".into()], &links);
+    let expected: Vec<SocketAddr> = [
+        "[fe80::5054:ff:fe12:102%3]:0",
+        "[fe80::5054:ff:fe12:102%5]:0",
+    ]
+    .map(|a| a.parse().unwrap())
+    .to_vec();
+    assert_eq!(derived, expected);
+}

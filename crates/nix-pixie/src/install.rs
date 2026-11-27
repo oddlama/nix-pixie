@@ -7,7 +7,7 @@
 //! the target format its disks and receive the system.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -747,6 +747,9 @@ struct Plan {
     boot_check: BootCheck,
     /// Whether the target boots with UEFI.
     uefi: bool,
+    /// Its NICs' MACs, for the addresses the installed system may make
+    /// from them.
+    macs: Vec<String>,
 }
 
 /// Approval, the facter report and host key, the disk plan, the build.
@@ -837,6 +840,7 @@ async fn prepare(
         label,
         name,
         configuration: machine.configuration.clone(),
+        macs: inventory.nics.iter().map(|nic| nic.mac.clone()).collect(),
         disks: inventory.disks,
         choices,
         built,
@@ -1071,6 +1075,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
         mut hooks,
         boot_check,
         uefi,
+        macs,
     } = plan;
     confirm_erase(&disks, &choices, args.yes, args.wipe).await?;
     format_disks(link, &choices, &disko, &built.disko_script, key_files).await?;
@@ -1122,6 +1127,7 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
         encrypted: !(disko.encryption.luks.is_empty() && disko.encryption.zfs.is_empty()),
         enrolls_keys: boot.enroll_keys.then_some(boot.enroll_reboots),
         boot_entry,
+        macs,
     };
     let after = leave(link, peer, args, &mut hooks, &mut report, leaving).await?;
     Ok(Installed {
@@ -1144,6 +1150,8 @@ struct Leaving {
     enrolls_keys: Option<bool>,
     /// What the firmware needs to boot the installed system next.
     boot_entry: bootentry::Plan,
+    /// The target's NICs' MACs.
+    macs: Vec<String>,
 }
 
 /// Leaves the target ready to boot (or mounted, with `--then stay`), and
@@ -1166,6 +1174,7 @@ async fn leave(
         encrypted,
         enrolls_keys,
         boot_entry,
+        macs,
     } = leaving;
     add_boot_entry(link, &boot_entry, &name, args.then, report).await?;
     let shutdown = match args.then {
@@ -1180,7 +1189,11 @@ async fn leave(
     };
     // Asked while the target still answers.
     let ssh_at = if ssh.enable && boot_check == BootCheck::Ssh {
-        Some(ssh_addrs(link, peer).await?)
+        Some(
+            ssh_addrs(link, peer)
+                .await?
+                .map(|addrs| with_derived(addrs, &macs)),
+        )
     } else {
         None
     };
@@ -1524,6 +1537,26 @@ async fn ssh_addrs(link: &Link, peer: &Peer) -> Result<Result<Vec<SocketAddr>, S
             addr.ip()
         ))
     })
+}
+
+/// `addrs`, and the link-local addresses the installed system may make from
+/// its NICs' MACs on the links the controller shares with it.
+fn with_derived(mut addrs: Vec<SocketAddr>, macs: &[String]) -> Vec<SocketAddr> {
+    let own: Vec<(u32, Ipv4Addr, Ipv4Addr)> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|interface| match (interface.index, interface.addr) {
+            (Some(index), if_addrs::IfAddr::V4(v4)) => Some((index, v4.ip, v4.netmask)),
+            _ => None,
+        })
+        .collect();
+    let links = hostkey::shared_links(&addrs, &own);
+    for addr in hostkey::from_macs(macs, &links) {
+        if !addrs.iter().any(|known| known.ip() == addr.ip()) {
+            addrs.push(addr);
+        }
+    }
+    addrs
 }
 
 /// The addresses of the target's network interfaces.

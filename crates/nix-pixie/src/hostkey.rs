@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -155,6 +155,70 @@ pub fn hosts(addrs: &[SocketAddr]) -> BTreeSet<SocketAddr> {
         .collect()
 }
 
+/// The link-local address a NIC makes from its MAC (EUI-64), as the kernel
+/// and systemd-networkd do by default (`NetworkManager` doesn't).
+#[must_use]
+pub fn eui64_link_local(mac: &str) -> Option<Ipv6Addr> {
+    let bytes: Vec<u8> = mac
+        .split(':')
+        .map(|b| u8::from_str_radix(b, 16))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [oui0, oui1, oui2, nic0, nic1, nic2]: [u8; 6] = bytes.try_into().ok()?;
+    Some(Ipv6Addr::new(
+        0xfe80,
+        0,
+        0,
+        0,
+        u16::from_be_bytes([oui0 ^ 0x02, oui1]),
+        u16::from_be_bytes([oui2, 0xff]),
+        u16::from_be_bytes([0xfe, nic0]),
+        u16::from_be_bytes([nic1, nic2]),
+    ))
+}
+
+/// The links the controller shares with a target found at `addrs`, by
+/// interface index: those its link-local addresses are on, and those of
+/// the controller's interfaces `own` (index, address, netmask) whose IPv4
+/// network holds one of its IPv4 addresses.
+#[must_use]
+pub fn shared_links(addrs: &[SocketAddr], own: &[(u32, Ipv4Addr, Ipv4Addr)]) -> BTreeSet<u32> {
+    let mut links = BTreeSet::new();
+    for addr in addrs {
+        match addr {
+            SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() && v6.scope_id() != 0 => {
+                links.insert(v6.scope_id());
+            }
+            SocketAddr::V4(v4) => {
+                let ip = u32::from(*v4.ip());
+                for &(index, own_ip, mask) in own {
+                    let mask = u32::from(mask);
+                    if mask != 0 && ip & mask == u32::from(own_ip) & mask {
+                        links.insert(index);
+                    }
+                }
+            }
+            SocketAddr::V6(_) => {}
+        }
+    }
+    links
+}
+
+/// Where a target with NICs of `macs` may answer on `links` by the
+/// link-local addresses it makes from them: for an installed system that
+/// gets no other address, or none the controller knows.
+#[must_use]
+pub fn from_macs(macs: &[String], links: &BTreeSet<u32>) -> Vec<SocketAddr> {
+    macs.iter()
+        .filter_map(|mac| eui64_link_local(mac))
+        .flat_map(|ip| {
+            links
+                .iter()
+                .map(move |&scope| SocketAddr::V6(SocketAddrV6::new(ip, 0, 0, scope)))
+        })
+        .collect()
+}
+
 /// `hosts` for people: link-local IPv6 with its scope.
 pub fn describe_hosts(hosts: &BTreeSet<SocketAddr>) -> String {
     hosts
@@ -174,8 +238,16 @@ pub async fn check(
     expected: Option<&PublicKey>,
     ignore: Option<&PublicKey>,
 ) -> Result<Option<Seen>> {
+    // All at once, since most don't answer and each takes its timeout to
+    // say so; judged in order.
+    let mut scans = tokio::task::JoinSet::new();
     for &addr in hosts {
-        let keys = scan(addr, port).await?;
+        scans.spawn(async move { (addr, scan(addr, port).await) });
+    }
+    let mut answers: Vec<_> = scans.join_all().await;
+    answers.sort_by_key(|(addr, _)| *addr);
+    for (addr, keys) in answers {
+        let keys = keys?;
         debug!(%addr, keys = keys.len(), "ssh-keyscan");
         match judge(&keys, expected, ignore) {
             Verdict::Wait => {}
