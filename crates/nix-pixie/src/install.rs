@@ -1104,6 +1104,13 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
     if let Some(id) = &hooks.context.id {
         report.insert("id".into(), id.clone().into());
     }
+    // A lease may have come since pairing (a NIC whose driver is slow).
+    let addrs = own_addresses(link).await?;
+    if !addrs.is_empty() {
+        let shown: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+        info!(addresses = shown.join(", "), "the target's addresses now");
+        report.insert("targetAddresses".into(), shown.into());
+    }
     let boot_entry = bootentry::Plan::of(&boot, uefi, &root);
     let leaving = Leaving {
         name,

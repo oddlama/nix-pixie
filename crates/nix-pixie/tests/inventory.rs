@@ -119,8 +119,36 @@ fn reads_sysfs_like_trees() {
         [Nic {
             name: "eth0".into(),
             mac: "52:54:00:12:01:02".into(),
-            link_up: true
+            link_up: true,
+            addrs: vec![],
         }]
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nics_get_their_addresses_ipv4_first_and_link_local_last() {
+    let nic = |name: &str| Nic {
+        name: name.into(),
+        mac: "52:54:00:12:01:02".into(),
+        link_up: true,
+        addrs: vec![],
+    };
+    let ip = |text: &str| text.parse::<std::net::IpAddr>().unwrap();
+    let addresses = [
+        ("eth0".to_string(), ip("fe80::5054:ff:fe12:102")),
+        ("eth0".to_string(), ip("2001:db8::7")),
+        ("eth0".to_string(), ip("10.0.3.195")),
+        ("wlan0".to_string(), ip("192.168.1.5")),
+    ];
+    let nics = with_addresses(vec![nic("eth0"), nic("usb0")], &addresses);
+    assert_eq!(
+        nics[0].addrs,
+        [
+            ip("10.0.3.195"),
+            ip("2001:db8::7"),
+            ip("fe80::5054:ff:fe12:102")
+        ]
+    );
+    assert_eq!(nics[1].addrs, Vec::<std::net::IpAddr>::new());
 }

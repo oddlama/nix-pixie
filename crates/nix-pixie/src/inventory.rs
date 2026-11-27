@@ -2,6 +2,7 @@
 //! installer). Parsing is kept apart from reading, so it can be tested.
 
 use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -50,7 +51,14 @@ pub async fn collect(formatted: &BTreeSet<String>) -> Inventory {
             .and_then(|text| mem_total(&text))
             .unwrap_or(0),
         firmware: firmware(Path::new("/sys/firmware/efi")),
-        nics: nics(Path::new("/sys/class/net")),
+        nics: with_addresses(
+            nics(Path::new("/sys/class/net")),
+            &if_addrs::get_if_addrs()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|interface| (interface.name.clone(), interface.ip()))
+                .collect::<Vec<_>>(),
+        ),
         disks,
     }
 }
@@ -177,10 +185,31 @@ pub fn nics(dir: &Path) -> Vec<Nic> {
                 name: sanitise(&entry.file_name().to_string_lossy(), MAX_FIELD),
                 mac: read_field(&path.join("address"))?.to_ascii_lowercase(),
                 link_up: read_field(&path.join("operstate")).as_deref() == Some("up"),
+                addrs: Vec::new(),
             })
         })
         .collect();
     nics.sort_by(|a, b| a.name.cmp(&b.name));
+    nics
+}
+
+/// `nics` with their addresses from `addresses` (interface, address),
+/// sorted: IPv4 first, then global IPv6, then link-local.
+#[must_use]
+pub fn with_addresses(mut nics: Vec<Nic>, addresses: &[(String, IpAddr)]) -> Vec<Nic> {
+    for nic in &mut nics {
+        nic.addrs = addresses
+            .iter()
+            .filter(|(name, _)| *name == nic.name)
+            .map(|(_, ip)| *ip)
+            .collect();
+        nic.addrs.sort_by_key(|ip| match ip {
+            IpAddr::V4(_) => (0, *ip),
+            IpAddr::V6(v6) if v6.is_unicast_link_local() => (2, *ip),
+            IpAddr::V6(_) => (1, *ip),
+        });
+        nic.addrs.dedup();
+    }
     nics
 }
 

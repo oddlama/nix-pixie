@@ -114,7 +114,10 @@ pkgs.testers.runNixOSTest {
         assert inventory["hostname"] == "target", inventory
         assert inventory["memory_bytes"] > 256 * 2**20, inventory
         assert not inventory["firmware"]["uefi"], "test VMs boot without UEFI"
-        assert {"name": "eth1", "mac": "52:54:00:12:01:02", "link_up": True} in inventory["nics"], inventory["nics"]
+        eth1 = next(n for n in inventory["nics"] if n["name"] == "eth1")
+        assert eth1["mac"] == "52:54:00:12:01:02" and eth1["link_up"], eth1
+        # Its addresses, the test network's first.
+        assert eth1["addrs"][0] == "192.168.1.2", eth1
 
         disks = {d["name"]: d for d in inventory["disks"]}
         data = next(d for d in disks.values() if "virtio-pixie-data" in d["by_id"])

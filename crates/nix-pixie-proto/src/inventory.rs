@@ -69,6 +69,9 @@ pub struct Nic {
     /// Lowercase, colon-separated.
     pub mac: String,
     pub link_up: bool,
+    /// Its addresses when the inventory was taken (a DHCP lease may come
+    /// later).
+    pub addrs: Vec<std::net::IpAddr>,
 }
 
 /// A whole disk (not a partition) as lsblk reports it.

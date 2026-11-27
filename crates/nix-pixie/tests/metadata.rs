@@ -42,6 +42,7 @@ fn inventory(mac: &str, serial: Option<&str>) -> Inventory {
             name: "eth1".into(),
             mac: mac.into(),
             link_up: true,
+            addrs: vec![],
         }],
         dmi: Dmi {
             serial: serial.map(Into::into),

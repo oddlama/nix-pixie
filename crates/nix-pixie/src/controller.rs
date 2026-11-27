@@ -711,8 +711,19 @@ fn summary(
     }
     for nic in &inventory.nics {
         let link = if nic.link_up { "up" } else { "down" };
+        let addrs = nic
+            .addrs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let addrs = if addrs.is_empty() {
+            String::new()
+        } else {
+            format!(" {addrs}")
+        };
         lines.push(format!(
-            "  nic       {} {} ({link})",
+            "  nic       {} {} ({link}){addrs}",
             clean(&nic.name),
             clean(&nic.mac)
         ));

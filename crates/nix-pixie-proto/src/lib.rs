@@ -18,7 +18,8 @@ pub mod rendezvous;
 /// installer older than its controller would fail on the first new one.
 /// Bump it with every change to the messages (see the proto's tests).
 ///
-/// 2: `SetClock`, `AddBootEntry`, `Exec` with input, compressed stores.
+/// 2: `SetClock`, `AddBootEntry`, `Exec` with input, compressed stores, the
+/// NICs' addresses in the inventory.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// DNS-SD service type that controllers and targets advertise on the LAN.
