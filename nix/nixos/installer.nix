@@ -36,7 +36,9 @@ let
   # Starts the advertisements on every wired link that has been up for a
   # while without anybody else on it giving addresses (DHCP) or advertising a
   # router: a direct cable. Stops them when the cable is pulled, so the next
-  # network gets looked at anew.
+  # network gets looked at anew. A USB gadget's link is a cable to one host
+  # whatever happens: advertised on from the start, and through the moments
+  # its carrier drops while the host enumerates the device anew.
   lonelyLinks = pkgs.writeShellApplication {
     name = "nix-pixie-lonely-links";
     runtimeInputs = [
@@ -55,6 +57,14 @@ let
             continue
           fi
           unit="nix-pixie-advertise@$link.service"
+          device=$(readlink -f "$dev/device")
+          if [[ ''${device##*/} == gadget* ]]; then
+            if ! systemctl is-active -q "$unit"; then
+              echo "$link: a USB gadget's link; advertising, so the host keeps it up"
+              systemctl start "$unit"
+            fi
+            continue
+          fi
           if [ "$(cat "$dev/carrier" 2>/dev/null || echo 0)" != 1 ]; then
             unset "since[$link]"
             if systemctl is-active -q "$unit"; then systemctl stop "$unit"; fi
@@ -80,6 +90,7 @@ in
   imports = [
     ./agent.nix
     ./storage.nix
+    ./usb-gadget.nix
   ];
 
   services.nix-pixie-agent = {
