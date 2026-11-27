@@ -93,6 +93,7 @@ impl Responder {
                 window = (Instant::now(), 0);
             }
             if window.1 >= MAX_REPLIES_PER_SECOND {
+                debug!(%from, "too many probes; no reply");
                 continue;
             }
             window.1 += 1;
@@ -106,7 +107,10 @@ impl Responder {
                     warn!("encoding a probe reply: {e}");
                     continue;
                 }
-                None => continue,
+                None => {
+                    debug!(%from, "not announcing; no reply");
+                    continue;
+                }
             };
             let prober = canonical(from).ip();
             if flushed
@@ -121,8 +125,9 @@ impl Responder {
                     forget_neighbour(prober).await;
                 }
             }
-            if let Err(e) = self.socket.send_to(&reply, from).await {
-                debug!(%from, "probe reply: {e}");
+            match self.socket.send_to(&reply, from).await {
+                Ok(_) => debug!(%from, "probe answered"),
+                Err(e) => debug!(%from, "probe reply: {e}"),
             }
         }
     }
