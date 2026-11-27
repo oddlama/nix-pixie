@@ -55,6 +55,9 @@ pub struct InstallArgs {
     pub code: Option<String>,
     /// A controller's code to pair with instead.
     pub controller_code_file: Option<PathBuf>,
+    /// A serial port to hand the target a controller's code through: ours
+    /// from `controller_code_file`, or a new one.
+    pub serial: Option<PathBuf>,
     /// Which of many devices of one configuration this is: for `{id}` in
     /// the machine's paths, and for hooks.
     pub id: Option<String>,
@@ -130,6 +133,7 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     let code = controller::pair_code(
         args.code.as_deref(),
         args.controller_code_file.as_deref(),
+        args.serial.is_some(),
         args.method,
         &args.targets,
     )
@@ -146,7 +150,11 @@ pub async fn install(args: InstallArgs) -> Result<()> {
     let result = tokio::select! {
         r = async {
             let (conn, stream, peer) = controller::pair_with_target(
-                &endpoint, &mut discovery, code, args.timeout,
+                &endpoint,
+                &mut discovery,
+                code,
+                args.timeout,
+                args.serial.as_deref(),
             )
             .await?;
             exit::reached(exit::Phase::Paired);

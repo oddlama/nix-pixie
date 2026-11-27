@@ -50,6 +50,9 @@ pub struct PairArgs {
     pub code: Option<String>,
     /// A controller's code to pair with instead.
     pub controller_code_file: Option<PathBuf>,
+    /// A serial port to hand the target a controller's code through: ours
+    /// from `controller_code_file`, or a new one.
+    pub serial: Option<PathBuf>,
     pub timeout: Duration,
     pub method: Method,
     /// Flake with the `pixie` output, for matching and writing reports.
@@ -101,6 +104,7 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     let code = pair_code(
         args.code.as_deref(),
         args.controller_code_file.as_deref(),
+        args.serial.is_some(),
         args.method,
         &args.targets,
     )
@@ -116,8 +120,14 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     let (endpoint, mut discovery) = search.start(code).await?;
     let result = tokio::select! {
         r = async {
-            let (conn, stream, peer) =
-                pair_with_target(&endpoint, &mut discovery, code, args.timeout).await?;
+            let (conn, stream, peer) = pair_with_target(
+                &endpoint,
+                &mut discovery,
+                code,
+                args.timeout,
+                args.serial.as_deref(),
+            )
+            .await?;
             exit::reached(exit::Phase::Paired);
             step.done(describe_peer(&conn, &peer));
             let link = Link::new(&endpoint, &peer, conn, stream);
@@ -236,9 +246,10 @@ pub struct Search<'a> {
 pub enum PairCode {
     /// Shown by the target, starting with its nameplate; typed here.
     Target { code: Code, nameplate: u32 },
-    /// Ours (`--controller-code-file`), handed to the target by other means,
-    /// such as the kernel command line of an installer booted over USB.
-    /// The target waits for this controller to dial it.
+    /// Ours (`--controller-code-file`, or new for `--serial`), handed to the
+    /// target by other means: the kernel command line of an installer booted
+    /// over USB, its serial port. The target waits for this controller to
+    /// dial it.
     Controller(Code),
 }
 
@@ -266,7 +277,9 @@ impl PairCode {
     }
 }
 
-/// The code of a target or of this controller, as given or asked for.
+/// The code of a target or of this controller, as given or asked for. With
+/// `serial` (the code goes to the target over a serial port), a
+/// controller's: from `controller`, or else a new one.
 ///
 /// # Errors
 ///
@@ -274,11 +287,15 @@ impl PairCode {
 pub async fn pair_code(
     target: Option<&str>,
     controller: Option<&Path>,
+    serial: bool,
     method: Method,
     targets: &[String],
 ) -> Result<PairCode> {
     if let Some(path) = controller {
         return Ok(PairCode::Controller(controller_code_file(path)?));
+    }
+    if serial {
+        return Ok(PairCode::Controller(Code::generate(None)?));
     }
     let code = code_or_ask(target.map(target_code).transpose()?, method, targets).await?;
     let nameplate = code.nameplate().context(ui::code::NAMEPLATE_NEEDED)?;
@@ -349,12 +366,22 @@ impl Search<'_> {
     }
 }
 
+/// Pairs with the first target that takes `pair`'s code within `timeout`.
+/// A controller's code goes to the target over `serial` meanwhile, if
+/// given.
 pub async fn pair_with_target(
     endpoint: &Endpoint,
     discovery: &mut Discovery,
     pair: PairCode,
     timeout: Duration,
+    serial: Option<&Path>,
 ) -> Result<(Connection, Stream, Peer)> {
+    let _handing_over = match (serial, pair) {
+        (Some(port), PairCode::Controller(code)) => {
+            Some(AbortOnDrop(crate::serial::spawn(port.to_path_buf(), code)))
+        }
+        _ => None,
+    };
     let deadline = tokio::time::Instant::now() + timeout;
     let mut dialer = Dialer::default();
     let which = pair.which();
@@ -392,6 +419,15 @@ pub async fn pair_with_target(
             ),
             Attempt::Skipped | Attempt::Failed => {}
         }
+    }
+}
+
+/// A task that ends with its owner.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

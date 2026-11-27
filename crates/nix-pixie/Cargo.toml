@@ -19,7 +19,7 @@ rand = "0.10.4"
 rpassword = "7.5.5"
 # The terminal: its size, whether stdin has a line (without blocking or
 # taking it from a hook), dropping type-ahead before destructive questions.
-rustix = { version = "1.1.6", features = ["event", "process", "termios"] }
+rustix = { version = "1.1.6", features = ["event", "fs", "process", "termios"] }
 rustyline = { version = "19.0.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

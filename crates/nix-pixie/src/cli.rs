@@ -173,6 +173,12 @@ pub struct InstallCli {
     /// installer booted over USB. For targets without a screen.
     #[arg(long, value_name = "FILE", conflicts_with = "code")]
     controller_code_file: Option<PathBuf>,
+    /// Hand the target a controller's code over this serial port, where
+    /// its status terminal takes `code CODE`, e.g. a USB gadget's
+    /// (/dev/serial/by-id/...): the code from --controller-code-file, or
+    /// a new one. Together with --target, for devices without a screen.
+    #[arg(long, value_name = "PORT", conflicts_with = "code")]
+    serial: Option<PathBuf>,
     /// Flake with the `pixie` output and the configurations.
     #[arg(long, default_value = ".")]
     flake: String,
@@ -239,6 +245,7 @@ impl InstallCli {
         let Self {
             code,
             controller_code_file,
+            serial,
             id,
             no_compression,
             boot_check,
@@ -262,6 +269,7 @@ impl InstallCli {
             identity,
             code,
             controller_code_file,
+            serial,
             id,
             boot_check,
             timeout: Duration::from_secs(timeout),
@@ -302,6 +310,13 @@ pub enum ControllerCommand {
         /// installer booted over USB. For targets without a screen.
         #[arg(long, value_name = "FILE", conflicts_with = "code")]
         controller_code_file: Option<PathBuf>,
+        /// Hand the target a controller's code over this serial port, where
+        /// its status terminal takes `code CODE`, e.g. a USB gadget's
+        /// (/dev/serial/by-id/...): the code from --controller-code-file,
+        /// or a new one. Together with --target, for devices without a
+        /// screen.
+        #[arg(long, value_name = "PORT", conflicts_with = "code")]
+        serial: Option<PathBuf>,
         /// Give up after this many seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -498,6 +513,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
         ControllerCommand::Pair {
             code,
             controller_code_file,
+            serial,
             timeout,
             discovery,
             flake,
@@ -512,6 +528,7 @@ async fn run_controller(identity: PathBuf, command: ControllerCommand) -> Result
                 identity,
                 code,
                 controller_code_file,
+                serial,
                 timeout: Duration::from_secs(timeout),
                 method: discovery,
                 flake,

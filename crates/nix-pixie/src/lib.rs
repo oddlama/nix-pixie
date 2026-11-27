@@ -43,6 +43,7 @@ pub mod relay_status;
 pub mod rendezvous;
 pub mod screen;
 pub mod secrets;
+pub mod serial;
 pub mod state;
 pub mod store;
 pub mod system;
