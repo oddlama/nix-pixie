@@ -23,7 +23,7 @@ use nix_pixie_proto::pair::Side;
 use nix_pixie_proto::{ALPN_CTRL, ALPN_RESUME};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::child;
 use crate::control;
@@ -53,6 +53,9 @@ const ROTATION_DELAY: Duration = Duration::from_secs(2);
 /// [`MAX_FAILURES`] guesses per minute: an agent on the internet can be
 /// dialled by anyone, not just by machines on its own network.
 const MAX_ROTATION_DELAY: Duration = Duration::from_secs(60);
+/// How long the agent waits for its port, which the endpoint it closed last
+/// may hold a moment longer.
+const REBIND_WAIT: Duration = Duration::from_secs(10);
 /// How long to listen for other targets' nameplates before picking ours.
 const NAMEPLATE_SURVEY: Duration = Duration::from_secs(2);
 
@@ -171,7 +174,7 @@ async fn listen(
     controller_code: Option<&Code>,
     requests: &mut Requests<'_>,
 ) -> Result<Outcome> {
-    let endpoint = net::bind(shared.secret.clone(), shared.port, relays).await?;
+    let endpoint = bind(shared, relays).await?;
     shared
         .state
         .write("endpoint-id", &endpoint.id().to_string())?;
@@ -211,11 +214,38 @@ async fn listen(
     announcer.withdraw().await;
     if let Some(task) = watching {
         task.abort();
+        // Its clone of the endpoint holds the port until it is gone.
+        let _ = task.await;
     }
     screen::code(None);
     screen::relay(None);
     endpoint.close().await;
     outcome
+}
+
+/// The agent's endpoint, with `relays`. Right after the operator changed
+/// something, the last one may not have let go of the port yet.
+async fn bind(shared: &Shared<'_>, relays: &Relays) -> Result<Endpoint> {
+    let deadline = tokio::time::Instant::now() + REBIND_WAIT;
+    loop {
+        match net::bind(shared.secret.clone(), shared.port, relays).await {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(e) if in_use(&e) && tokio::time::Instant::now() < deadline => {
+                debug!("port {} still in use; trying again", shared.port);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether `error` is that the address is in use.
+fn in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+    })
 }
 
 /// Keeps the relays the operator chose for the rest of the boot, and
