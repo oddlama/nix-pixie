@@ -122,8 +122,8 @@ pkgs.testers.runNixOSTest {
         assert data["size_bytes"] == 2**30, data
         assert data["partition_table"] == "gpt", data
         assert any(c["fstype"] == "ext4" and c["label"] == "old-root" for c in data["contents"]), data
-        assert not data["in_use"], data
-        assert any(d["in_use"] for d in disks.values()), "the root disk is mounted"
+        assert not data["mounts"], data
+        assert any(d["mounts"] for d in disks.values()), "the root disk is mounted"
 
         assert report["machine"] == "web1", report
         assert report["configuration"] == "web1", report
