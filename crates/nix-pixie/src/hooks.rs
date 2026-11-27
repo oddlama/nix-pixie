@@ -323,6 +323,10 @@ pub struct Context {
     /// Where the installed system is mounted on the target (`format` to
     /// `install`).
     pub root: Option<String>,
+    /// Where disko's keys are on the target, in RAM (`format` to `finish`):
+    /// for `target exec` (not `--chroot`, which has the installed system's
+    /// `/tmp` and `/run`), e.g. to enroll another way to unlock.
+    pub disk_keys: Option<Vec<String>>,
     /// What earlier hooks wrote into `$PIXIE_OUT/context.json`, by hook.
     pub outputs: BTreeMap<String, serde_json::Value>,
     /// The install's id (`--id`, or a hook's `$PIXIE_OUT/id`): which of

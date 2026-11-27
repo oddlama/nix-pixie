@@ -118,3 +118,21 @@ fn refuses_disks_that_are_gone_or_in_use_right_now() {
         assert!(err.contains(why), "{device}: {err}");
     }
 }
+
+#[test]
+fn kept_key_files_are_overwritten_and_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("nix-pixie-test-wipe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("secret.key");
+    std::fs::write(&key, b"secretsecret").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o400)).unwrap();
+    // Its contents, seen through another name once it is gone.
+    let other = dir.join("other-name");
+    std::fs::hard_link(&key, &other).unwrap();
+    drop(nix_pixie::disko::KeyFiles::new(vec![key.clone()]));
+    assert!(!key.exists());
+    assert_eq!(std::fs::read(&other).unwrap(), vec![0; 12]);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -725,6 +725,8 @@ struct Session {
     prepared: Option<Vec<DiskAssignment>>,
     /// Set by a successful `Finish`.
     shutdown: Option<Shutdown>,
+    /// The key files disko read, until `Finish` or the session's end.
+    keys: disko::KeyFiles,
     /// Requests answered so far, and the last reply: a controller that
     /// comes back gets it again if it never saw it.
     answered: u64,
@@ -1030,7 +1032,7 @@ async fn answer(
             prepare_disks(state, disks, &labels, &mut session.prepared).await
         }
         ControllerMsg::RunDisko { script, key_files } => {
-            run_disko(state, stream, &script, &key_files, session.prepared.take()).await?
+            run_disko(state, stream, &script, &key_files, session).await?
         }
         ControllerMsg::GenerateHostKey => generate_host_key(state).await,
         ControllerMsg::ProvideHostKey { private } => {
@@ -1063,6 +1065,8 @@ async fn answer(
             input,
         } => exec(stream, &program, &args, root.as_deref(), input).await?,
         ControllerMsg::Finish { root, zpools, then } => {
+            // The install is done: so is what the keys were kept for.
+            session.keys.wipe();
             let reply = finish(&root, &zpools).await;
             if matches!(reply, TargetMsg::Finished { .. }) {
                 session.shutdown = Some(then);
@@ -1281,8 +1285,9 @@ async fn run_disko(
     stream: &mut Stream,
     script: &str,
     key_files: &[KeyFile],
-    prepared: Option<Vec<DiskAssignment>>,
+    session: &mut Session,
 ) -> Result<TargetMsg> {
+    let prepared = session.prepared.take();
     let Some(disks) = prepared else {
         return Ok(TargetMsg::DiskoFailed {
             error: "the disks were not prepared".to_string(),
@@ -1291,8 +1296,9 @@ async fn run_disko(
     screen::say("Formatting...");
     Ok(
         match disko::run(state, stream, script, &disks, key_files).await? {
-            Ok(()) => {
+            Ok(keys) => {
                 screen::say("Formatted and mounted.");
+                session.keys = keys;
                 TargetMsg::DiskoDone
             }
             Err(error) => {

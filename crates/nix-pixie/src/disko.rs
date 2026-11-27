@@ -8,7 +8,7 @@
 //! must still not wipe the installer's own boot medium.
 
 use std::collections::BTreeSet;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
@@ -127,14 +127,16 @@ pub fn link(dir: &Path, role: &str, device: &str) -> Result<()> {
 
 /// Runs the disko `script` for the prepared `disks`, sending its output to the
 /// controller as it comes. The outer `Result` is about the control stream;
-/// the inner one is disko's outcome, as a reason for the operator.
+/// the inner one is disko's outcome, as a reason for the operator. After a
+/// success, the key files it read stay for later hooks, until the returned
+/// [`KeyFiles`] are wiped.
 pub async fn run(
     state: &StateDir,
     stream: &mut Stream,
     script: &str,
     disks: &[DiskAssignment],
     key_files: &[KeyFile],
-) -> Result<Result<(), String>> {
+) -> Result<Result<KeyFiles, String>> {
     if !is_store_path(script) {
         return Ok(Err("not a store path".into()));
     }
@@ -154,18 +156,57 @@ pub async fn run(
     }
 
     let written = match write_key_files(key_files) {
-        Ok(written) => written,
+        Ok(written) => KeyFiles { paths: written },
         Err(reason) => return Ok(Err(reason)),
     };
-    info!(%script, key_files = written.len(), "running disko");
+    info!(%script, key_files = written.paths.len(), "running disko");
     let result = child::run("disko", tokio::process::Command::new(script), stream).await;
-    // Whatever happened: the keys are of no use afterwards.
-    for path in &written {
-        if let Err(e) = std::fs::remove_file(path) {
-            warn!(path = %path.display(), "removing a key file: {e}");
+    // A failed attempt's keys are wiped (dropped) now; the next brings its own.
+    Ok(result?.map(|()| written))
+}
+
+/// The key files disko read, kept on the installer's RAM disks for the
+/// hooks after `install` (to enroll another way to unlock, say), until
+/// wiped: overwritten with zeros and removed, when the target finishes or
+/// the session ends.
+#[derive(Debug, Default)]
+pub struct KeyFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl KeyFiles {
+    /// Keeps these files, written already, until wiped.
+    #[must_use]
+    pub fn new(paths: Vec<PathBuf>) -> Self {
+        Self { paths }
+    }
+
+    /// Overwrites and removes them.
+    pub fn wipe(&mut self) {
+        for path in self.paths.drain(..) {
+            if let Err(e) = wipe(&path) {
+                warn!(path = %path.display(), "wiping a key file: {e:#}");
+            }
         }
     }
-    result
+}
+
+impl Drop for KeyFiles {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+fn wipe(path: &Path) -> Result<()> {
+    let len = std::fs::metadata(path)?.len();
+    // Written 0400; only root writes to that as it is.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    std::io::Write::write_all(&mut file, &vec![0; usize::try_from(len).unwrap_or(0)])?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::remove_file(path)?;
+    Ok(())
 }
 
 /// Directories key files may go into. The installer's `/tmp` and `/run`

@@ -76,4 +76,13 @@ in
     mkdir -p "$PIXIE_OUT/disk-keys/tmp"
     printf secretsecret > "$PIXIE_OUT/disk-keys/tmp/secret.key"
   '';
+  # After install, that key is still there (diskKeys): another passphrase,
+  # added with it, as hooks that enroll a TPM2 token do. Quick to derive.
+  luks-enroll = hook "luks-enroll" ''
+    key=$(${pkgs.jq}/bin/jq -r '.diskKeys[0]' "$PIXIE_CONTEXT")
+    test "$key" = /tmp/secret.key
+    printf enrolled | "$PIXIE" target exec --stdin -- ${pkgs.cryptsetup}/bin/cryptsetup \
+      luksAddKey --key-file "$key" --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+      /dev/disk/by-partlabel/disk-main-root -
+  '';
 }

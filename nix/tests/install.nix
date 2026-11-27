@@ -60,6 +60,16 @@ let
   interval = if live then 600 else 5;
   install = "nix-pixie controller install --code CODE --machine web1 ${diskArgs} --yes --then poweroff --boot-timeout 300 --boot-check-interval ${toString interval}";
   encrypted = spec.passphrase != null;
+  # disko is done; its key stays, in RAM and for root only, for hooks after
+  # `install`, until the target finishes.
+  keysKept =
+    if encrypted then
+      lib.concatStringsSep "; " [
+        "target.succeed(\"test \\\"$(stat -c %a /tmp/secret.key)\\\" = 400\")"
+        "target.succeed(\"findmnt -n -o FSTYPE --target /tmp/secret.key | grep -qx tmpfs\")"
+      ]
+    else
+      "target.fail(\"test -e /tmp/secret.key\")";
   # Passphrases are typed in on a terminal: give it one (`script`), fed from
   # a file with the passphrase twice (it is asked again to confirm). Unless
   # hooks provide them: then there is no terminal at all.
@@ -229,8 +239,7 @@ pkgs.testers.runNixOSTest {
         # The step with where it goes: on a live console, the list shows the
         # step from the start.
         wait_for_output("Send the system.*into /")
-        # disko is done: its keys must be gone.
-        target.fail("test -e /tmp/secret.key")
+        ${keysKept}
         # The target powers off once installed.
         wait_for_output("is powered off")
         target.wait_for_shutdown()

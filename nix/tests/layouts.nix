@@ -97,6 +97,7 @@
       {
         push-key = { command = "push-key"; before = [ "host-key" ]; };
         luks-key = { command = "luks-key"; after = [ "disks" ]; };
+        luks-enroll = { command = "luks-enroll"; after = [ "install" ]; };
       }
     '';
     typed = false;
@@ -109,6 +110,8 @@
       assert installed_key == pushed, installed_key
       source = installed.succeed("findmnt -n -o SOURCE /").strip()
       assert source == "/dev/mapper/cryptroot", source
+      # Added by a hook after install, with the key disko had read.
+      installed.succeed("printf enrolled | cryptsetup open --test-passphrase --key-file=- /dev/vda3")
     '';
   };
 

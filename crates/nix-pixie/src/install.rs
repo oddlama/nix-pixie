@@ -1078,9 +1078,11 @@ async fn apply(link: &Link, peer: &Peer, args: &InstallArgs, plan: Plan) -> Resu
         macs,
     } = plan;
     confirm_erase(&disks, &choices, args.yes, args.wipe).await?;
+    let key_paths: Vec<String> = key_files.iter().map(|k| k.path.clone()).collect();
     format_disks(link, &choices, &disko, &built.disko_script, key_files).await?;
     let root = disko.root_mount_point;
     hooks.context.root = Some(root.clone());
+    hooks.context.disk_keys = (!key_paths.is_empty()).then_some(key_paths);
     hooks_after(&mut hooks, Step::Format, link, None).await?;
     place_files(link, &root, &mut hooks).await?;
 
@@ -1205,6 +1207,7 @@ async fn leave(
         Shutdown::PowerOff => "powering off",
     });
     hooks.context.root = None;
+    hooks.context.disk_keys = None;
     hooks.after(Step::Finish, None).await?;
     no_files_left(hooks, Step::Finish)?;
     let check = Check {

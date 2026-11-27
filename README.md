@@ -550,8 +550,13 @@ packages.disk-key = pkgs.writeShellApplication {
 };
 ```
 
-The keys are sent over the encrypted channel, only ever written to RAM on the
-target and deleted as soon as disko is done. Options that would make disko ask
+The keys are sent over the encrypted channel and only ever written to RAM on
+the target. They stay there for hooks after `install` (listed in
+`$PIXIE_CONTEXT` as `diskKeys`), to enroll another way to unlock, say:
+`"$PIXIE" target exec -- ${pkgs.cryptsetup}/bin/cryptsetup luksAddKey
+--key-file /tmp/secret.key ...` (not `--chroot`, whose `/tmp` is the installed
+system's). When the target finishes, they are overwritten and deleted. Options
+that would make disko ask
 on a terminal (`askPassword`, ZFS `keylocation = "prompt"`) are refused
 before anything is erased, with a hint on what to use instead. For ZFS that is
 to create the dataset with `keylocation = "file:///tmp/secret.key"` and to
