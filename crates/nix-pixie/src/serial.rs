@@ -6,11 +6,14 @@
 //! away and come back (the host enumerates it anew), and drops what is
 //! written while nobody reads at the other end. So the code goes again
 //! until the target answers it.
+//!
+//! The port is ours alone while we use it (`TIOCEXCL`): two readers split
+//! what arrives between them, and each misses what the other got.
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -30,7 +33,7 @@ const PORT_WAIT: Duration = Duration::from_millis(500);
 /// once the target paired, or pairing failed.
 pub fn spawn(port: PathBuf, code: Code) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut waiting = false;
+        let (mut waiting, mut shared) = (false, false);
         loop {
             let attempt = {
                 let port = port.clone();
@@ -41,6 +44,13 @@ pub fn spawn(port: PathBuf, code: Code) -> tokio::task::JoinHandle<()> {
                     let answer = crate::net::sanitise(&answer, 200);
                     info!(port = %port.display(), %answer, "handed the code over the serial port");
                     return;
+                }
+                Ok(Err(e)) if e.is::<Shared>() => {
+                    if !shared {
+                        warn!(port = %port.display(), "{e:#}; waiting for it to be ours alone");
+                        shared = true;
+                    }
+                    tokio::time::sleep(PORT_WAIT).await;
                 }
                 Ok(Err(e)) if !port.exists() => {
                     if !waiting {
@@ -123,6 +133,17 @@ fn open(port: &Path) -> Result<File> {
     )
     .with_context(|| format!("opening {}", port.display()))?;
     let file = File::from(fd);
+    // Nobody opens it after us (but root), then nobody else may have it.
+    termios::ioctl_tiocexcl(file.as_fd())
+        .with_context(|| format!("making {} ours alone", port.display()))?;
+    let others = openers(meta.rdev());
+    if !others.is_empty() {
+        return Err(Shared {
+            port: port.to_path_buf(),
+            others,
+        }
+        .into());
+    }
     let mut settings = termios::tcgetattr(file.as_fd())
         .with_context(|| format!("reading the settings of {}", port.display()))?;
     settings.make_raw();
@@ -130,6 +151,44 @@ fn open(port: &Path) -> Result<File> {
     termios::tcsetattr(file.as_fd(), OptionalActions::Now, &settings)
         .with_context(|| format!("setting up {}", port.display()))?;
     Ok(file)
+}
+
+/// Another process has the port open: it would read some of the answer.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{} is open in {} as well, which would read some of what the target writes",
+    port.display(),
+    others.join(", ")
+)]
+struct Shared {
+    port: PathBuf,
+    others: Vec<String>,
+}
+
+/// Other processes that have the terminal `rdev` open (`pid (name)`), of
+/// those this one may look at: its user's, or all of them as root.
+#[must_use]
+pub fn openers(rdev: u64) -> Vec<String> {
+    let me = std::process::id().to_string();
+    let mut found = Vec::new();
+    for process in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let pid = process.file_name().to_string_lossy().into_owned();
+        if pid == me || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        let has_it = fds.flatten().any(|fd| {
+            std::fs::metadata(fd.path())
+                .is_ok_and(|m| m.file_type().is_char_device() && m.rdev() == rdev)
+        });
+        if has_it {
+            let name = std::fs::read_to_string(process.path().join("comm")).unwrap_or_default();
+            found.push(format!("{pid} ({})", name.trim()));
+        }
+    }
+    found
 }
 
 fn write_all(file: &mut File, mut bytes: &[u8]) -> Result<()> {

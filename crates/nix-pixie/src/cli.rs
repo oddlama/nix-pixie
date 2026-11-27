@@ -177,6 +177,8 @@ pub struct InstallCli {
     /// its status terminal takes `code CODE`, e.g. a USB gadget's
     /// (/dev/serial/by-id/...): the code from --controller-code-file, or
     /// a new one. Together with --target, for devices without a screen.
+    /// The port is ours alone meanwhile: it waits while another process
+    /// has it open.
     #[arg(long, value_name = "PORT", conflicts_with = "code")]
     serial: Option<PathBuf>,
     /// Flake with the `pixie` output and the configurations.
@@ -314,7 +316,8 @@ pub enum ControllerCommand {
         /// its status terminal takes `code CODE`, e.g. a USB gadget's
         /// (/dev/serial/by-id/...): the code from --controller-code-file,
         /// or a new one. Together with --target, for devices without a
-        /// screen.
+        /// screen. The port is ours alone meanwhile: it waits while another
+        /// process has it open.
         #[arg(long, value_name = "PORT", conflicts_with = "code")]
         serial: Option<PathBuf>,
         /// Give up after this many seconds.

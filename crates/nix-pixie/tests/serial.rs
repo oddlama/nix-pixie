@@ -8,7 +8,9 @@
     reason = "tests fail by panicking"
 )]
 
-use nix_pixie::serial::answer;
+use std::os::unix::fs::MetadataExt;
+
+use nix_pixie::serial::{answer, openers};
 
 #[test]
 fn answers_to_code_come_plain_or_as_json() {
@@ -43,4 +45,19 @@ fn everything_else_is_no_answer_to_code() {
         None
     );
     assert_eq!(answer(r#"{"v":1,"event":"status","code":null}"#), None);
+}
+
+#[test]
+fn other_processes_that_have_the_port_open_are_found() {
+    let rdev = std::fs::metadata("/dev/null").unwrap().rdev();
+    let mut holder = std::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::fs::File::open("/dev/null").unwrap())
+        .spawn()
+        .unwrap();
+    let found = openers(rdev);
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    let holder = format!("{} (sleep)", holder.id());
+    assert!(found.contains(&holder), "{holder} not in {found:?}");
 }
