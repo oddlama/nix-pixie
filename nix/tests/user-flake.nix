@@ -185,6 +185,7 @@ let
     cp ${../options.nix} $out/nix-pixie/options.nix
     cp ${../nixos/system.nix} $out/nix-pixie/nixos/system.nix
     cp ${../nixos/disks.nix} $out/nix-pixie/nixos/disks.nix
+    cp ${../nixos/secure-boot.nix} $out/nix-pixie/nixos/secure-boot.nix
     ${lib.optionalString withLanzaboote "cp ${./lanzaboote.nix} $out/nix-pixie/lanzaboote.nix"}
   '';
 in

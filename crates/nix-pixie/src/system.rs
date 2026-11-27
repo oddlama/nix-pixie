@@ -84,6 +84,15 @@ const FACTS: &str = r#"config: {
     hostKeyPath =
       let keys = builtins.filter (k: (k.type or null) == "ed25519") config.services.openssh.hostKeys;
       in if keys == [ ] then null else (builtins.head keys).path;
+    # Whether the SSH server waits for lanzaboote's key preparation, which
+    # reboots (nix-pixie.nixosModules.default sees to that).
+    afterKeyPreparation =
+      let
+        unit =
+          if config.services.openssh.startWhenNeeded
+          then config.systemd.sockets.sshd or { }
+          else config.systemd.services.sshd or { };
+      in builtins.elem "prepare-sb-auto-enroll.service" (unit.after or [ ]);
   };
 }"#;
 
@@ -144,6 +153,9 @@ pub struct Ssh {
     /// The first ed25519 entry of `services.openssh.hostKeys`: where a
     /// pulled host key goes.
     pub host_key_path: Option<String>,
+    /// Whether the SSH server starts only after lanzaboote prepared the
+    /// Secure Boot keys, so not on a first boot that reboots to enroll them.
+    pub after_key_preparation: bool,
 }
 
 /// The configuration's disko setup.

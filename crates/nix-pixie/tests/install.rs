@@ -77,6 +77,7 @@ fn a_rebuild_compares_against_the_disks_as_pinned() {
             enable: true,
             ports: vec![22],
             host_key_path: None,
+            after_key_preparation: false,
         },
     };
     let choices = [Choice {

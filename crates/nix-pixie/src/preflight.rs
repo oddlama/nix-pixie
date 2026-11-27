@@ -4,7 +4,36 @@
 use anyhow::{Result, bail};
 use nix_pixie_proto::inventory::Firmware;
 
-use crate::system::Boot;
+use crate::metadata::BootCheck;
+use crate::system::{Boot, Ssh};
+
+/// Whether checking the installed system by its SSH host key can be fooled:
+/// a first boot that reboots to enroll the Secure Boot keys (lanzaboote's
+/// `autoReboot`) would answer with the key, and the check report it up,
+/// unless the SSH server waits for the keys.
+pub fn check_boot_check(
+    boot: &Boot,
+    ssh: &Ssh,
+    boot_check: BootCheck,
+    configuration: &str,
+) -> Result<()> {
+    if boot.enroll_keys
+        && boot.enroll_reboots
+        && ssh.enable
+        && boot_check == BootCheck::Ssh
+        && !ssh.after_key_preparation
+    {
+        bail!(
+            "nixosConfigurations.{configuration} reboots on its first boot to enroll its Secure \
+             Boot keys (boot.lanzaboote.autoEnrollKeys.autoReboot), and its SSH server may \
+             answer before that: the check after the install would report the machine up \
+             before Secure Boot is. Import nix-pixie.nixosModules.default, which has the SSH \
+             server wait for the keys, or order sshd after prepare-sb-auto-enroll.service \
+             yourself; or check another way (bootCheck = \"hooks\" or \"none\")"
+        );
+    }
+    Ok(())
+}
 
 /// Whether the configuration's boot loader can boot on the target's
 /// firmware, judged by how the target booted the installer.

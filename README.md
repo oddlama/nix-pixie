@@ -565,6 +565,7 @@ the machine make its own keys and enroll them on its first boot, so they never
 leave it:
 
 ```nix
+imports = [ nix-pixie.nixosModules.default ];
 boot.lanzaboote = {
   enable = true;
   pkiBundle = "/var/lib/sbctl";
@@ -587,6 +588,12 @@ because the firmware of some graphics and network cards is signed with them
 (`autoEnrollKeys.includeMicrosoftKeys`). lanzaboote adds no boot entry to the
 firmware: the machine starts whatever its disk boots by default, so that disk
 has to come first in the boot order.
+
+The controller checks the installed system after the reboot that enrolls the
+keys, with Secure Boot on: `nixosModules.default` has the SSH server wait for
+the keys, so the boot that prepares them never answers. Without the module, the
+controller refuses a configuration with `autoReboot` before it erases anything,
+unless it checks the first boot some other way (`bootCheck`).
 
 To bring your own keys instead, for example the same ones for a whole fleet,
 leave out `autoGenerateKeys` and have a hook write them to

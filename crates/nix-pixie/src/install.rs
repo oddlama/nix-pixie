@@ -969,6 +969,12 @@ async fn evaluate(
     }
     let firmware = machine.firmware.apply(&inventory.firmware);
     preflight::check_boot(&facts.boot, &firmware, &machine.configuration)?;
+    preflight::check_boot_check(
+        &facts.boot,
+        &facts.ssh,
+        args.boot_check.unwrap_or(machine.boot_check),
+        &machine.configuration,
+    )?;
     let host_key = host_key_path(pulled, &facts, &machine.configuration)?;
     let disko = facts
         .disko

@@ -92,6 +92,11 @@ let
     "assert len(boots) == 2, boots"
     "# Made on the target, and nowhere else."
     "target.succeed(\"test -s /var/lib/sbctl/keys/db/db.key\")"
+    "# The boot that prepared the keys never answered SSH: the controller"
+    "# saw this one (nix-pixie.nixosModules.default)."
+    "target.succeed(\"journalctl -b -1 -u prepare-sb-auto-enroll | grep -q .\")"
+    "target.fail(\"journalctl -b -1 -u sshd | grep -q 'Server listening'\")"
+    "target.succeed(\"journalctl -b 0 -u sshd | grep -q 'Server listening'\")"
   ]);
   toldAboutKeys = lib.optionalString secureBoot (body [
     "# Told while it waited."
