@@ -77,6 +77,10 @@
             agent = withDefaultPackage ./nix/nixos/agent.nix;
             # Agent plus installer networking: add to any live system.
             installer = withDefaultPackage ./nix/nixos/installer.nix;
+            # The installer as netboot media (kernel and initrd, the system a
+            # squashfs inside), for devices booted over USB or the network.
+            # Build it with the device's platform and kernel.
+            installer-netboot = withDefaultPackage ./nix/nixos/installer-netboot.nix;
           };
         };
 
@@ -133,6 +137,20 @@
               agent = pkgs.callPackage ./nix/agent-package.nix {
                 nix-pixie = config.packages.default;
               };
+
+              # The netboot installer with nixpkgs' kernel: kernel, initrd and
+              # command line. Devices need their own, with their kernel.
+              installer-netboot =
+                (inputs.nixpkgs.lib.nixosSystem {
+                  modules = [
+                    ./nix/nixos/installer-netboot.nix
+                    {
+                      services.nix-pixie-agent.package = config.packages.default;
+                      nixpkgs.hostPlatform = system;
+                      system.stateVersion = lib.trivial.release;
+                    }
+                  ];
+                }).config.system.build.nixPixieNetboot;
 
               # Boot this on the machine to install; it shows a pairing code.
               installer-iso =
