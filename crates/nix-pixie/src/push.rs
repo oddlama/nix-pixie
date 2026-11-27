@@ -7,7 +7,8 @@
 //! target filesystems (`crates/nix-pixie/src/store.rs`). Nothing is staged in
 //! between, and the target never gets to read the controller's store.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -39,13 +40,93 @@ pub struct Copied {
     pub what: String,
 }
 
-/// Whether store streams are compressed (`--no-compression` turns it off).
-static COMPRESS: AtomicBool = AtomicBool::new(true);
+/// When store streams are compressed (`--compression`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Compression {
+    /// By the connection's path, for each stream: not on direct paths to
+    /// nearby addresses (link-local or private ones, and any on one of the
+    /// controller's networks: a USB cable, the LAN), which are faster than
+    /// zstd on many a target's CPU; on relayed paths and to other
+    /// addresses, where the link is the bottleneck.
+    #[default]
+    Auto,
+    /// Always, with zstd.
+    Zstd,
+    /// Never.
+    None,
+}
 
-/// Stops compressing store streams: for links faster than zstd on the
-/// controller's CPU, or contents that don't compress.
-pub fn no_compression() {
-    COMPRESS.store(false, Ordering::Relaxed);
+/// The `--compression` in effect: [`Compression`] as a number.
+static COMPRESSION: AtomicU8 = AtomicU8::new(0);
+
+/// Sets when store streams are compressed, for the rest of the run.
+pub fn set_compression(compression: Compression) {
+    COMPRESSION.store(compression as u8, Ordering::Relaxed);
+}
+
+fn compression() -> Compression {
+    match COMPRESSION.load(Ordering::Relaxed) {
+        1 => Compression::Zstd,
+        2 => Compression::None,
+        _ => Compression::Auto,
+    }
+}
+
+/// Whether a stream over `route` goes compressed under `compression`.
+/// `networks`: the controller's own (an address, its prefix length), whose
+/// hosts are nearby however they are numbered (a LAN with global IPv6).
+#[must_use]
+pub fn compresses(compression: Compression, route: &Route, networks: &[(IpAddr, u8)]) -> bool {
+    match compression {
+        Compression::Zstd => true,
+        Compression::None => false,
+        Compression::Auto => match route {
+            Route::Direct(addr) => !is_nearby(addr.ip().to_canonical(), networks),
+            Route::Relayed(_) | Route::Unknown => true,
+        },
+    }
+}
+
+/// Whether `ip` is on this link, a private network, or one of `networks`.
+fn is_nearby(ip: IpAddr, networks: &[(IpAddr, u8)]) -> bool {
+    let private = match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local() || v6.is_unique_local() || v6.is_loopback(),
+    };
+    private
+        || networks
+            .iter()
+            .any(|&(network, prefix)| same_network(ip, network, prefix))
+}
+
+/// Whether `a` and `b` share their first `prefix` bits. Not for a prefix of
+/// 0, which every address would share.
+fn same_network(a: IpAddr, b: IpAddr, prefix: u8) -> bool {
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) if (1..=32).contains(&prefix) => {
+            let mask = u32::MAX << (32 - u32::from(prefix));
+            u32::from(a) & mask == u32::from(b) & mask
+        }
+        (IpAddr::V6(a), IpAddr::V6(b)) if (1..=128).contains(&prefix) => {
+            let mask = u128::MAX << (128 - u32::from(prefix));
+            u128::from(a) & mask == u128::from(b) & mask
+        }
+        _ => false,
+    }
+}
+
+/// This machine's networks: an address of each interface but loopback, and
+/// its prefix length.
+fn own_networks() -> Vec<(IpAddr, u8)> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| !interface.is_loopback())
+        .map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(v4) => (IpAddr::V4(v4.ip), v4.prefixlen),
+            if_addrs::IfAddr::V6(v6) => (IpAddr::V6(v6.ip), v6.prefixlen),
+        })
+        .collect()
 }
 
 /// Fails unless every path is valid in the local store, so a typo surfaces
@@ -159,16 +240,25 @@ async fn copy(conn: &Connection, request: &StreamRequest, paths: &[String]) -> R
 /// Connects every client of the local socket to a new stream of the kind
 /// `request` names.
 async fn forward(listener: UnixListener, conn: Connection, request: StreamRequest) {
-    let zstd = COMPRESS.load(Ordering::Relaxed);
-    let request = if zstd {
-        StreamRequest::Zstd(Box::new(request))
-    } else {
-        request
-    };
+    let route = net::route(&conn);
+    let networks = own_networks();
+    let zstd = compresses(compression(), &route, &networks);
+    info!(
+        compressed = zstd,
+        route = %route,
+        "copying to the target{}",
+        if zstd { " compressed (zstd)" } else { "" }
+    );
     let mut tasks = JoinSet::new();
     while let Ok((mut local, _)) = listener.accept().await {
         let conn = conn.clone();
-        let request = request.clone();
+        // By the path now: a relayed one may have become direct.
+        let zstd = compresses(compression(), &net::route(&conn), &networks);
+        let request = if zstd {
+            StreamRequest::Zstd(Box::new(request.clone()))
+        } else {
+            request.clone()
+        };
         tasks.spawn(async move {
             let result = async {
                 let (mut send, recv) = conn.open_bi().await?;

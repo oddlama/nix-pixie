@@ -57,6 +57,11 @@ pub enum Command {
         /// needs is in the local store already.
         #[arg(long, global = true)]
         offline: bool,
+        /// When what goes to the target is compressed (zstd): by its path
+        /// (not over a cable or the LAN, which tend to be faster than the
+        /// target's CPU; through relays and the internet), always, or never.
+        #[arg(long, global = true, value_enum, default_value_t)]
+        compression: crate::push::Compression,
         #[command(subcommand)]
         command: Box<ControllerCommand>,
     },
@@ -190,10 +195,6 @@ pub struct InstallCli {
     /// hooks. A hook can give it instead, in `$PIXIE_OUT/id`.
     #[arg(long)]
     id: Option<String>,
-    /// Don't compress what goes to the target: for links faster than
-    /// zstd on this machine, or contents that don't compress.
-    #[arg(long)]
-    no_compression: bool,
     /// How to check that the installed system came up, instead of the
     /// machine's bootCheck: ask its SSH server, leave it to the hooks
     /// after `boot`, or not at all.
@@ -249,7 +250,6 @@ impl InstallCli {
             controller_code_file,
             serial,
             id,
-            no_compression,
             boot_check,
             flake,
             machine,
@@ -264,9 +264,6 @@ impl InstallCli {
             targets,
             relay,
         } = self;
-        if no_compression {
-            crate::push::no_compression();
-        }
         Ok(install::InstallArgs {
             identity,
             code,
@@ -391,8 +388,10 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             identity,
             events,
             offline,
+            compression,
             command,
         } => {
+            crate::push::set_compression(compression);
             if let Some(path) = &events {
                 events::open(path)?;
             }

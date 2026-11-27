@@ -100,7 +100,9 @@ pkgs.testers.runNixOSTest {
 
       with subtest("a closure bigger than the agent's memory lands on the target's disk"):
           current = code()
-          report = json.loads(pair(current, "--push ${blob} --push ${hello}"))
+          # Compressed, which a LAN isn't by default: zstd at its worst
+          # (the blob doesn't compress) under the memory cap too.
+          report = json.loads(pair(current, "--compression zstd --push ${blob} --push ${hello}"))
           push = report["push"]
           assert push["root"] == "/mnt" and push["fstype"] == "ext4", push
           print(f"pushed in {push['seconds']:.1f} s")

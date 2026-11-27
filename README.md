@@ -713,7 +713,9 @@ discovery. For programs that drive the controller:
   after `boot`, for devices that report on a serial port rather than over
   SSH; a hook can hand over the host key it saw in `$PIXIE_OUT/seen-host-key`.
 
-Closures travel compressed (zstd; `--no-compression` turns it off).
+Closures travel compressed (zstd) through relays and over the internet, but
+not over a cable or the LAN, where the target's CPU tends to be slower than the
+link: `--compression zstd` or `none` decides otherwise.
 
 ### Many devices, one configuration
 

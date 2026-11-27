@@ -157,7 +157,7 @@ pkgs.testers.runNixOSTest {
         failures, deletions = failed_activations(), link_local_deletions()
         status, _ = laptop.execute(
             f"su - alice -c 'cd repo && nix-pixie controller install --code {code} --machine web1"
-            " --disk main=vdb --yes --then stay --timeout 90 --no-compression"
+            " --disk main=vdb --yes --then stay --timeout 90 --compression none"
             " >/tmp/install.json 2>/tmp/install.err'"
         )
         print(laptop.succeed("cat /tmp/install.err"))
