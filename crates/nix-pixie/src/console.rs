@@ -189,7 +189,7 @@ async fn command(state_dir: &Path, line: &str) -> String {
                 Err(e) => format!("{e:#}"),
             }
         }
-        Some((first, _)) => format!("{first}: no such command (help lists them)"),
+        Some(_) => "no such command (help lists them)".into(),
     }
 }
 
@@ -313,7 +313,8 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
                     view.notice = Some(format!("> {line}: ..."));
                     draw(&view)?;
                     let answer = command(&state_dir, &line).await;
-                    view.notice = (!answer.is_empty()).then_some(answer);
+                    let word = line.split_whitespace().next().unwrap_or_default();
+                    view.notice = (!answer.is_empty()).then(|| format!("{word}: {answer}"));
                 }
             }
         }
@@ -336,25 +337,48 @@ fn draw(view: &View) -> Result<()> {
 /// How [`run_lines`] writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lines {
-    /// For people: `code …`, `relay …`, the messages, and answers after `>`.
+    /// For people: `code …`, `relay …`, the messages, and answers as
+    /// `> COMMAND: …`.
     Plain,
     /// One JSON object per line, for programs: `{"v":1,"event":…}` with
     /// `status` (`code`, `command`, `relay`), `message` (`text`) and
-    /// `answer` (`text`) events.
+    /// `answer` (`command`, `text`) events.
     Json,
+}
+
+/// How many written lines [`run_lines`] remembers, to know them when they
+/// come back.
+const REMEMBERED: usize = 64;
+/// How often [`run_lines`] writes everything again, at most.
+const REPLAY_PAUSE: Duration = Duration::from_secs(1);
+
+/// Whether a line read by [`run_lines`] is no command but what it wrote,
+/// come back: the other end echoes (a serial port opened without turning
+/// that off, which takes a moment even for those who do), or a terminal
+/// answers the escape sequences the service manager wrote. Answering it
+/// would only send more back.
+#[must_use]
+pub fn is_echo(line: &str, written: &std::collections::VecDeque<String>) -> bool {
+    line.contains('\x1b') || written.iter().any(|w| w == line)
 }
 
 /// The console for a line-based terminal, e.g. a serial port a program
 /// reads: no screen to redraw, just what changes, a line each. Commands
-/// come in as lines. Runs until stdin ends.
+/// come in as lines; an empty one (or `status`) has everything written
+/// again, for whoever just opened the port: a USB gadget's drops what
+/// nobody read. Runs until stdin, a terminal, hangs up (when the USB host
+/// goes away, say), for the service manager to open it again; or forever,
+/// if stdin is no terminal and ends.
 pub async fn run_lines(state_dir: PathBuf, format: Lines) -> Result<()> {
     use tokio::io::AsyncBufReadExt;
+    let terminal = termios::isatty(std::io::stdin());
     // A program on the other end doesn't want its commands echoed back.
     let _quiet = (format == Lines::Json).then(Quiet::enter).transpose()?;
     let mut input = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut out = Out::new(format);
     let mut watching: Option<Watching> = None;
     let mut seen: Option<Status> = None;
+    let mut replayed: Option<std::time::Instant> = None;
     let mut open = true;
     loop {
         if watching.is_none() {
@@ -376,12 +400,28 @@ pub async fn run_lines(state_dir: PathBuf, format: Lines) -> Result<()> {
                 Err(_) => watching = None,
             },
             line = input.next_line(), if open => match line {
-                Ok(Some(line)) => {
-                    let answer = command(&state_dir, line.trim()).await;
-                    if !answer.is_empty() {
-                        out.answer(&answer)?;
+                Ok(Some(line)) if is_echo(line.trim(), &out.written) => {}
+                // CR LF is two empty lines to a terminal that turns CR into
+                // LF: one is enough.
+                Ok(Some(line)) if matches!(line.trim(), "" | "status") => {
+                    if replayed.is_none_or(|at| at.elapsed() >= REPLAY_PAUSE) {
+                        replayed = Some(std::time::Instant::now());
+                        match &seen {
+                            Some(status) => out.changes(None, status)?,
+                            None => out.answer("status", "the agent isn't running (yet)")?,
+                        }
                     }
                 }
+                Ok(Some(line)) => {
+                    let line = line.trim();
+                    let answer = command(&state_dir, line).await;
+                    if !answer.is_empty() {
+                        let word = line.split_whitespace().next().unwrap_or_default();
+                        out.answer(word, &answer)?;
+                    }
+                }
+                // A terminal that hung up stays so.
+                Ok(None) | Err(_) if terminal => return Ok(()),
                 // Without input, it still reports.
                 Ok(None) | Err(_) => open = false,
             },
@@ -389,17 +429,25 @@ pub async fn run_lines(state_dir: PathBuf, format: Lines) -> Result<()> {
     }
 }
 
-/// Writes [`run_lines`]' lines.
+/// Writes [`run_lines`]' lines, and remembers the last of them.
 struct Out {
     format: Lines,
+    written: std::collections::VecDeque<String>,
 }
 
 impl Out {
     fn new(format: Lines) -> Self {
-        Self { format }
+        Self {
+            format,
+            written: std::collections::VecDeque::with_capacity(REMEMBERED),
+        }
     }
 
-    fn line(text: &str) -> Result<()> {
+    fn line(&mut self, text: &str) -> Result<()> {
+        if self.written.len() == REMEMBERED {
+            self.written.pop_front();
+        }
+        self.written.push_back(text.trim().to_string());
         let mut out = std::io::stdout().lock();
         // A serial line wants CR LF.
         out.write_all(text.as_bytes())
@@ -408,12 +456,12 @@ impl Out {
             .context("writing to the console")
     }
 
-    fn json(event: &str, mut fields: serde_json::Value) -> Result<()> {
+    fn json(&mut self, event: &str, mut fields: serde_json::Value) -> Result<()> {
         if let Some(object) = fields.as_object_mut() {
             object.insert("v".into(), 1.into());
             object.insert("event".into(), event.into());
         }
-        Self::line(&fields.to_string())
+        self.line(&fields.to_string())
     }
 
     /// What changed from `before` to `now`.
@@ -421,7 +469,7 @@ impl Out {
         let code_changed = before.is_none_or(|b| b.code != now.code);
         let relay_changed = before.is_none_or(|b| b.relay != now.relay);
         match self.format {
-            Lines::Json if code_changed || relay_changed => Self::json(
+            Lines::Json if code_changed || relay_changed => self.json(
                 "status",
                 serde_json::json!({
                     "code": now.code.as_ref().map(|c| &c.code),
@@ -434,13 +482,13 @@ impl Out {
                 if code_changed {
                     match &now.code {
                         Some(shown) => {
-                            Self::line(&format!("code {}: {}", shown.code, shown.command))?;
+                            self.line(&format!("code {}: {}", shown.code, shown.command))?;
                         }
-                        None => Self::line("code none")?,
+                        None => self.line("code none")?,
                     }
                 }
                 if relay_changed && let Some(relay) = &now.relay {
-                    Self::line(relay)?;
+                    self.line(relay)?;
                 }
             }
         }
@@ -455,17 +503,21 @@ impl Out {
         let first = now.messages.len().saturating_sub(new);
         for text in now.messages.get(first..).unwrap_or_default() {
             match self.format {
-                Lines::Json => Self::json("message", serde_json::json!({ "text": text }))?,
-                Lines::Plain => Self::line(text)?,
+                Lines::Json => self.json("message", serde_json::json!({ "text": text }))?,
+                Lines::Plain => self.line(text)?,
             }
         }
         Ok(())
     }
 
-    fn answer(&mut self, text: &str) -> Result<()> {
+    /// The answer to `command` (its first word).
+    fn answer(&mut self, command: &str, text: &str) -> Result<()> {
         match self.format {
-            Lines::Json => Self::json("answer", serde_json::json!({ "text": text })),
-            Lines::Plain => Self::line(&format!("> {text}")),
+            Lines::Json => self.json(
+                "answer",
+                serde_json::json!({ "command": command, "text": text }),
+            ),
+            Lines::Plain => self.line(&format!("> {command}: {text}")),
         }
     }
 }

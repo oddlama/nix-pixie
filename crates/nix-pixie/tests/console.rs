@@ -7,7 +7,9 @@
     reason = "tests fail by panicking"
 )]
 
-use nix_pixie::console::{View, render, wrap};
+use std::collections::VecDeque;
+
+use nix_pixie::console::{View, is_echo, render, wrap};
 use nix_pixie::screen::{Shown, Status};
 
 /// The screen's lines without escape sequences.
@@ -97,4 +99,28 @@ fn long_lines_wrap_at_spaces_and_long_words_are_cut() {
         wrap("\x1b[1mbold\x1b[0m word", 9),
         ["\x1b[1mbold\x1b[0m word"]
     );
+}
+
+#[test]
+fn what_comes_back_from_the_other_end_is_no_command() {
+    let written: VecDeque<String> = [
+        "code 482913-acid-acorn-acre: nix-pixie controller pair --code 482913-acid-acorn-acre",
+        "> code: waiting for the controller with that code",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert!(is_echo(
+        "code 482913-acid-acorn-acre: nix-pixie controller pair --code 482913-acid-acorn-acre",
+        &written
+    ));
+    assert!(is_echo(
+        "> code: waiting for the controller with that code",
+        &written
+    ));
+    // Escape sequences the service manager wrote, answered or echoed.
+    assert!(is_echo("\x1b[!p\x1b]104\x1b\\code ash-bat-cow", &written));
+    assert!(!is_echo("code ash-bat-cow", &written));
+    assert!(!is_echo("relay off", &written));
+    assert!(!is_echo("", &written));
 }
