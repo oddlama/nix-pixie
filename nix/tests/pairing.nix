@@ -123,6 +123,17 @@ pkgs.testers.runNixOSTest {
         pair(code)
         code = next_code(code)
 
+    with subtest("a target whose clock is days off gets the controller's, real-time clock too"):
+        target.succeed("date -s @$(( $(date +%s) - 3 * 86400 ))")
+        pair(code)
+        code = next_code(code)
+        target.succeed("journalctl -u nix-pixie-agent | grep -q 'The clock was 3 days behind'")
+        target.fail("journalctl -u nix-pixie-agent | grep -q 'setting the real-time clock'")
+        off = abs(int(target.succeed("date +%s")) - int(controller.succeed("date +%s")))
+        assert off <= 5, f"the clocks are {off} s apart"
+        rtc = abs(int(target.succeed("date -d \"$(hwclock --get)\" +%s")) - int(target.succeed("date +%s")))
+        assert rtc <= 5, f"the real-time clock is {rtc} s off"
+
     with subtest("without --code the controller asks for it, completing words with Tab"):
         words = [w.strip() for w in open("${../../crates/nix-pixie-proto/src/wordlist.txt}") if w.strip() and not w.startswith("#")]
 

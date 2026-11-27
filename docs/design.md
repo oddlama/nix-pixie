@@ -46,7 +46,7 @@ we build on them.
 | USB gadget (`nix-pixie.usbGadget`: NCM with `fe80::2`, ACM for the status), added to a vendor's gadget if there is one | done on `dummy_hcd`; not yet on a board, nor into a vendor's gadget | `checks.vm-netboot` (the host's side in the same machine) |
 | A controller's code at the console, as `nix-pixie code`, or from a credential; `--serial` to hand it over | done; the credential only by unit tests | `checks.vm-netboot` (a controller started before the device is plugged in), unit tests |
 | Status terminals: replay on an empty line, echoes ignored, reopened after a hang-up | done | `checks.vm-netboot`, unit tests |
-| The target's clock set from the controller's | implemented | — |
+| The target's clock set from the controller's | done | `checks.vm-pairing` (3 days behind, the real-time clock too); by hand, a whole install through a relay after a 10 min step |
 | Link-local `--target` and reconnects following an interface's new index | the first done, reconnects implemented | `checks.vm-netboot` (an interface that shows up late, under a new index), unit tests |
 
 ## Goal
