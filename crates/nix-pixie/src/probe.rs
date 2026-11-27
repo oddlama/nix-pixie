@@ -41,6 +41,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
+use crate::discovery::Targets;
+
 /// Path to `ip`; the Nix build pins it to iproute2 from the store.
 const IP: &str = match option_env!("NIX_PIXIE_IP") {
     Some(path) => path,
@@ -189,23 +191,23 @@ impl Prober {
 
     /// Probes only `targets`, by unicast, every `interval`: for targets on
     /// other networks (e.g. a server on the internet), where broadcasts and
-    /// the neighbour table can't reach.
+    /// the neighbour table can't reach, and on links of their own.
     pub fn spawn_targeted(
         &self,
-        targets: Vec<SocketAddr>,
+        targets: Targets,
         interval: Duration,
-        report: &watch::Sender<RoundReport>,
+        report: watch::Sender<RoundReport>,
     ) -> tokio::task::JoinHandle<()> {
-        report.send_replace(RoundReport {
-            interfaces: targets.iter().map(ToString::to_string).collect(),
-            neighbours_ok: true,
-        });
         let (v4, v6, probe) = (self.v4.clone(), self.v6.clone(), encode_probe(&self.nonce));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
-                for &to in &targets {
+                report.send_replace(RoundReport {
+                    interfaces: targets.describe(),
+                    neighbours_ok: true,
+                });
+                for to in targets.now() {
                     match (to, &v6) {
                         (SocketAddr::V6(_), Some(v6)) => send(v6, to, &probe).await,
                         (SocketAddr::V6(_), None) => {}

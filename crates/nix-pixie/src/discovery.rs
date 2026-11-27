@@ -1,10 +1,10 @@
 //! Finding targets from the controller: DNS-SD, probes and the relay
 //! rendezvous, merged.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
-use std::net::{IpAddr, SocketAddr, SocketAddrV6};
-use std::path::Path;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -69,14 +69,14 @@ pub struct Discovery {
     /// News that arrived while [`Self::settle`] waited for another peer.
     pending: VecDeque<Peer>,
     /// Probing only these, not the local network.
-    targets: Vec<SocketAddr>,
+    targets: Targets,
     pub stats: Stats,
 }
 
 impl Discovery {
     /// Searches the local network with `method`, or with `targets`, probes
     /// only those addresses instead (see [`resolve_targets`]).
-    pub async fn start(method: Method, targets: Vec<SocketAddr>) -> Result<Self> {
+    pub async fn start(method: Method, targets: Targets) -> Result<Self> {
         let local = targets.is_empty();
         let mdns = match method {
             Method::Both | Method::Mdns if local => {
@@ -92,7 +92,7 @@ impl Discovery {
             let task = if local {
                 prober.spawn_rounds(PROBE_INTERVAL, tx)
             } else {
-                prober.spawn_targeted(targets.clone(), PROBE_INTERVAL, &tx)
+                prober.spawn_targeted(targets.clone(), PROBE_INTERVAL, tx)
             };
             Some((prober, task, rx))
         } else {
@@ -207,7 +207,7 @@ impl Discovery {
     /// Where we looked, for "nothing found" errors.
     pub fn describe(&self) -> String {
         if !self.targets.is_empty() {
-            let targets: Vec<String> = self.targets.iter().map(ToString::to_string).collect();
+            let targets = self.targets.describe();
             return format!(
                 "probed {}: {} reply(s). Is the agent running there, and does its firewall (and \
                  any in between) let UDP {} and {PROBE_PORT} in",
@@ -315,35 +315,109 @@ async fn recv_rendezvous(search: Option<&mut Search>) -> (Announcement, BTreeSet
     }
 }
 
+/// Where network interfaces are listed, by name, with their index.
+pub const SYS_NET: &str = "/sys/class/net";
+
+/// The hosts given with `--target`, as addresses to probe. A link-local
+/// one's interface is looked up again for every probe: a USB link that
+/// drops comes back as a new interface with a new index, and it may not be
+/// there yet when the controller starts (the device is still booting).
+#[derive(Debug, Clone, Default)]
+pub struct Targets {
+    fixed: Vec<SocketAddr>,
+    /// Link-local addresses, with the name of their interface.
+    scoped: Vec<(Ipv6Addr, String)>,
+    sys_net: PathBuf,
+}
+
+impl Targets {
+    pub fn is_empty(&self) -> bool {
+        self.fixed.is_empty() && self.scoped.is_empty()
+    }
+
+    /// Where to probe now. Interfaces that aren't there are left out.
+    #[must_use]
+    pub fn now(&self) -> Vec<SocketAddr> {
+        let mut addrs = self.fixed.clone();
+        for (ip, interface) in &self.scoped {
+            if let Ok(scope) = interface_index(interface, &self.sys_net) {
+                addrs.push(SocketAddr::V6(SocketAddrV6::new(*ip, PROBE_PORT, 0, scope)));
+            }
+        }
+        addrs
+    }
+
+    /// The targets as given, for messages, saying which interface isn't
+    /// there.
+    #[must_use]
+    pub fn describe(&self) -> Vec<String> {
+        let fixed = self.fixed.iter().map(ToString::to_string);
+        let scoped = self.scoped.iter().map(|(ip, interface)| {
+            if interface_index(interface, &self.sys_net).is_ok() {
+                format!("{ip}%{interface}")
+            } else {
+                format!("{ip}%{interface} (no interface {interface} yet)")
+            }
+        });
+        fixed.chain(scoped).collect()
+    }
+}
+
 /// The probe addresses of `hosts` (`--target`): IP addresses, or names to
 /// look up.
-pub async fn resolve_targets(hosts: &[String]) -> Result<Vec<SocketAddr>> {
-    let mut targets = Vec::new();
+pub async fn resolve_targets(hosts: &[String]) -> Result<Targets> {
+    resolve_targets_in(hosts, Path::new(SYS_NET)).await
+}
+
+/// [`resolve_targets`], with interfaces under `sys_net`.
+pub async fn resolve_targets_in(hosts: &[String], sys_net: &Path) -> Result<Targets> {
+    let mut targets = Targets {
+        sys_net: sys_net.to_path_buf(),
+        ..Targets::default()
+    };
     for host in hosts {
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        if let Some(addr) = literal(bare, Path::new("/sys/class/net"))? {
-            targets.push(addr);
-            continue;
+        match literal(bare, sys_net)? {
+            Some(Literal::Addr(addr)) => targets.fixed.push(addr),
+            Some(Literal::LinkLocal(ip, interface)) => {
+                if interface_index(&interface, sys_net).is_err() {
+                    info!(%interface, "no interface {interface} yet; probing {bare} once it is there");
+                }
+                if !targets.scoped.contains(&(ip, interface.clone())) {
+                    targets.scoped.push((ip, interface));
+                }
+            }
+            None => {
+                let found: Vec<SocketAddr> = tokio::net::lookup_host((bare, PROBE_PORT))
+                    .await
+                    .with_context(|| format!("looking up {host}"))?
+                    .collect();
+                if found.is_empty() {
+                    bail!("{host} has no addresses");
+                }
+                targets.fixed.extend(found);
+            }
         }
-        let found: Vec<SocketAddr> = tokio::net::lookup_host((bare, PROBE_PORT))
-            .await
-            .with_context(|| format!("looking up {host}"))?
-            .collect();
-        if found.is_empty() {
-            bail!("{host} has no addresses");
-        }
-        targets.extend(found);
     }
-    targets.sort_unstable();
-    targets.dedup();
+    targets.fixed.sort_unstable();
+    targets.fixed.dedup();
     Ok(targets)
 }
 
-/// The probe address of `host` if it is an IP address. An IPv6 link-local
-/// one needs its interface, by name or index (`fe80::2%usb0`): the same
-/// address can be on every link. Interfaces are looked up under `sys_net`
-/// (`/sys/class/net`), where they show up before they have addresses.
-pub fn literal(host: &str, sys_net: &Path) -> Result<Option<SocketAddr>> {
+/// An IP address given as a target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Literal {
+    /// Its probe address.
+    Addr(SocketAddr),
+    /// A link-local address on the interface of this name.
+    LinkLocal(Ipv6Addr, String),
+}
+
+/// `host`, if it is an IP address. An IPv6 link-local one needs its
+/// interface, by name or index (`fe80::2%usb0`): the same address can be on
+/// every link. An index is looked up under `sys_net` (`/sys/class/net`),
+/// where interfaces show up before they have addresses.
+pub fn literal(host: &str, sys_net: &Path) -> Result<Option<Literal>> {
     let (ip, zone) = match host.split_once('%') {
         Some((ip, zone)) => (ip, Some(zone)),
         None => (host, None),
@@ -355,7 +429,7 @@ pub fn literal(host: &str, sys_net: &Path) -> Result<Option<SocketAddr>> {
         if zone.is_some() {
             bail!("{host}: only IPv6 link-local addresses take an interface");
         }
-        return Ok(Some(SocketAddr::new(ip, PROBE_PORT)));
+        return Ok(Some(Literal::Addr(SocketAddr::new(ip, PROBE_PORT))));
     };
     let scope = match zone {
         None if v6.is_unicast_link_local() => bail!(
@@ -363,11 +437,29 @@ pub fn literal(host: &str, sys_net: &Path) -> Result<Option<SocketAddr>> {
              target is on, e.g. {host}%eth0"
         ),
         None => 0,
+        Some(zone) if zone.parse::<u32>().is_err() => {
+            if !is_interface_name(zone) {
+                bail!("--target {host}: {zone:?} is no interface's name");
+            }
+            return Ok(Some(Literal::LinkLocal(v6, zone.to_string())));
+        }
         Some(zone) => interface_index(zone, sys_net).with_context(|| format!("--target {host}"))?,
     };
-    Ok(Some(SocketAddr::V6(SocketAddrV6::new(
+    Ok(Some(Literal::Addr(SocketAddr::V6(SocketAddrV6::new(
         v6, PROBE_PORT, 0, scope,
-    ))))
+    )))))
+}
+
+/// Whether `name` can be a network interface's (and a file's, under
+/// `/sys/class/net`).
+fn is_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@'))
 }
 
 /// The index of the network interface `zone` (a name, or already an index).
@@ -375,12 +467,9 @@ fn interface_index(zone: &str, sys_net: &Path) -> Result<u32> {
     if let Ok(index) = zone.parse::<u32>() {
         return Ok(index);
     }
-    let plain = !zone.is_empty()
-        && zone.len() <= 15
-        && zone
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@'));
-    if plain && let Ok(text) = std::fs::read_to_string(sys_net.join(zone).join("ifindex")) {
+    if is_interface_name(zone)
+        && let Ok(text) = std::fs::read_to_string(sys_net.join(zone).join("ifindex"))
+    {
         return text
             .trim()
             .parse()
@@ -399,7 +488,61 @@ fn interface_index(zone: &str, sys_net: &Path) -> Result<u32> {
     )
 }
 
-/// Addresses worth dialing or probing./// Addresses worth dialing or probing.
+/// The names of the interfaces that `addrs`' link-local addresses are on,
+/// by index under `sys_net`: to find them again under a new index (see
+/// [`rescoped`]).
+#[must_use]
+pub fn interface_names(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    sys_net: &Path,
+) -> BTreeMap<u32, String> {
+    let scopes: BTreeSet<u32> = addrs
+        .into_iter()
+        .filter_map(|addr| match addr {
+            SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() && v6.scope_id() != 0 => {
+                Some(v6.scope_id())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut names = BTreeMap::new();
+    if scopes.is_empty() {
+        return names;
+    }
+    for entry in std::fs::read_dir(sys_net).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Ok(index) = interface_index(&name, sys_net)
+            && scopes.contains(&index)
+        {
+            names.insert(index, name);
+        }
+    }
+    names
+}
+
+/// `addrs`' link-local addresses again, on interfaces of `names` that are
+/// back under another index: a USB link the host enumerated anew.
+#[must_use]
+pub fn rescoped(
+    addrs: &[SocketAddr],
+    names: &BTreeMap<u32, String>,
+    sys_net: &Path,
+) -> Vec<SocketAddr> {
+    addrs
+        .iter()
+        .filter_map(|addr| {
+            let SocketAddr::V6(v6) = addr else {
+                return None;
+            };
+            let name = names.get(&v6.scope_id())?;
+            let now = interface_index(name, sys_net).ok()?;
+            (now != v6.scope_id())
+                .then(|| SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, now)))
+        })
+        .collect()
+}
+
+/// Addresses worth dialing or probing.
 pub fn is_usable(ip: IpAddr) -> bool {
     !(ip.is_loopback()
         || ip.is_unspecified()

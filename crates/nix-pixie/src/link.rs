@@ -8,12 +8,14 @@
 //! busy building. A request is never carried out twice, and one that never
 //! arrived is sent again.
 
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use iroh::endpoint::{Connection, ConnectionError, VarInt};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use nix_pixie_proto::ALPN_RESUME;
 use nix_pixie_proto::ctrl::{ControllerMsg, MAX_FACTER_FRAME, MAX_TARGET_FRAME, TargetMsg};
 use nix_pixie_proto::frame::{read_frame, write_frame};
@@ -22,7 +24,7 @@ use tokio::sync::{Mutex, MutexGuard, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::discovery::Peer;
+use crate::discovery::{self, Peer};
 use crate::net::{self, Stream, sanitise};
 
 /// How long the controller tries to get a lost connection back. The
@@ -44,6 +46,9 @@ struct Shared {
     endpoint: Endpoint,
     /// Where the target was found, to dial again.
     peer: Peer,
+    /// The interfaces its link-local addresses are on, by index when it
+    /// paired: to find them again if one comes back under a new index.
+    interfaces: BTreeMap<u32, String>,
     state: Mutex<State>,
     /// The connection in use, without waiting for a request to finish.
     current: watch::Sender<Connection>,
@@ -85,6 +90,10 @@ impl Link {
         let shared = Arc::new(Shared {
             endpoint: endpoint.clone(),
             peer: peer.clone(),
+            interfaces: discovery::interface_names(
+                peer.addrs.iter().copied(),
+                Path::new(discovery::SYS_NET),
+            ),
             current: watch::Sender::new(conn.clone()),
             state: Mutex::new(State {
                 conn,
@@ -317,6 +326,19 @@ impl Shared {
             if !routes.contains(path.remote_addr()) {
                 routes.push(path.remote_addr().clone());
             }
+        }
+        // A USB link the host enumerated anew is a new interface, with a new
+        // index: its link-local addresses are only reachable under that.
+        let ips: Vec<_> = routes
+            .iter()
+            .filter_map(|route| match route {
+                TransportAddr::Ip(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        for addr in discovery::rescoped(&ips, &self.interfaces, Path::new(discovery::SYS_NET)) {
+            debug!(%addr, "the interface came back under another index");
+            routes.push(TransportAddr::Ip(addr));
         }
         let addr = EndpointAddr::from_parts(self.peer.id, routes);
         let conn = tokio::time::timeout(
