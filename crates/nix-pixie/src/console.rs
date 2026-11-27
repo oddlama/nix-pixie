@@ -1,7 +1,7 @@
 //! The installer's tty1 (`nix-pixie console`): the agent's code and how to
 //! pair with it, its relay and its messages, and a prompt for commands such
-//! as `relay URL`. It talks to the agent over its control socket (see
-//! [`crate::control`]), so either can restart without the other.
+//! as `relay URL` and `code CODE`. It talks to the agent over its control
+//! socket (see [`crate::control`]), so either can restart without the other.
 //!
 //! The installer redirects kernel messages to tty12, so nothing scribbles
 //! over the screen, and keeps a shell on tty2.
@@ -20,10 +20,12 @@ use crate::screen::Status;
 
 /// What the operator is told about the other ttys and the commands.
 pub const HINT: &str = "Alt+F2: a shell (tty2). Kernel messages: tty12. Commands: relay URL, relay off, \
-     relay default, help.";
+     relay default, code CODE, help.";
 const HELP: &str = "relay URL...: use your own relays (e.g. an iroh-relay) · relay n0: n0's \
                     public relays · relay off: none, only this network · relay default: as the \
-                    agent was started · the agent then shows a new code";
+                    agent was started · the agent then shows a new code · code CODE: wait for \
+                    the controller with this code (three words) instead · code default: as the \
+                    agent was started";
 
 /// What the console shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -183,6 +185,19 @@ async fn command(state_dir: &Path, line: &str) -> String {
             let result = match Setting::parse(rest) {
                 Ok(setting) => control::set_relays(state_dir, setting).await,
                 Err(e) => Err(e),
+            };
+            match result {
+                Ok(done) => done,
+                Err(e) => format!("{e:#}"),
+            }
+        }
+        Some((first, rest)) if first == "code" => {
+            let result = match rest {
+                [word] if word == "default" => control::set_code(state_dir, None).await,
+                [code] => control::set_code(state_dir, Some(code.clone())).await,
+                _ => Err(anyhow::anyhow!(
+                    "which code? The controller's (three words), or `default`"
+                )),
             };
             match result {
                 Ok(done) => done,

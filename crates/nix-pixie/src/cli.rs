@@ -74,10 +74,18 @@ pub enum Command {
         /// `--target`: relays aren't used.
         #[arg(long, value_name = "CODE")]
         controller_code: Option<String>,
-        /// Like --controller-code, from a file, e.g. a systemd credential
-        /// set on the kernel command line: unattended, with no screen.
+        /// Like --controller-code, from a file: unattended, with no screen.
         #[arg(long, value_name = "FILE", conflicts_with = "controller_code")]
         controller_code_file: Option<PathBuf>,
+        /// Like --controller-code, from the systemd credential NAME
+        /// (`systemd.set_credential=NAME:CODE` on the kernel command line)
+        /// if it is set; else show a code here.
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["controller_code", "controller_code_file"]
+        )]
+        controller_code_credential: Option<String>,
         #[command(flatten)]
         relay: RelayArgs,
     },
@@ -93,8 +101,19 @@ pub enum Command {
         #[arg(long, default_value = "/run/nix-pixie")]
         state_dir: PathBuf,
     },
+    /// On the target (as root): wait for the controller with CODE (three
+    /// words, e.g. from `nix-pixie controller new-code`) instead of showing
+    /// a code, or `default`: as the agent was started. Lasts until the
+    /// target reboots.
+    Code {
+        /// The controller's code, or `default`.
+        code: String,
+        /// The agent's state directory.
+        #[arg(long, default_value = "/run/nix-pixie")]
+        state_dir: PathBuf,
+    },
     /// The installer's tty1: the agent's code, relay and messages, and a
-    /// prompt for commands like `relay URL`.
+    /// prompt for commands like `relay URL` and `code CODE`.
     Console {
         /// The agent's state directory.
         #[arg(long, default_value = "/run/nix-pixie")]
@@ -373,16 +392,18 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             port,
             controller_code,
             controller_code_file,
+            controller_code_credential,
             relay,
         } => {
-            let controller_code = match controller_code_file {
-                Some(path) => Some(
+            let controller_code = match (controller_code_file, controller_code_credential) {
+                (Some(path), _) => Some(
                     std::fs::read_to_string(&path)
                         .with_context(|| format!("reading the code from {}", path.display()))?
                         .trim()
                         .to_string(),
                 ),
-                None => controller_code,
+                (None, Some(name)) => credential(&name)?,
+                (None, None) => controller_code,
             };
             agent::run(agent::AgentArgs {
                 state_dir,
@@ -393,6 +414,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             .await
         }
         Command::Relay { setting, state_dir } => relay(&state_dir, &setting).await,
+        Command::Code { code, state_dir } => {
+            let code = (code != "default").then_some(code);
+            println!("{}", control::set_code(&state_dir, code).await?);
+            Ok(())
+        }
         Command::Console {
             state_dir,
             plain,
@@ -417,6 +443,28 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         }
     };
     result.map(|()| ExitCode::SUCCESS)
+}
+
+/// The systemd credential `name` of this service, if it was given one.
+fn credential(name: &str) -> Result<Option<String>> {
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        bail!("{name:?} is not a credential's name");
+    }
+    let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") else {
+        return Ok(None);
+    };
+    let path = Path::new(&dir).join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            tracing::info!(
+                credential = name,
+                "using the controller's code from the credential"
+            );
+            Ok(Some(text.trim().to_string()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading the credential {}", path.display())),
+    }
 }
 
 /// `nix-pixie relay`: changes the agent's relays, or says how they stand.

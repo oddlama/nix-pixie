@@ -62,6 +62,19 @@ in
       '';
     };
 
+    controllerCodeCredential = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "pixie.code";
+      description = ''
+        A systemd credential with a controller's code (from `nix-pixie
+        controller new-code`) to wait for instead of showing a code, if it is
+        set: `systemd.set_credential=pixie.code:CODE` on the kernel command
+        line, for a machine without a screen. The code can also come later,
+        at the console or a serial status terminal (`code CODE`). `null`:
+        none.
+      '';
+    };
+
     statusTty = {
       device = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
@@ -143,8 +156,13 @@ in
             "--state-dir"
             "/run/nix-pixie"
           ]
+          ++ lib.optionals (cfg.controllerCodeCredential != null) [
+            "--controller-code-credential"
+            cfg.controllerCodeCredential
+          ]
           ++ relayFlags
         );
+        ImportCredential = lib.mkIf (cfg.controllerCodeCredential != null) cfg.controllerCodeCredential;
         RuntimeDirectory = "nix-pixie";
         RuntimeDirectoryMode = "0700";
         # Kept until the next boot: a restarted agent must still know which

@@ -21,7 +21,7 @@ use nix_pixie_proto::ctrl::{
 use nix_pixie_proto::frame::{FrameError, read_frame, write_frame};
 use nix_pixie_proto::pair::Side;
 use nix_pixie_proto::{ALPN_CTRL, ALPN_RESUME};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -85,22 +85,15 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 
     let state = StateDir::create(args.state_dir)?;
     // From an earlier run of the agent during this boot: the disks it
-    // formatted and the host key it made carry over, its session doesn't.
+    // formatted, the host key it made and what the operator chose carry
+    // over, its session doesn't.
     for stale in ["code", "paired-controller", "approved", "relay"] {
         state.remove(stale);
     }
-    // A controller's code has no nameplate to meet at: without one, relays
-    // are of no use.
-    let configured = if controller_code.is_some() {
-        Relays::Disabled
-    } else {
-        args.relays
-    };
-    let mut relays = if controller_code.is_some() {
-        Relays::Disabled
-    } else {
-        chosen_earlier(&state).unwrap_or_else(|| configured.clone())
-    };
+    let started_with = controller_code;
+    let mut code = given_earlier(&state).or(started_with);
+    let configured = args.relays;
+    let mut relays = chosen_earlier(&state).unwrap_or_else(|| configured.clone());
     // A fresh identity per boot, the same for every endpoint of this run.
     // Nothing persists on the installer.
     let secret = SecretKey::generate();
@@ -130,9 +123,41 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         state: &state,
     };
     let result = loop {
-        match listen(&shared, &relays, controller_code.as_ref(), &mut requests).await {
-            Ok(Outcome::Relays(change)) => relays = take_change(&state, change),
+        // A controller's code has no nameplate to meet at: without one,
+        // relays are of no use.
+        let using = if code.is_some() {
+            Relays::Disabled
+        } else {
+            relays.clone()
+        };
+        match listen(&shared, &using, code.as_ref(), &mut requests).await {
+            Ok(Outcome::Change(change)) => match change.wanted {
+                control::Wanted::Relays {
+                    relays: wanted,
+                    chosen,
+                } => relays = take_relays(&state, wanted, chosen.as_deref(), change.answer),
+                control::Wanted::Code(wanted) => {
+                    code = take_code(&state, wanted, started_with, change.answer);
+                }
+            },
             Ok(Outcome::Done) => break Ok(()),
+            // Given at the console: forgotten, so it can't be guessed at
+            // any longer. Ours otherwise, from the command line: the
+            // service manager starts us again.
+            Ok(Outcome::Rejected) if state.read(control::GIVEN_CODE).is_some() => {
+                state.remove(control::GIVEN_CODE);
+                code = started_with;
+                screen::say(format!(
+                    "The controller's code was rejected {MAX_FAILURES} times; give it again \
+                     (`code CODE`)."
+                ));
+            }
+            Ok(Outcome::Rejected) => {
+                break Err(anyhow::anyhow!(
+                    "the code was rejected {MAX_FAILURES} times; check the code shown by the \
+                     controller and enter it again"
+                ));
+            }
             Err(e) => break Err(e),
         }
     };
@@ -149,6 +174,23 @@ struct Shared<'a> {
     mdns: &'a Mdns,
     probe: &'a watch::Sender<Option<Announcement>>,
     state: &'a StateDir,
+}
+
+/// The controller's code given with `nix-pixie code` earlier during this
+/// boot.
+fn given_earlier(state: &StateDir) -> Option<Code> {
+    let text = state.read(control::GIVEN_CODE)?;
+    match control::controller_code(text.trim()) {
+        Ok(code) => {
+            info!("waiting for the controller whose code was given earlier during this boot");
+            Some(code)
+        }
+        Err(e) => {
+            warn!("ignoring the controller's code given earlier: {e}");
+            state.remove(control::GIVEN_CODE);
+            None
+        }
+    }
 }
 
 /// The relays chosen with `nix-pixie relay` earlier during this boot.
@@ -204,9 +246,7 @@ async fn listen(
         r = async {
             match controller_code {
                 None => show_code(&mut announcer, shared.state, requests).await,
-                Some(code) => typed_code(&mut announcer, shared.state, code, requests)
-                    .await
-                    .map(|()| Outcome::Done),
+                Some(code) => typed_code(&mut announcer, shared.state, code, requests).await,
             }
         } => r,
         () = crate::shutdown_signal() => Ok(Outcome::Done),
@@ -250,31 +290,69 @@ fn in_use(error: &anyhow::Error) -> bool {
 
 /// Keeps the relays the operator chose for the rest of the boot, and
 /// answers them.
-fn take_change(state: &StateDir, change: control::Change) -> Relays {
-    let kept = if let Some(text) = &change.chosen {
+fn take_relays(
+    state: &StateDir,
+    relays: Relays,
+    chosen: Option<&str>,
+    answer: oneshot::Sender<Result<String, String>>,
+) -> Relays {
+    let kept = if let Some(text) = chosen {
         state.write(control::CHOSEN, text)
     } else {
         state.remove(control::CHOSEN);
         Ok(())
     };
-    let answer = kept
-        .map(|()| format!("now using {}; the target shows a new code", change.relays))
+    let reply = kept
+        .map(|()| format!("now using {relays}; the target shows a new code"))
         .map_err(|e| format!("{e:#}"));
-    let _ = change.answer.send(answer);
-    screen::say(format!("Relays changed to {}.", change.relays));
-    change.relays
+    let _ = answer.send(reply);
+    screen::say(format!("Relays changed to {relays}."));
+    relays
+}
+
+/// Keeps the controller's code the operator gave for the rest of the boot
+/// (or forgets it, for `None`), and answers it. Returns the code to wait
+/// for.
+fn take_code(
+    state: &StateDir,
+    code: Option<Code>,
+    started_with: Option<Code>,
+    answer: oneshot::Sender<Result<String, String>>,
+) -> Option<Code> {
+    let (kept, now, reply) = if let Some(code) = code {
+        (
+            state.write(control::GIVEN_CODE, &code.to_string()),
+            Some(code),
+            "waiting for the controller with that code",
+        )
+    } else {
+        state.remove(control::GIVEN_CODE);
+        let reply = if started_with.is_some() {
+            "waiting for the controller whose code the agent was started with"
+        } else {
+            "the target shows a code of its own again"
+        };
+        (Ok(()), started_with, reply)
+    };
+    let _ = answer.send(
+        kept.map(|()| reply.to_string())
+            .map_err(|e| format!("{e:#}")),
+    );
+    now
 }
 
 /// Why the agent stopped waiting for controllers.
 enum Outcome {
-    /// Shut down, or (with a typed code) the session is over.
+    /// Shut down, or (with a controller's code) the session is over.
     Done,
-    /// The operator chose other relays.
-    Relays(control::Change),
+    /// The operator asked for other relays or another code.
+    Change(control::Change),
+    /// The controller's code was rejected [`MAX_FAILURES`] times.
+    Rejected,
 }
 
-/// Relay changes from the control socket. They are only taken while the
-/// agent waits for a controller, never while one pairs or is paired.
+/// Changes from the control socket. They are only taken while the agent
+/// waits for a controller, never while one pairs or is paired.
 struct Requests<'a> {
     changes: &'a mut mpsc::Receiver<control::Change>,
     /// Set while waiting, for the control socket to see.
@@ -357,7 +435,7 @@ impl Announcer<'_> {
 }
 
 /// Default mode: show a code, let the operator type it on the controller.
-/// Returns when the operator chooses other relays.
+/// Returns when the operator asks for other relays or a controller's code.
 async fn show_code(
     announcer: &mut Announcer<'_>,
     state: &StateDir,
@@ -404,7 +482,7 @@ async fn show_code(
                 ));
                 tokio::time::sleep(delay).await;
             }
-            Accepted::Change(change) => return Ok(Outcome::Relays(change)),
+            Accepted::Change(change) => return Ok(Outcome::Change(change)),
         }
     }
 }
@@ -438,25 +516,26 @@ async fn nameplates_in_use(mdns: &Mdns, endpoint: &Endpoint) -> Result<Vec<u32>>
     Ok(taken)
 }
 
-/// Alternative mode: the operator typed the controller's code here. The
-/// controller finds us and dials in.
+/// Alternative mode: the operator gave the controller's code here (typed,
+/// as a credential, through the console). The controller finds us and dials
+/// in. Returns when the session is over or the operator asks for another
+/// code.
 async fn typed_code(
     announcer: &mut Announcer<'_>,
     state: &StateDir,
     code: &Code,
     requests: &mut Requests<'_>,
-) -> Result<()> {
+) -> Result<Outcome> {
     announcer.announce(Pairing::TypedControllerCode).await?;
-    screen::say("Waiting for the controller to connect...");
+    screen::say("Waiting for the controller whose code was given here...");
     let paired = accept_pairing(announcer.endpoint, code, Side::TypedCode, requests).await;
     announcer.withdraw().await;
     match paired? {
-        Accepted::Paired(conn, stream) => session(announcer.endpoint, state, &conn, stream).await,
-        Accepted::Spent => bail!(
-            "the code was rejected {MAX_FAILURES} times; check the code shown by the controller and enter it again"
-        ),
-        // Not taken with a typed code (see `accept_pairing`).
-        Accepted::Change(_) => Ok(()),
+        Accepted::Paired(conn, stream) => session(announcer.endpoint, state, &conn, stream)
+            .await
+            .map(|()| Outcome::Done),
+        Accepted::Spent => Ok(Outcome::Rejected),
+        Accepted::Change(change) => Ok(Outcome::Change(change)),
     }
 }
 
@@ -465,12 +544,13 @@ enum Accepted {
     Paired(Connection, Stream),
     /// [`MAX_FAILURES`] guesses were spent.
     Spent,
-    /// The operator chose other relays (with a code of our own only).
+    /// The operator asked for another code, or other relays (with a code of
+    /// our own only).
     Change(control::Change),
 }
 
-/// Accepts connections until one pairs with `code`, or the operator
-/// chooses other relays.
+/// Accepts connections until one pairs with `code`, or the operator asks
+/// for a change.
 async fn accept_pairing(
     endpoint: &Endpoint,
     code: &Code,
@@ -488,12 +568,21 @@ async fn accept_pairing(
                     continue;
                 }
                 if side == Side::TypedCode {
-                    let _ = change.answer.send(Err(
-                        "this machine waits for a controller whose code was typed in, which \
-                         uses no relays"
-                            .into(),
-                    ));
-                    continue;
+                    let answered = match &change.wanted {
+                        control::Wanted::Relays { .. } => Some(Err(
+                            "this machine waits for a controller whose code was given here, \
+                             which uses no relays"
+                                .to_string(),
+                        )),
+                        control::Wanted::Code(Some(wanted)) if wanted == code => Some(Ok(
+                            "already waiting for the controller with that code".to_string(),
+                        )),
+                        control::Wanted::Code(_) => None,
+                    };
+                    if let Some(answer) = answered {
+                        let _ = change.answer.send(answer);
+                        continue;
+                    }
                 }
                 requests.idle.store(false, Ordering::Relaxed);
                 return Ok(Accepted::Change(change));

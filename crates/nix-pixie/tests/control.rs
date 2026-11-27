@@ -7,7 +7,7 @@
     reason = "tests fail by panicking"
 )]
 
-use nix_pixie::control::{Setting, chosen};
+use nix_pixie::control::{Setting, chosen, controller_code};
 use nix_pixie::net::Relays;
 
 #[test]
@@ -35,4 +35,15 @@ fn chosen_relays_last_the_boot_in_a_state_file() {
     let relays = chosen("http://1.2.3.4:3340\nhttps://relay.example.org\n").unwrap();
     assert_eq!(relays.urls().len(), 2);
     assert!(chosen("").is_err() || matches!(chosen("").unwrap(), Relays::N0));
+}
+
+#[test]
+fn only_a_controllers_code_can_be_given() {
+    assert_eq!(
+        controller_code("acid-acorn-acre").unwrap().to_string(),
+        "acid-acorn-acre"
+    );
+    let err = controller_code("482913-acid-acorn-acre").unwrap_err();
+    assert!(err.contains("target's"), "{err}");
+    assert!(controller_code("not a code").is_err());
 }

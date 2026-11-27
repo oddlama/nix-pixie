@@ -1,6 +1,7 @@
 //! The agent's control socket, `control.sock` in its state directory,
 //! which only root can enter. `nix-pixie relay` changes the agent's relays
-//! through it, and `nix-pixie console` follows its [`Status`].
+//! through it, `nix-pixie code` gives it a controller's code to wait for,
+//! and `nix-pixie console` follows its [`Status`] and does both.
 //!
 //! Frames as everywhere else (see `nix_pixie_proto::frame`), one request per
 //! connection.
@@ -11,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use nix_pixie_proto::code::Code;
 use nix_pixie_proto::frame::{read_frame, write_frame};
 use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
@@ -25,10 +27,16 @@ pub const SOCKET: &str = "control.sock";
 /// The state file with relays chosen through the socket: `off`, `n0`, or
 /// URLs, one per line. It lasts the boot, like the state directory.
 pub const CHOSEN: &str = "relays";
+/// The state file with a controller's code given through the socket. It
+/// lasts the boot, so a restarted agent still waits for that controller.
+pub const GIVEN_CODE: &str = "controller-code";
 /// Upper bound for a frame on the socket.
 const MAX_FRAME: usize = 256 * 1024;
 /// How long a relay change may wait for the agent to take it.
 const CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a change waits for the agent to wait for controllers again:
+/// after the last change, it takes a moment to listen anew.
+const SETTLE: Duration = Duration::from_secs(3);
 
 /// What a client asks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +45,9 @@ pub enum Request {
     Watch,
     /// Use other relays.
     Relays(Setting),
+    /// Wait for the controller with this code (three words); `None`: as
+    /// the agent was started.
+    Code(Option<String>),
 }
 
 /// Relays as the operator asks for them.
@@ -75,12 +86,23 @@ pub enum Reply {
     Refused(String),
 }
 
-/// New relays for the agent's run loop, and where its answer goes.
+/// What the operator asks the agent's run loop for, and where its answer
+/// goes.
 pub struct Change {
-    pub relays: Relays,
-    /// For [`CHOSEN`]; `None` to go back to the configured relays.
-    pub chosen: Option<String>,
+    pub wanted: Wanted,
     pub answer: oneshot::Sender<Result<String, String>>,
+}
+
+/// A change to how the agent waits for controllers.
+pub enum Wanted {
+    Relays {
+        relays: Relays,
+        /// For [`CHOSEN`]; `None` to go back to the configured relays.
+        chosen: Option<String>,
+    },
+    /// Wait for the controller with this code instead of showing one; `None`:
+    /// as the agent was started.
+    Code(Option<Code>),
 }
 
 /// What the agent's run loop shares with the socket.
@@ -90,7 +112,7 @@ pub struct Agent {
     /// Changes go here, while [`Self::idle`].
     pub changes: mpsc::Sender<Change>,
     /// Whether it waits for a controller, rather than pairing or serving
-    /// one: only then may the relays change.
+    /// one: only then may the relays or the code change.
     pub idle: Arc<AtomicBool>,
 }
 
@@ -126,19 +148,34 @@ async fn handle(mut stream: UnixStream, agent: &Agent) -> Result<()> {
             }
         }
         Request::Relays(setting) => {
-            let reply = match change(agent, setting).await {
-                Ok(done) => Reply::Done(done),
-                Err(refused) => Reply::Refused(refused),
+            let reply = match relays(agent, &setting) {
+                Ok(wanted) => change(agent, wanted).await,
+                Err(refused) => Err(refused),
             };
-            write_frame(&mut stream, &reply).await?;
-            Ok(())
+            answer(&mut stream, reply).await
+        }
+        Request::Code(code) => {
+            let reply = match code.as_deref().map(controller_code).transpose() {
+                Ok(code) => change(agent, Wanted::Code(code)).await,
+                Err(refused) => Err(refused),
+            };
+            answer(&mut stream, reply).await
         }
     }
 }
 
-/// Hands new relays to the run loop, if it can take them now.
-async fn change(agent: &Agent, setting: Setting) -> Result<String, String> {
-    let (relays, chosen) = match &setting {
+async fn answer(stream: &mut UnixStream, reply: Result<String, String>) -> Result<()> {
+    let reply = match reply {
+        Ok(done) => Reply::Done(done),
+        Err(refused) => Reply::Refused(refused),
+    };
+    write_frame(stream, &reply).await?;
+    Ok(())
+}
+
+/// The relays the operator asks for.
+fn relays(agent: &Agent, setting: &Setting) -> Result<Wanted, String> {
+    let (relays, chosen) = match setting {
         Setting::Configured => (agent.configured.clone(), None),
         Setting::Off => (Relays::Disabled, Some("off".to_string())),
         Setting::N0 => (Relays::N0, Some("n0".to_string())),
@@ -147,18 +184,45 @@ async fn change(agent: &Agent, setting: Setting) -> Result<String, String> {
             Some(urls.join("\n")),
         ),
     };
-    if !agent.idle.load(Ordering::Relaxed) {
+    Ok(Wanted::Relays { relays, chosen })
+}
+
+/// `text` as a controller's code: three words, no nameplate.
+///
+/// # Errors
+///
+/// If it isn't one, saying why.
+pub fn controller_code(text: &str) -> Result<Code, String> {
+    let code = Code::parse(text).map_err(|e| format!("{e:#}"))?;
+    if code.nameplate().is_some() {
         return Err(
-            "a controller is pairing or paired right now; change the relays once it is done".into(),
+            "that code starts with a number, so it is a target's; give the code of the controller"
+                .into(),
         );
     }
-    info!(%relays, "relays changed through the control socket");
+    Ok(code)
+}
+
+/// Hands a change to the run loop, once it can take it.
+async fn change(agent: &Agent, wanted: Wanted) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while !agent.idle.load(Ordering::Relaxed) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                "a controller is pairing or paired right now; try again once it is done".into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    match &wanted {
+        Wanted::Relays { relays, .. } => {
+            info!(%relays, "relays changed through the control socket");
+        }
+        Wanted::Code(Some(_)) => info!("a controller's code was given through the control socket"),
+        Wanted::Code(None) => info!("back to the code the agent was started with, if any"),
+    }
     let (answer, answered) = oneshot::channel();
-    let change = Change {
-        relays,
-        chosen,
-        answer,
-    };
+    let change = Change { wanted, answer };
     agent
         .changes
         .send(change)
@@ -200,8 +264,18 @@ pub async fn connect(state_dir: &Path) -> Result<UnixStream> {
 
 /// Asks the agent to use other relays; returns its answer.
 pub async fn set_relays(state_dir: &Path, setting: Setting) -> Result<String> {
+    ask(state_dir, &Request::Relays(setting)).await
+}
+
+/// Asks the agent to wait for the controller with `code` (`None`: as it was
+/// started); returns its answer.
+pub async fn set_code(state_dir: &Path, code: Option<String>) -> Result<String> {
+    ask(state_dir, &Request::Code(code)).await
+}
+
+async fn ask(state_dir: &Path, request: &Request) -> Result<String> {
     let mut stream = connect(state_dir).await?;
-    write_frame(&mut stream, &Request::Relays(setting)).await?;
+    write_frame(&mut stream, request).await?;
     match read_frame(&mut stream, MAX_FRAME)
         .await
         .context("reading the agent's answer")?
