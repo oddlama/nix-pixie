@@ -35,7 +35,9 @@ fn txt_rejects_bad_records() {
         map.insert(key, value.to_string());
         from_map(&map)
     };
-    assert_eq!(with("v", "2"), Err(AnnounceError::Version(2)));
+    // An installer older or newer than the controller.
+    assert_eq!(with("v", "1"), Err(AnnounceError::Version(1)));
+    assert_eq!(with("v", "3"), Err(AnnounceError::Version(3)));
     assert_eq!(with("np", "0"), Err(AnnounceError::Invalid("np")));
     assert_eq!(with("np", "100"), Err(AnnounceError::Invalid("np")));
     assert_eq!(with("id", "abcd"), Err(AnnounceError::Invalid("id")));

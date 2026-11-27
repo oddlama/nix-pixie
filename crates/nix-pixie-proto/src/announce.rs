@@ -63,7 +63,10 @@ pub enum AnnounceError {
     Missing(&'static str),
     #[error("invalid `{0}`")]
     Invalid(&'static str),
-    #[error("protocol version {0}, we speak {PROTOCOL_VERSION}")]
+    #[error(
+        "it speaks nix-pixie protocol {0}, this one {PROTOCOL_VERSION}: use an installer of the \
+         same nix-pixie version as the controller"
+    )]
     Version(u32),
 }
 

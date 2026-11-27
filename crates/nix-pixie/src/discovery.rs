@@ -2,7 +2,7 @@
 //! rendezvous, merged.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,14 +10,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use iroh::{Endpoint, EndpointId, RelayUrl};
 use mdns_sd::ServiceEvent;
-use nix_pixie_proto::announce::{Announcement, MAX_LABEL, PROBE_PORT, Pairing};
+use nix_pixie_proto::announce::{AnnounceError, Announcement, MAX_LABEL, PROBE_PORT, Pairing};
 use nix_pixie_proto::code::NameplateSpace;
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::mdns::{self, Mdns};
 use crate::net::{Relays, sanitise};
-use crate::probe::{Prober, RoundReport};
+use crate::probe::{Prober, Reply, RoundReport};
 use crate::rendezvous::Search;
 
 const PROBE_INTERVAL: Duration = Duration::from_millis(1500);
@@ -70,6 +70,9 @@ pub struct Discovery {
     pending: VecDeque<Peer>,
     /// Probing only these, not the local network.
     targets: Targets,
+    /// Targets that speak another protocol version, by address: we don't
+    /// pair with them, but say so.
+    other_versions: BTreeMap<String, u32>,
     pub stats: Stats,
 }
 
@@ -105,6 +108,7 @@ impl Discovery {
             peers: HashMap::new(),
             pending: VecDeque::new(),
             targets,
+            other_versions: BTreeMap::new(),
             stats: Stats::default(),
         })
     }
@@ -150,17 +154,27 @@ impl Discovery {
                                 (announcement, addrs, BTreeSet::new(), "mDNS")
                             }
                             Err(e) => {
-                                debug!(fullname = %service.fullname, "ignoring record: {e:#}");
+                                if let Some(AnnounceError::Version(version)) = e.downcast_ref() {
+                                    self.other_version(&sanitise(&service.fullname, 100), *version);
+                                } else {
+                                    debug!(fullname = %service.fullname, "ignoring record: {e:#}");
+                                }
                                 continue;
                             }
                         },
                         _ => continue,
                     }
                 }
-                (announcement, addr) = recv_probe(self.prober.as_ref()) => {
-                    self.stats.probe_replies += 1;
-                    (announcement, vec![addr], BTreeSet::new(), "probe")
-                }
+                reply = recv_probe(self.prober.as_ref()) => match reply {
+                    Reply::Target(announcement, addr) => {
+                        self.stats.probe_replies += 1;
+                        (announcement, vec![addr], BTreeSet::new(), "probe")
+                    }
+                    Reply::OtherVersion { from, version } => {
+                        self.other_version(&from.ip().to_string(), version);
+                        continue;
+                    }
+                },
                 (announcement, relays) = recv_rendezvous(self.rendezvous.as_mut()) => {
                     self.stats.rendezvous_answers += 1;
                     (announcement, Vec::new(), relays, "relay")
@@ -169,6 +183,22 @@ impl Discovery {
             if let Some(peer) = self.merge(&announcement, addrs, relays, via) {
                 return Ok(peer);
             }
+        }
+    }
+
+    /// Remembers a target of another protocol version, and says so the first
+    /// time.
+    fn other_version(&mut self, at: &str, version: u32) {
+        if self
+            .other_versions
+            .insert(at.to_string(), version)
+            .is_none()
+        {
+            warn!(
+                target = %at,
+                "found a target, but {}",
+                AnnounceError::Version(version)
+            );
         }
     }
 
@@ -204,8 +234,21 @@ impl Discovery {
         changed.then(|| peer.clone())
     }
 
-    /// Where we looked, for "nothing found" errors.
+    /// Where we looked, for "nothing found" errors; and who answered in
+    /// another protocol version.
     pub fn describe(&self) -> String {
+        let mut text = self.looked();
+        for (at, version) in &self.other_versions {
+            let _ = write!(
+                text,
+                ". The target at {at} answered, but {}",
+                AnnounceError::Version(*version)
+            );
+        }
+        text
+    }
+
+    fn looked(&self) -> String {
         if !self.targets.is_empty() {
             let targets = self.targets.describe();
             return format!(
@@ -298,7 +341,7 @@ async fn recv_probe(
         tokio::task::JoinHandle<()>,
         watch::Receiver<RoundReport>,
     )>,
-) -> (Announcement, SocketAddr) {
+) -> Reply {
     match prober {
         Some((prober, _, _)) => prober.recv().await,
         None => std::future::pending().await,

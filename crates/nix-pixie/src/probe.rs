@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use if_addrs::IfAddr;
 use nix_pixie_proto::announce::{
-    Announcement, Nonce, PROBE_LEN, PROBE_PORT, decode_probe, decode_reply, encode_probe,
-    encode_reply,
+    AnnounceError, Announcement, Nonce, PROBE_LEN, PROBE_PORT, decode_probe, decode_reply,
+    encode_probe, encode_reply,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -301,8 +301,9 @@ impl Prober {
     }
 
     /// Next valid reply: the announcement and the address it came from (with
-    /// the iroh port from the announcement).
-    pub async fn recv(&self) -> (Announcement, SocketAddr) {
+    /// the iroh port from the announcement), or a target that speaks another
+    /// protocol version.
+    pub async fn recv(&self) -> Reply {
         loop {
             let received = match &self.v6 {
                 Some(v6) => tokio::select! {
@@ -318,8 +319,19 @@ impl Prober {
     }
 }
 
-/// One datagram from `socket`, if it is a valid reply to our probe.
-async fn recv_reply(socket: &UdpSocket, nonce: &Nonce) -> Option<(Announcement, SocketAddr)> {
+/// A reply to our probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reply {
+    /// The target's announcement, and its address (with the iroh port from
+    /// the announcement).
+    Target(Announcement, SocketAddr),
+    /// A target that speaks another protocol version, which we don't pair
+    /// with: worth saying, since it is most likely the one looked for.
+    OtherVersion { from: SocketAddr, version: u32 },
+}
+
+/// One datagram from `socket`, if it is a reply to our probe.
+async fn recv_reply(socket: &UdpSocket, nonce: &Nonce) -> Option<Reply> {
     let mut buf = vec![0; PROBE_LEN];
     let (len, from) = socket.recv_from(&mut buf).await.ok()?;
     match decode_reply(buf.get(..len)?, nonce) {
@@ -327,8 +339,12 @@ async fn recv_reply(socket: &UdpSocket, nonce: &Nonce) -> Option<(Announcement, 
             debug!(%from, "probe reply");
             let mut addr = canonical(from);
             addr.set_port(announcement.port);
-            Some((announcement, addr))
+            Some(Reply::Target(announcement, addr))
         }
+        Err(AnnounceError::Version(version)) => Some(Reply::OtherVersion {
+            from: canonical(from),
+            version,
+        }),
         Err(e) => {
             debug!(%from, "ignoring probe reply: {e}");
             None

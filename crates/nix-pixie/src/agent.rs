@@ -56,6 +56,8 @@ const MAX_ROTATION_DELAY: Duration = Duration::from_secs(60);
 /// How long the agent waits for its port, which the endpoint it closed last
 /// may hold a moment longer.
 const REBIND_WAIT: Duration = Duration::from_secs(10);
+/// The close code for a controller that sent what we can't read.
+const PROTOCOL_BROKEN: u32 = 3;
 /// How long to listen for other targets' nameplates before picking ours.
 const NAMEPLATE_SURVEY: Duration = Duration::from_secs(2);
 
@@ -750,7 +752,7 @@ async fn serve(
     introduce: bool,
     returns: &mut tokio::sync::mpsc::Receiver<Connection>,
 ) -> (Result<Option<anyhow::Error>>, Option<Connection>) {
-    let serving = serve_controller(state, stream, session, introduce);
+    let serving = serve_controller(state, conn, stream, session, introduce);
     tokio::pin!(serving);
     let (mut early, mut listening) = (None, true);
     let end = loop {
@@ -942,6 +944,7 @@ async fn serve_store(
 /// `introduce`: start with the hello and the inventory (not after resuming).
 async fn serve_controller(
     state: &StateDir,
+    conn: &Connection,
     stream: &mut Stream,
     session: &mut Session,
     introduce: bool,
@@ -958,6 +961,16 @@ async fn serve_controller(
             Err(FrameError::Io(e)) => return Ok(Some(e.into())),
             Err(e) => {
                 warn!("the controller broke the protocol: {e}");
+                // Said at once, rather than leaving it waiting for a reply:
+                // most likely, it is another version of nix-pixie.
+                let reason = net::sanitise(
+                    &format!(
+                        "a message this agent can't read ({e}); it speaks nix-pixie protocol {}",
+                        nix_pixie_proto::PROTOCOL_VERSION
+                    ),
+                    200,
+                );
+                conn.close(VarInt::from_u32(PROTOCOL_BROKEN), reason.as_bytes());
                 return Ok(None);
             }
         };

@@ -72,8 +72,10 @@ async fn responder_answers_probes_while_announcing() {
     let reply = async |to| {
         loop {
             prober.probe(to).await;
-            if let Ok(r) = tokio::time::timeout(Duration::from_millis(100), prober.recv()).await {
-                return r;
+            if let Ok(Reply::Target(announcement, from)) =
+                tokio::time::timeout(Duration::from_millis(100), prober.recv()).await
+            {
+                return (announcement, from);
             }
         }
     };

@@ -194,7 +194,12 @@ impl Link {
                 Err(e) if state.resumable && is_lost(&state.conn) => {
                     send = self.shared.resume(&mut state, &e, true).await? == Missed::Request;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    return Err(match closed_by_target(&state.conn) {
+                        Some(reason) => anyhow!("the target ended the session: {reason}"),
+                        None => e,
+                    });
+                }
             }
         }
     }
@@ -385,6 +390,16 @@ impl Shared {
         state.stream = stream;
         self.current.send_replace(conn);
         Ok(missed)
+    }
+}
+
+/// Why the target closed `conn`, if it did on purpose.
+fn closed_by_target(conn: &Connection) -> Option<String> {
+    match conn.close_reason()? {
+        ConnectionError::ApplicationClosed(close) => {
+            Some(sanitise(&String::from_utf8_lossy(&close.reason), 200))
+        }
+        _ => None,
     }
 }
 
