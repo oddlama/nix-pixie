@@ -370,11 +370,12 @@ const REPLAY_PAUSE: Duration = Duration::from_secs(1);
 /// Whether a line read by [`run_lines`] is no command but what it wrote,
 /// come back: the other end echoes (a serial port opened without turning
 /// that off, which takes a moment even for those who do), or a terminal
-/// answers the escape sequences the service manager wrote. Answering it
-/// would only send more back.
+/// answers the escape sequences the service manager wrote. An echo may
+/// spell escapes out, as `^[` (a terminal's `echoctl`), which nobody types.
+/// Answering it would only send more back.
 #[must_use]
 pub fn is_echo(line: &str, written: &std::collections::VecDeque<String>) -> bool {
-    line.contains('\x1b') || written.iter().any(|w| w == line)
+    line.contains('\x1b') || line.contains("^[") || written.iter().any(|w| w == line)
 }
 
 /// The console for a line-based terminal, e.g. a serial port a program

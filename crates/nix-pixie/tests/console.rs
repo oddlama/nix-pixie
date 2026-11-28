@@ -120,6 +120,8 @@ fn what_comes_back_from_the_other_end_is_no_command() {
     ));
     // Escape sequences the service manager wrote, answered or echoed.
     assert!(is_echo("\x1b[!p\x1b]104\x1b\\code ash-bat-cow", &written));
+    // The same, echoed by a host's terminal that spells escapes out.
+    assert!(is_echo("^[[!p^[]104^[\\^[584c84bf9df5b2e7", &written));
     assert!(!is_echo("code ash-bat-cow", &written));
     assert!(!is_echo("relay off", &written));
     assert!(!is_echo("", &written));
