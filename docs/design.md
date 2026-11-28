@@ -43,13 +43,17 @@ we build on them.
 | A driving program's interface: JSON events (`--events`), exit codes by phase, the agent's status on a serial terminal (`console --plain`/`--json`), `--offline` | implemented, not yet VM-tested | unit tests of the console |
 | Many devices, one configuration: `--id`/`$PIXIE_OUT/id`, `{id}` paths, `disks.rules`, `facter.mode`, side-by-side installs | implemented, not yet VM-tested | unit tests of the disk plan |
 | Hooks: owners and directory modes (`files.json`), `target exec --stdin`, `context.json` to later hooks, `encrypted/` into the repo with age, `seen-host-key` and `bootCheck = "hooks"`, outputs in RAM only | implemented, not yet VM-tested | unit tests of the outputs |
-| Store streams compressed with zstd by path (`--compression auto`): not to link-local or private addresses, through relays and to public ones | done | `checks.vm-relay` (through the relay), `checks.vm-push` (`--compression zstd`, incompressible, under the memory cap), unit tests of the choice |
+| Store streams compressed with zstd by path (`--compression auto`): not to link-local or private addresses or any on the controller's networks, through relays and to other ones | done | `checks.vm-relay` (through the relay), `checks.vm-push` (`--compression zstd`, incompressible, under the memory cap), unit tests of the choice |
 | Netboot installer (`nixosModules.installer-netboot`): nothing needed on the command line (no `init=`, any `root=` ignored), only chosen kernel modules | done in QEMU; not yet on a board | `checks.vm-netboot` (kernel and initrd alone, `console=ttyS0 root=/dev/vda` with that disk there) |
 | USB gadget (`nix-pixie.usbGadget`: NCM with `fe80::2`, ACM for the status), added to a vendor's gadget if there is one | done on `dummy_hcd`; not yet on a board, nor into a vendor's gadget | `checks.vm-netboot` (the host's side in the same machine) |
-| A controller's code at the console, as `nix-pixie code`, or from a credential; `--serial` to hand it over | done; the credential only by unit tests | `checks.vm-netboot` (a controller started before the device is plugged in), unit tests |
-| Status terminals: replay on an empty line, echoes ignored, reopened after a hang-up | done | `checks.vm-netboot`, unit tests |
+| A controller's code at the console, as `nix-pixie code`, or from a credential; `--serial` to hand it over, the port the controller's alone (`TIOCEXCL`, waiting while another process has it) | done; the credential only by unit tests | `checks.vm-netboot` (a controller started before the device is plugged in), unit tests |
+| Status terminals: replay on an empty line, echoes ignored (also spelled out, `^[`), reopened after a hang-up | done | `checks.vm-netboot`, unit tests |
 | The target's clock set from the controller's | done | `checks.vm-pairing` (3 days behind, the real-time clock too); by hand, a whole install through a relay after a 10 min step |
 | Link-local `--target` and reconnects following an interface's new index | the first done, reconnects implemented | `checks.vm-netboot` (an interface that shows up late, under a new index), unit tests |
+| The target's addresses by NIC: in the pairing summary, and again before it leaves (`targetAddresses`) | done | `checks.vm-inventory` |
+| The check after the install also at the EUI-64 link-local addresses of the target's MACs, on the links shared with it; all addresses asked at once | done | unit tests |
+| Disk keys kept in RAM for the hooks after `install` (`diskKeys`), overwritten and removed at `finish` | done | `checks.vm-install-luks-scripted` (a hook adds a passphrase with the kept key), unit tests of the wipe |
+| Store copies over another network than the session's (`--bulk-via auto\|ADDR`): a bulk endpoint bound to that address alone, falling back to the session | done in VMs; not yet over a board's USB and Ethernet | `checks.vm-bulk` (to the other network, auto, a wrong address, the network cut midway) |
 
 ## Goal
 
@@ -1217,7 +1221,7 @@ Running them: `checks [PATTERN]` in the devshell builds the matching checks
 `nix flake check` evaluates all of them in one process, which needs more
 memory than a busy machine has; `checks` evaluates each on its own first.
 A layout test takes 2 to 4 minutes and about 3 GiB while it runs; all
-twenty-seven checks take about 30 minutes with `JOBS=2`. The install tests fail
+twenty-eight checks take about 30 minutes with `JOBS=2`. The install tests fail
 as soon as the install fails instead of waiting out their timeouts.
 
 On a machine that is busy with other things, use `JOBS=1`. NixOS test VMs run

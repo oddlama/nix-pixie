@@ -720,7 +720,10 @@ discovery. For programs that drive the controller:
 
 Closures travel compressed (zstd) through relays and over the internet, but
 not over a cable or the LAN, where the target's CPU tends to be slower than the
-link: `--compression zstd` or `none` decides otherwise.
+link: `--compression zstd` or `none` decides otherwise. With `--bulk-via auto`
+(or one of the target's addresses), they go over another network than the
+session's: the session over the USB cable, the copy over the device's
+Ethernet, back to the cable if that fails. That needs UDP 47013 to the target.
 
 ### Many devices, one configuration
 
